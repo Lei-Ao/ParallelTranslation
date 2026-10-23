@@ -43,7 +43,6 @@ async function generateLayout(){
     if(request!==layoutRequest)return;
     state.layout=report;state.layoutKey=key;
     if(report.save_error)toast(report.save_error);
-    else if(report.saved_pdf && !state.running)toast(`译文 PDF 已自动保存：${report.saved_pdf}`);
   }catch(error){if(request!==layoutRequest)return;state.layoutError=error.message;}
   finally{
     if(request===layoutRequest){state.layoutBusy=false;updateLayoutControls();if(state.view==='pdf' && state.doc?.id===id && !state.pendingOpen)renderTranslations();}

@@ -102,14 +102,14 @@ Pausing stops new requests while letting in-flight requests finish and save thei
 | Content | Location or behavior |
 | --- | --- |
 | Source PDFs, extracted text, translations, and layout caches | `.data/<document ID>/` |
-| Completed standalone translated PDFs | `output/pdf/` |
+| Completed standalone translated PDFs | `output/pdf/` under the project root |
 | Agent configuration, API key, language, and terminology settings | The current browser’s localStorage |
 | Content sent to the AI service | The current paragraph, bounded text context, terminology, and instructions |
 
 - PDF binaries are not sent to the configured translation endpoint, but relevant text is sent to that service.
 - Credentials in browser storage are **not encrypted**. A masked input only hides their display. Use the saved-key removal control to remove a credential.
 - Do not put credentials in URLs, request templates, source files, or commits.
-- Once all paragraphs are translated and typesetting succeeds, the finished PDF is saved to `output/pdf/` and can be opened independently. Some regions may still retain their original content; review the layout messages.
+- Once all paragraphs are translated and typesetting succeeds, the finished PDF is automatically saved to `output/pdf/` under the project root. The folder is created on the first save, and PDFs can be opened independently. Successful saves and reopening documents do not display a save-path notification; save failures still display an error. Some regions may retain their original content; review the layout messages.
 - A document currently stores one translation set. Translating into another language replaces previous translations paragraph by paragraph; export older versions first if needed.
 - Back up the entire `.data/` directory to preserve documents. Personal documents, translations, credentials, caches, virtual environments, and local development screenshots are excluded from the repository and source package.
 
