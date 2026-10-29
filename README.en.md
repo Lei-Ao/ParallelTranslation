@@ -1,10 +1,25 @@
-# ParallelTranslation
+<div align="center">
 
-[简体中文](README.md) | **English**
+<p>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-%3E%3D3.10-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
+  <a href="#windows"><img src="https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows&logoColor=white" alt="Platform: Windows"></a>
+  <a href="#configure-the-ai-api"><img src="https://img.shields.io/badge/AI-OpenAI%20compatible-412991" alt="OpenAI-compatible AI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0--only-663366" alt="License: AGPL-3.0-only"></a>
+</p>
 
-A local-first PDF translation workspace with side-by-side reading, layout-aware typesetting, and custom AI APIs.
+<h1>ParallelTranslation</h1>
 
-The application displays the name “页间 Parallel”. Its interface is currently in Chinese; this repository provides Chinese and English documentation.
+<p><strong>Where understanding meets the page.</strong></p>
+
+<p><sub>Local-first PDF translation workspace · bring your own AI · preserve the page layout</sub></p>
+
+<p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a></p>
+
+</div>
+
+---
+
+A local-first PDF translation workspace with side-by-side reading, layout-aware typesetting, and custom AI APIs. The application displays the name “页间 Parallel”; this repository provides Chinese and English documentation.
 
 ## Features
 

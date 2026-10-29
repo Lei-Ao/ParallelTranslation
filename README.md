@@ -1,10 +1,25 @@
-# ParallelTranslation
+<div align="center">
 
-**简体中文** | [English](README.en.md)
+<p>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-%3E%3D3.10-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
+  <a href="#windows"><img src="https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows&logoColor=white" alt="Platform: Windows"></a>
+  <a href="#配置-ai-接口"><img src="https://img.shields.io/badge/AI-OpenAI%20compatible-412991" alt="OpenAI-compatible AI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0--only-663366" alt="License: AGPL-3.0-only"></a>
+</p>
 
-本地 PDF 对照翻译工作台。接入自己的 AI 接口，在原文与译文之间同步阅读，并尽可能保留页面版式。
+<h1>ParallelTranslation</h1>
 
-界面中的名称为「页间 Parallel」。目前界面使用中文，项目文档提供中英文版本。
+<p><strong>让理解，在页间相遇。</strong></p>
+
+<p><sub>本地 PDF 对照翻译工作台 · 接入自己的 AI · 保留页面版式</sub></p>
+
+<p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a></p>
+
+</div>
+
+---
+
+本地 PDF 对照翻译工作台。接入自己的 AI 接口，在原文与译文之间同步阅读，并尽可能保留页面版式。界面名称为「页间 Parallel」，文档提供中英文版本。
 
 ## 功能
 
