@@ -2,12 +2,15 @@
 
 Run: python tests/audit_corpus_layout.py
 Results and rendered source/translation samples go to tmp/source-layout-audit/.
+Link checks report, per page, reader-report schema violations, dropped source
+URI/goto annotations and reader entries whose rectangle is not on their page.
 """
 import json
 import sys
 import unicodedata
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,6 +22,93 @@ from pdf_typography import font_source
 
 def han(text):
     return Counter(c for c in unicodedata.normalize("NFKC", text) if "\u3400" <= c <= "\u9fff")
+
+
+def normalized_uri(value):
+    """Comparable form of a link URI.
+
+    Older PDFs carry the same DOI link with different spellings
+    ("https://doi.org/..." vs "http://dx.doi.org/..."); comparing raw strings
+    reports surviving links as dropped. The scheme and host spellings are
+    normalized, the path keeps its case, and a trailing slash is ignored.
+    """
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "dx.doi.org":
+        host = "doi.org"
+    path = parts.path
+    if path.endswith("/"):
+        path = path[:-1]
+    target = host + path
+    if parts.query:
+        target += "?" + parts.query
+    if parts.fragment:
+        target += "#" + parts.fragment
+    return target or value
+
+
+def link_box(page, link):
+    """Displayed normalized rectangle of an output page annotation."""
+    try:
+        box = pymupdf.Rect(link.get("from"))
+    except (TypeError, ValueError):
+        return None
+    bounds = page.rect
+    if box.is_empty or not box.is_valid or not bounds.width or not bounds.height:
+        return None
+    return [box.x0 / bounds.width, box.y0 / bounds.height,
+            box.x1 / bounds.width, box.y1 / bounds.height]
+
+
+def matches_reader_entry(page, link, entry):
+    box = link_box(page, link)
+    values = entry.get("from") or []
+    return (box is not None and len(values) == 4
+            and all(abs(actual - value) <= .02 for actual, value in zip(box, values)))
+
+
+def check_reader_links(reader_links, page_count, errors):
+    """Validate the reader link schema shared with static/app.js."""
+    for entry in reader_links or []:
+        if not isinstance(entry, dict):
+            errors.append({"page": 0, "kind": "reader_entry", "entry": entry})
+            continue
+        source_page = entry.get("source_page")
+        if (not isinstance(source_page, int) or isinstance(source_page, bool)
+                or not 1 <= source_page <= page_count):
+            errors.append({"page": source_page if isinstance(source_page, int) else 0,
+                           "kind": "reader_source_page", "entry": entry})
+            continue
+        box = entry.get("from")
+        if (not isinstance(box, list) or len(box) != 4
+                or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                           and 0 <= value <= 1 for value in box)
+                or box[0] > box[2] or box[1] > box[3]):
+            errors.append({"page": source_page, "kind": "reader_from", "entry": entry})
+            continue
+        kind = entry.get("kind")
+        if kind == "uri":
+            if not isinstance(entry.get("uri"), str) or not entry.get("uri"):
+                errors.append({"page": source_page, "kind": "reader_uri", "entry": entry})
+        elif kind == "goto":
+            target = entry.get("page")
+            fraction = entry.get("fraction")
+            if (not isinstance(target, int) or isinstance(target, bool)
+                    or not 1 <= target <= page_count):
+                errors.append({"page": source_page, "kind": "reader_goto_target", "entry": entry})
+            elif (not isinstance(fraction, (int, float)) or isinstance(fraction, bool)
+                  or not 0 <= fraction <= 1):
+                errors.append({"page": source_page, "kind": "reader_fraction", "entry": entry})
+        else:
+            errors.append({"page": source_page, "kind": "reader_kind", "entry": entry})
 
 
 def audit():
@@ -37,7 +127,9 @@ def audit():
                   "untranslated": report["untranslated"], "scaled": report["scaled"],
                   "revision": report["revision"], "missing_chinese": [], "collisions": [],
                   "spacing_errors": [], "font_changes": [], "bold_body": [], "symbol_errors": [],
-                  "adjusted_regions": len(report.get("flow", [])), "samples": []}
+                  "link_errors": [], "adjusted_regions": len(report.get("flow", [])), "samples": []}
+        reader_links = report.get("links") or []
+        check_reader_links(reader_links, len(document["pages"]), result["link_errors"])
         sample_pages = {0, 1, 2, len(document["pages"]) // 2, len(document["pages"]) - 1}
         pdf_path = metadata.parent / "layout" / (report["revision"] + ".pdf")
         with pymupdf.open(pdf_path) as pdf, pymupdf.open(metadata.parent / "source.pdf") as original:
@@ -115,6 +207,70 @@ def audit():
                         actual_count = sum(label.count(key) for label in item["matched"])
                         if actual_count < expected_count:
                             result["symbol_errors"].append({"page": index + 1, "blocks": item["blocks"], "symbol": key})
+                page_links = page.get_links()
+                output_uris = {normalized_uri(link.get("uri") or "") for link in page_links
+                               if link.get("kind") == pymupdf.LINK_URI}
+                visible_text = "".join(page.get_text().split())
+                translation_text = "".join("".join(
+                    b.get("translation", "") for b in saved["blocks"]
+                    if b.get("target") == target).split())
+                source_links = original[index].get_links()
+                # A source web annotation is only allowed to disappear when its
+                # URL no longer appears anywhere on the page; if the URL survived
+                # the translation the reader must still be able to click it.
+                # Repeated annotations of the same URL collapse to one entry.
+                reported_uris = set()
+                for annotation in source_links:
+                    if annotation.get("kind") != pymupdf.LINK_URI:
+                        continue
+                    uri = (annotation.get("uri") or "").strip()
+                    if not uri or (uri not in visible_text and uri not in translation_text):
+                        continue
+                    key = normalized_uri(uri)
+                    if not key or key in output_uris or key in reported_uris:
+                        continue
+                    reported_uris.add(key)
+                    result["link_errors"].append({"page": index + 1, "kind": "missing_uri", "uri": uri})
+                # Rewording a citation may move a jump target, but it must not
+                # silently remove the jump from the page. Unresolvable named
+                # destinations are excluded because no annotation can be rebuilt.
+                source_gotos = [annotation for annotation in source_links
+                                if annotation.get("kind") in {pymupdf.LINK_GOTO, pymupdf.LINK_NAMED}
+                                and isinstance(annotation.get("page"), int)
+                                and not isinstance(annotation.get("page"), bool)
+                                and 0 <= annotation["page"] < len(document["pages"])]
+                output_gotos = [link for link in page_links
+                                if link.get("kind") in {pymupdf.LINK_GOTO, pymupdf.LINK_NAMED}]
+                if len(output_gotos) < len(source_gotos):
+                    result["link_errors"].append({"page": index + 1, "kind": "missing_goto",
+                                                  "source": len(source_gotos), "output": len(output_gotos)})
+                # Reader entries name the page the link lives on; the rectangle
+                # must exist there, so a goto whose target page leaked into
+                # source_page is caught instead of being placed on the wrong page.
+                for entry in (item for item in reader_links
+                              if item.get("source_page") == index + 1):
+                    if entry.get("kind") == "uri":
+                        candidates = [link for link in page_links
+                                      if link.get("kind") == pymupdf.LINK_URI
+                                      and normalized_uri(link.get("uri") or "")
+                                      == normalized_uri(entry.get("uri") or "")]
+                    else:
+                        candidates = [link for link in page_links
+                                      if link.get("kind") in {pymupdf.LINK_GOTO, pymupdf.LINK_NAMED}
+                                      and isinstance(link.get("page"), int)
+                                      and not isinstance(link.get("page"), bool)
+                                      and link["page"] + 1 == entry.get("page")]
+                    matched = any(matches_reader_entry(page, link, entry) for link in candidates)
+                    if not matched and entry.get("kind") == "goto":
+                        # An unresolved named destination exposes no target page
+                        # to PyMuPDF; its placement on this page is still
+                        # checkable, which is enough to catch a source_page leak.
+                        matched = any(link.get("kind") == pymupdf.LINK_NAMED
+                                      and matches_reader_entry(page, link, entry)
+                                      for link in page_links)
+                    if not matched:
+                        result["link_errors"].append({"page": index + 1, "kind": "reader_mismatch",
+                                                      "entry": entry})
                 if index in sample_pages:
                     prefix = f"{document['id'][:8]}-p{index + 1}"
                     for label, rendered in (("source", original[index]), ("translation", page)):
@@ -126,7 +282,8 @@ def audit():
                "pages": sum(r["pages"] for r in results), "results": results}
     (output / "report.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return any(r[field] for r in results for field in
-               ("missing_chinese", "collisions", "spacing_errors", "font_changes", "bold_body", "symbol_errors"))
+               ("missing_chinese", "collisions", "spacing_errors", "font_changes", "bold_body",
+                "symbol_errors", "link_errors"))
 
 
 if __name__ == "__main__":

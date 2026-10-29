@@ -9,7 +9,9 @@
 ## 功能
 
 - **对照阅读**：原文与译文并排展示，支持连续翻页、双向同步滚动、段落定位、缩放与拖动。
+- **桌面启动**：Windows 下双击 `start.bat` 或 `start.vbs` 后驻留系统托盘，不会保留终端窗口；关闭浏览器不会停止服务，托盘菜单可打开工作台、重启、停止和退出。
 - **版式排印**：保留页面尺寸和图形，在安全区域内排印译文，参考原文的字体样式、段间距与栏结构。
+- **链接保留**：原文中的网页链接与文内跳转随译文重新定位，译文页面可直接点击；链接文字沿用原文颜色，换行链接的各段会作为一组同时高亮。
 - **自带 AI**：支持 OpenAI 兼容的 Chat Completions 接口，也可配置自定义 HTTP JSON Agent。
 - **上下文翻译**：携带前后段落、已完成译文、目标语言、术语表和翻译要求。
 - **并发与恢复**：可调请求并发和同页批量翻译；支持暂停、失败重试及跳过已有译文。
@@ -23,8 +25,8 @@
 
 1. 安装 **Python 3.10 或更新版本**，确保终端可以运行 `python`。
 2. 克隆仓库，或通过 GitHub 的 **Code → Download ZIP** 下载并解压。
-3. 双击项目根目录的 **`start.bat`**。
-4. 首次启动会创建 `.venv` 并安装固定版本依赖。服务就绪后自动打开 <http://127.0.0.1:8765>。
+3. 双击项目根目录的 **`start.bat`**。首次启动会创建 `.venv` 并安装固定版本依赖（此时会短暂显示终端窗口）。
+4. 之后双击 `start.bat` 或 **`start.vbs`** 即可，不会保留终端窗口：程序在系统托盘显示「页间 Parallel」图标，并自动打开 <http://127.0.0.1:8765>。
 
 ```powershell
 git clone https://github.com/Lei-Ao/ParallelTranslation.git
@@ -32,7 +34,7 @@ cd ParallelTranslation
 .\start.bat
 ```
 
-使用期间保留启动窗口，关闭服务按 **Ctrl+C**。再次启动会优先打开已运行的工作台。
+托盘图标双击打开工作台；右键菜单可以「打开工作台」「重新启动服务」「启动服务 / 停止服务」或「停止并退出」。关闭浏览器不会停止服务；需要完全停止时从托盘菜单选择「停止并退出」，也可以双击 **`stop.bat`** 强制停止。服务日志位于 `tmp/parallel.log`。再次启动已运行的实例只会打开工作台，不会重复启动服务。
 
 不要直接打开 `static/index.html`；PDF 解析、译文保存与接口调用需要本机后端服务。当前测试环境为 Windows / Python 3.12。
 
@@ -90,7 +92,7 @@ python3 -m venv .venv
 1. 在首页选择目标语言，按需填写「术语与要求」。
 2. 导入文字型 PDF。程序解析后自动翻译，首页显示进度；全文译完并完成排版后进入阅读界面。
 3. 翻译期间可暂停；失败后点击「继续翻译」，跳过已有当前语言译文。
-4. 两侧单击段落可同步定位，双击译文文字可编辑。也可在右上角菜单切换「段落（编辑）」视图。
+4. 两侧单击段落可同步定位，单击空白处取消选择，双击译文文字可编辑。也可在右上角菜单切换「段落（编辑）」视图。
 5. 在菜单中调整语言、并发、批量段数、同步滚动与阅读模式，或重新排版、下载 PDF、导出对照 Markdown。
 
 默认并发 **3** 个请求，最高 **12** 个；OpenAI 兼容接口默认每次合并同页最多 **3** 段，可选 1 / 3 / 5 段。自定义接口使用单段请求。接口临时错误最多自动重试两次，重试可能产生额外费用。
@@ -120,6 +122,10 @@ python3 -m venv .venv
 - 支持 **1–300 页、最大 50 MB** 的 PDF。
 - 扫描件需要先进行 OCR；本项目不提供自动 OCR。
 - 多栏、旋转、标题、作者信息、行内符号、首字下沉和参考文献等使用版式规则处理，复杂文档仍可能存在提取或排版误差。
+- 被提取成多个文本块的封面标题会合并为一个标题组，统一使用原文标题的字号与源字重排印；作者编号按原文保留为上标，不依赖编号与姓名的连接方式。旋转封面和不在首页的标题仍按逐块方式处理。
+- 跨页、含未加引号专著题名或编号不连续等无法重建为完整条目的参考文献，会整段保留原文并在排版提示中说明，避免同一文献条目中英文混排或译文覆盖相邻条目；标题仍正常翻译。无法识别编号的续页按普通文本处理。
+- 原文中的网页链接和文内跳转（引用、图表、目录）会重新锚定到译文对应位置；译文改写导致锚文本无法定位时，外部链接不再可点并在排版提示中说明，文内跳转按原位置保留。链接文字颜色沿用原文，链接下划线等装饰不重建。阅读器只为可可靠定位或整块锚定的链接显示点击层；按原位置保留的文内跳转仍存在于导出的 PDF 中。
+- 模型有时会把同一段译文返回成多行；排版和阅读视图会把源段落内部的软换行合并为一个段落（列表、术语表等多行结构除外），编辑框和已保存译文保持原样。
 - 独立公式、复杂表格、竖排文字或无法安全容纳的区域可能保留完整原文；表格通常只翻译表题和表注。
 - 图片内的文字不进行 OCR 或替换。翻译进度表示已生成的段落译文比例，不代表所有区域均已替换进 PDF。
 - 原文以渲染页面显示，支持段落交互，暂不支持原文自由选字、全文搜索或 PDF 内嵌批注。
@@ -131,7 +137,7 @@ python3 -m venv .venv
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
-node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js
+node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js
 ```
 
 测试使用临时 PDF 与模拟接口，不消耗真实 AI 服务额度。针对本机已有译文的可选排版检查：
@@ -145,6 +151,9 @@ node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/t
 ```text
 app.py                  FastAPI、文档保存、Agent 适配与导出
 launch.py               本机服务启动与浏览器打开
+start.bat / start.vbs   Windows 一键启动（隐藏终端，托盘控制）
+stop.bat                停止本机服务与托盘
+tray.ps1                Windows 托盘菜单（打开/重启/停止/退出）
 pdf_text.py             首字下沉与完整单词恢复
 pdf_layout.py           PDF 排版、图表避让与按页缓存
 pdf_flow.py             分栏重排与公式区域移动

@@ -50,6 +50,46 @@ async function generateLayout(){
 }
 function showEdit(block){editBlock=block;$('#edit-source').textContent=block.text;$('#edit-text').value=block.translation;$('#edit-dialog').showModal();}
 const escapeHtml = (str) => String(str).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+const URL_TEXT=/https?:\/\/[^\s<>"'，。；：！？）】」』《【〕]+/g;
+const URL_TRAILING=/[.,;:!?)\]}'"。、；，！？）：」』）》]+$/;
+function linkifyText(value){
+  const text=String(value||'');const pieces=[];let last=0,match;
+  URL_TEXT.lastIndex=0;
+  while((match=URL_TEXT.exec(text))){
+    const url=match[0].replace(URL_TRAILING,'');
+    if(url.length<9)continue;
+    pieces.push(escapeHtml(text.slice(last,match.index))
+      +`<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`);
+    last=match.index+url.length;URL_TEXT.lastIndex=last;
+  }
+  pieces.push(escapeHtml(text.slice(last)));
+  return pieces.join('');
+}
+function linkOverlayHtml(link){
+  if(!Array.isArray(link.from)||link.from.length!==4)return '';
+  const [x0,y0,x1,y1]=link.from;
+  const style=`left:${x0*100}%;top:${y0*100}%;width:${Math.max(0,x1-x0)*100}%;height:${Math.max(0,y1-y0)*100}%`;
+  if(link.kind==='uri' && link.uri)return `<a class="link-overlay" draggable="false" href="${escapeHtml(link.uri)}" target="_blank" rel="noopener noreferrer" style="${style}" title="${escapeHtml(link.uri)}" aria-label="打开外部链接：${escapeHtml(link.uri)}"></a>`;
+  if(link.kind==='goto' && Number.isInteger(link.page) && link.page>=1)return `<button type="button" class="link-overlay" data-link-page="${link.page-1}" data-link-fraction="${Number.isFinite(link.fraction)?link.fraction:0}" style="${style}" title="跳转到第 ${link.page} 页" aria-label="跳转到第 ${link.page} 页"></button>`;
+  return '';
+}
+function linkOverlays(links){
+  // A URL wrapped over several lines is several rectangles of one link. The
+  // layout report gives them a shared `group`; wrap them so hovering or
+  // focusing any fragment highlights the whole link instead of one fragment.
+  const groups=new Map(),order=[];
+  (links||[]).forEach((link,index)=>{
+    const html=linkOverlayHtml(link);
+    if(!html)return;
+    const key=link.group?`g:${link.group}`:`i:${index}`;
+    if(!groups.has(key)){groups.set(key,[]);order.push(key);}
+    groups.get(key).push(html);
+  });
+  return order.map(key=>{
+    const parts=groups.get(key);
+    return parts.length===1?parts[0]:`<span class="link-group">${parts.join('')}</span>`;
+  }).join('');
+}
 function toast(message) { $('#toast').textContent=message; $('#toast').classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('#toast').classList.add('hidden'),5500); }
 async function api(path, options={}) {
   const headers = {'X-Local-Token':state.token,...options.headers};
@@ -104,11 +144,28 @@ function renderDocument(ready=false){
   $('#page-select').innerHTML=state.doc.pages.map((page,i)=>`<option value="${i}">${page.number}</option>`).join('');
   $('#page-total').textContent=`/ ${state.doc.pages.length}`;
   $('#export').href=`/api/documents/${state.doc.id}/export`;
-  if(!ready)invalidateLayout();renderPage();renderLibrary();status('准备就绪 · 单击同步选中，双击译文编辑 · Shift 连选');if(!ready)refreshLayout();
+  if(!ready)invalidateLayout();renderPage();renderLibrary();status('准备就绪 · 单击同步选中，点击空白取消 · Shift 连选');if(!ready)refreshLayout();
+}
+const SOFT_LIST_LINE=/^\s*(?:[•·●▪▫◦‣∙⋅※■□◆◇]|\(?\d{1,2}[.)]|[A-Za-z][.)])\s+/m;
+function proseSource(text){
+  const value=String(text||'');
+  const words=(value.match(/\b[A-Za-z]{2,}\b/g)||[]).length;
+  const stops=(value.match(/\b(?:the|is|of|and|to|in|with|for|can|are|this|that|from|where|which)\b/gi)||[]).length;
+  return (words>=8 && stops>=2)||(value.match(/[\u3400-\u9fff]/g)||[]).length>=20;
+}
+function softTranslation(block){
+  // A source paragraph is one translated paragraph. Models sometimes return
+  // it with line breaks; collapse those for prose, keep line-structured lists.
+  const text=String(block?.translation||'');
+  if(!/[\r\n]/.test(text))return text;
+  const source=String(block?.text||'');
+  if(!proseSource(source)||SOFT_LIST_LINE.test(source)||/\n[ \t]*\n/.test(source))return text;
+  return text.replace(/[ \t]*\r?\n+[ \t]*/g,' ').trim()
+    .replace(/(?<=[。！？；：，、]) (?=[\u3400-\u9fff（“‘《【])/g,'');
 }
 function renderCard(block,index){
   const error=state.errors[block.id],working=state.activeBlocks.has(block.id);
-  const text=block.translation?`<div class="translation-text">${escapeHtml(block.translation)}</div>`:`<div class="source-preview">${escapeHtml(block.text)}</div>`;
+  const text=block.translation?`<div class="translation-text">${linkifyText(softTranslation(block))}</div>`:`<div class="source-preview">${linkifyText(block.text)}</div>`;
   let label=block.translation?(block.edited?'已修订':'已翻译'):'待翻译';
   if(block.translation && block.target!==state.target) label=`已有${block.target}译文`;
   if(error) label='翻译失败'; if(working) label='<span class="busy-indicator"></span>翻译中';
@@ -305,6 +362,9 @@ function scrollToPage(index){
   scrollPaneToPage($('#translation-pane'),state.page);
   updateControls();
 }
+// Reader links carry the page they live on as `source_page`; a goto link's
+// `page` is the target page, so only the overlay placement uses source_page.
+function layoutLinksForPage(pageNumber){return (state.layout?.links||[]).filter(link=>link.source_page===pageNumber);}
 function renderTranslations(){
   const pane=$('#translation-pane');
   if(!state.doc){pane.innerHTML='';return;}
@@ -315,7 +375,8 @@ function renderTranslations(){
     const valid=Boolean(state.layout);
     pane.innerHTML=state.doc.pages.map((page,pageIndex)=>{
       const image=valid?`/api/documents/${state.doc.id}/layout/${state.layout.revision}/pages/${page.number}.png`:`/api/documents/${state.doc.id}/pages/${page.number}.png`;
-      return `<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="${image}" alt="第 ${page.number} 页${valid?'译文':'原文占位'}" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=valid?(state.layout.placements[block.id] || block.bbox):block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文，双击编辑" title="单击同步选中，双击编辑译文" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button>`;}).join('')}</div>`;
+      const pageLinks=valid?layoutLinksForPage(page.number):page.links;
+      return `<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="${image}" alt="第 ${page.number} 页${valid?'译文':'原文占位'}" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=valid?(state.layout.placements[block.id] || block.bbox):block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文，双击编辑" title="单击同步选中，双击编辑译文" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button>`;}).join('')}${linkOverlays(pageLinks)}</div>`;
     }).join('');
     if(!valid){const notice=document.createElement('div');notice.className='layout-notice';notice.textContent=state.layoutError || (state.layoutBusy?'正在排版，暂显示原文…':state.running?'翻译中，每页译完后自动更新版式':'暂显示原文，请点击菜单中的重新排版');pane.prepend(notice);}
     $$('#translation-pane .pdf-page img').forEach(img=>img.addEventListener('error',()=>toast('译文页面加载失败，请点击重新排版或切换段落视图')));
@@ -330,7 +391,7 @@ function renderPage(){
   const stack=$('#pdf-page');
   stack.classList.add('pages-stack');
   stack.style.aspectRatio='';
-  stack.innerHTML=state.doc.pages.map((page,pageIndex)=>`<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="/api/documents/${state.doc.id}/pages/${page.number}.png" alt="${escapeHtml(state.doc.name)} 第 ${page.number} 页" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文" title="第 ${page.number} 页第 ${i+1} 段" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button>`;}).join('')}</div>`).join('');
+  stack.innerHTML=state.doc.pages.map((page,pageIndex)=>`<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="/api/documents/${state.doc.id}/pages/${page.number}.png" alt="${escapeHtml(state.doc.name)} 第 ${page.number} 页" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文" title="第 ${page.number} 页第 ${i+1} 段" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button>`;}).join('')}${linkOverlays(page.links)}</div>`).join('');
   $$('#pdf-page img').forEach(img=>img.addEventListener('error',()=>toast('PDF 页面渲染失败，请重新打开文档')));
   renderTranslations();
   scrollToPage(state.page);
@@ -419,6 +480,25 @@ function selectBlock(id,from,extend=false){
   if(offset<0 || offset>origin.clientHeight-40){setPaneScroll(origin,elementTopInPane(origin,original)-35);offset=35;}
   setPaneScroll(dest,elementTopInPane(dest,item)-offset);
 }
+function clearBlockSelection(){
+  if(state.selected===null && !readingInteraction.selection.size)return;
+  state.selected=null;readingInteraction.anchor=null;readingInteraction.selection.clear();applyBlockSelection();
+}
+function readerClick(event,side){
+  const jump=event.target.closest('[data-link-page]');
+  if(jump){
+    const index=Number(jump.dataset.linkPage),fraction=Number(jump.dataset.linkFraction)||0;
+    if(state.doc && index>=0 && index<state.doc.pages.length){
+      scrollPaneToPage($('#source-pane'),index,fraction);
+      scrollPaneToPage($('#translation-pane'),index,fraction);
+      setCurrentPage(index);
+    }
+    return;
+  }
+  const target=event.target.closest('[data-block]');
+  if(target){selectBlock(target.dataset.block,side,event.shiftKey);return;}
+  clearBlockSelection();
+}
 function hoverBlock(id){
   if(readingInteraction.hovered===id)return;
   readingInteraction.hovered=id;
@@ -484,9 +564,7 @@ function readerKeydown(event,side){
     event.preventDefault();
     setReaderZoom(event.key==='0'?1:readerViewport.zoom*(event.key==='-'?1/1.2:1.2),{side});return;
   }
-  if(event.key==='Escape'){
-    state.selected=null;readingInteraction.anchor=null;readingInteraction.selection.clear();applyBlockSelection();return;
-  }
+  if(event.key==='Escape'){clearBlockSelection();return;}
   const item=event.target.closest('[data-block]');
   if(item && ['ArrowUp','ArrowDown'].includes(event.key) && !event.ctrlKey && !event.metaKey && !event.altKey){
     const all=blocks(),index=all.findIndex(block=>block.id===(state.selected || item.dataset.block));
@@ -610,10 +688,10 @@ $('#translation-batch-size').onchange=event=>{state.batchSize=Number(event.targe
 $('#refresh-layout').onclick=()=>refreshLayout();
 $('#translate-all').onclick=()=>{if(state.running){state.stop=true;updateControls();status(`将在已发送的 ${state.activeBlocks.size} 段完成后暂停…`);return;}const pending=blocks().filter(block=>!isTranslated(block));if(!pending.length){toast('全文已翻译完成。如需调整，可对单段重新翻译。');return;}runTranslation(pending);};
 $('#translate-page').onclick=()=>{const pending=currentPage().blocks.filter(block=>!isTranslated(block));if(!pending.length){toast('本页已翻译完成');return;}runTranslation(pending);};
-$('#source-pane').onclick=event=>{const block=event.target.closest('[data-block]');if(block)selectBlock(block.dataset.block,'source',event.shiftKey);};
+$('#source-pane').onclick=event=>readerClick(event,'source');
 $('#translation-pane').onclick=async event=>{
-  const button=event.target.closest('[data-action]'),card=event.target.closest('[data-block]');
-  if(card)selectBlock(card.dataset.block,'translation',event.shiftKey);
+  const button=event.target.closest('[data-action]');
+  readerClick(event,'translation');
   if(!button)return;
   const block=blocks().find(block=>block.id===button.dataset.id);
   if(button.dataset.action==='translate')runTranslation([block]);

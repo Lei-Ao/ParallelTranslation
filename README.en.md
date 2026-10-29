@@ -9,7 +9,9 @@ The application displays the name “页间 Parallel”. Its interface is curren
 ## Features
 
 - **Parallel reading**: continuous pages, bidirectional synchronized scrolling, paragraph navigation, zoom, and panning.
+- **Desktop launcher**: on Windows, `start.bat` or `start.vbs` starts the app in the system tray without leaving a terminal window open. Closing the browser does not stop the service; the tray menu can open the workbench, restart, stop, or exit.
 - **Layout-aware output**: preserve page dimensions and graphics, and typeset translations in safe regions using source typography, column geometry, and paragraph spacing.
+- **Preserved links**: web links and in-document jumps are re-anchored to the translated text and stay clickable; link text keeps the source color, and all line fragments of a wrapped link highlight together as one link.
 - **Bring your own AI**: OpenAI-compatible Chat Completions APIs or a configurable HTTP JSON agent.
 - **Contextual translation**: surrounding paragraphs, completed translations, target language, terminology, and custom instructions.
 - **Concurrency and recovery**: configurable parallel requests and same-page batches, pause/resume, bounded retries, and reuse of saved translations.
@@ -23,8 +25,8 @@ The application displays the name “页间 Parallel”. Its interface is curren
 
 1. Install **Python 3.10 or newer** and make sure `python` is available in your terminal.
 2. Clone this repository, or use GitHub’s **Code → Download ZIP** and extract the archive.
-3. Double-click **`start.bat`** in the project root.
-4. The first launch creates `.venv` and installs pinned dependencies. When the local server is ready, it opens <http://127.0.0.1:8765>.
+3. Double-click **`start.bat`** in the project root. The first launch creates `.venv` and installs pinned dependencies (a terminal window is shown briefly during this step).
+4. Afterwards, double-click `start.bat` or **`start.vbs`**. No terminal window stays open: a “页间 Parallel” tray icon appears and the workbench opens at <http://127.0.0.1:8765>.
 
 ```powershell
 git clone https://github.com/Lei-Ao/ParallelTranslation.git
@@ -32,7 +34,7 @@ cd ParallelTranslation
 .\start.bat
 ```
 
-Keep the launcher window open while using the app. Press **Ctrl+C** to stop the server. If an instance is already running, launching again opens that instance.
+Double-click the tray icon to open the workbench. Its context menu offers **打开工作台**, **重新启动服务**, **启动服务 / 停止服务**, and **停止并退出**. Closing the browser does not stop the service; use **停止并退出** in the tray menu, or double-click **`stop.bat`**, to stop it completely. Server logs are written to `tmp/parallel.log`. Launching an already running instance only opens the workbench again.
 
 Do not open `static/index.html` directly: PDF extraction, persistence, and API requests require the local backend. The current regression environment is Windows / Python 3.12.
 
@@ -90,7 +92,7 @@ Only non-streaming JSON responses completed in one request are supported. SSE, p
 1. Select a target language on the home page and optionally enter terminology and translation instructions.
 2. Import a text-based PDF. The app extracts and translates its text, shows progress, and opens the reader when translation and typesetting finish.
 3. Pause when needed. Resume after failures to skip already saved translations in the current target language.
-4. Click a paragraph to locate its counterpart. Double-click translated text to edit, or select the paragraph editing view from the top-right menu.
+4. Click a paragraph to locate its counterpart; click blank space to clear the selection. Double-click translated text to edit, or select the paragraph editing view from the top-right menu.
 5. Use the menu to change language, concurrency, batch size, synchronized scrolling, or reading mode; regenerate the layout; download the PDF; or export bilingual Markdown.
 
 The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **3 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
@@ -120,6 +122,10 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 - PDFs must have **1–300 pages** and be no larger than **50 MB**.
 - Scans require OCR beforehand; automatic OCR is not included.
 - Columns, rotation, headings, author information, inline symbols, drop caps, and references use general layout rules. Complex documents can still have extraction or typesetting errors.
+- A cover title extracted as several text blocks is merged into one title group and typeset with the source title's size and weight. Author affiliation markers stay superscripted regardless of whether they follow the surname directly, a comma, a space, or a footnote symbol. Rotated covers and titles that do not start on the first page still follow the conservative per-block path.
+- A bibliography that cannot be rebuilt into complete entries (multi-page lists, unquoted book titles, non-contiguous numbering) is retained as a whole and explained in the layout report, so one entry is never mixed between languages or overwritten by an expanded translation. The heading itself is still translated. Continuation pages without recognizable numbering are treated as ordinary text.
+- Web links and in-document jumps (citations, figures, contents) are re-anchored onto the translation. When a rewritten anchor text cannot be located, an external link is no longer clickable and the layout report says so; internal jumps fall back to their original position. Link color is inherited from the source; decorative underlines are not rebuilt. The reader only draws a click overlay for links that can be reliably located or whole-block anchored; jumps kept at their original position remain clickable in the exported PDF.
+- A model may return one paragraph as several lines; the layout and reader merge soft line breaks inside one source paragraph (line-structured lists and notation blocks keep their breaks). The edit dialog and saved translation text are not rewritten.
 - Display equations, complex tables, vertical text, or text that cannot fit safely may retain the complete original. Tables generally retain their contents while their captions and notes are translated.
 - Text inside images is not recognized or replaced. Translation progress counts saved paragraph translations, not the proportion of PDF regions successfully replaced.
 - The source is displayed as rendered pages with paragraph interactions. Free text selection, full-text search, and embedded PDF annotations are not implemented in the source reader.
@@ -131,7 +137,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
-node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js
+node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js
 ```
 
 Tests use temporary PDFs and simulated endpoints, without consuming real AI service credits. An optional audit of documents already translated on your machine is available:
@@ -145,6 +151,9 @@ It writes reports and previews to `tmp/source-layout-audit/`. Personal paper sam
 ```text
 app.py                  FastAPI, persistence, agent adapters, exports
 launch.py               Local startup and browser launch
+start.bat / start.vbs   One-click Windows launch (hidden console, tray control)
+stop.bat                Stop the local server and tray
+tray.ps1                Windows tray menu (open/restart/stop/exit)
 pdf_text.py             Drop-cap recovery and complete words
 pdf_layout.py           Typesetting, obstacle handling, page caches
 pdf_flow.py             Column reflow and equation relocation

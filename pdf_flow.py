@@ -273,10 +273,15 @@ def reflow_columns(prepared, native, graphics, source_rects, page_width, prose):
                     box = pymupdf.Rect(result["rect"])
                     top = pymupdf.Rect(prior_result["rect"]).y1 + gap
                     if top < box.y0 - 2:
-                        swept = pymupdf.Rect(box.x0, top, box.x1, box.y1)
+                        # Moving up only crosses the strip above the old top.
+                        # Content below the shortened block no longer blocks it;
+                        # keeping the old bottom in the collision test left a
+                        # gap under headings whose following text could move.
+                        moved = pymupdf.Rect(box.x0, top, box.x1, top + box.height)
+                        swept = pymupdf.Rect(box.x0, top, box.x1, max(box.y0, moved.y1))
                         other_text = [pymupdf.Rect(other["rect"]) for _, _, other in prepared if other is not result]
                         if not any(overlap(swept, obstacle) > .1 for obstacle in fixed + other_text):
-                            result["rect"] = [box.x0, top, box.x1, top + box.height]
+                            result["rect"] = [moved.x0, moved.y0, moved.x1, moved.y1]
                             adjustments.append({"blocks": block.get("_members", [block["id"]]),
                                                 "previous": prior.get("_members", [prior["id"]]),
                                                 "previous_bottom": pymupdf.Rect(prior_result["rect"]).y1,

@@ -19,6 +19,34 @@ class ParagraphSpacingTests(unittest.TestCase):
             {"spans": [{"bbox": box, "origin": (box[0], box[1] + size),
                          "size": size, "text": PROSE}]} for box in boxes]}
 
+    def test_heading_and_body_move_together_when_fixed_content_is_below(self):
+        def item(identifier, text, rect):
+            return ({"id": identifier, "text": text},
+                    {"size": 10, "lines": [], "spans": []}, {"rect": list(rect)})
+        source_rects = {"a": pymupdf.Rect(300, 100, 560, 200),
+                        "h": pymupdf.Rect(300, 207, 420, 219),
+                        "b": pymupdf.Rect(300, 224, 560, 300)}
+        prepared = [item("a", PROSE, pymupdf.Rect(300, 100, 560, 150)),
+                    item("h", "A. Data Collection", pymupdf.Rect(300, 207, 420, 219)),
+                    item("b", PROSE, pymupdf.Rect(300, 224, 560, 300))]
+        # A preserved formula lies inside the body's old box but below the new
+        # destination: it must not block pulling the body up under its heading.
+        adjustments = reflow_columns(prepared, [], [pymupdf.Rect(300, 285, 560, 295)],
+                                     source_rects, 600, pdf_layout.is_prose)
+        self.assertTrue(adjustments)
+        heading, body = prepared[1][2]["rect"], prepared[2][2]["rect"]
+        self.assertLess(body[1], 224)
+        self.assertAlmostEqual(body[1], heading[3] + 5.0, places=2)
+
+        # Content that really sits between the old and the new position still
+        # blocks the move.
+        prepared = [item("a", PROSE, pymupdf.Rect(300, 100, 560, 150)),
+                    item("h", "A. Data Collection", pymupdf.Rect(300, 207, 420, 219)),
+                    item("b", PROSE, pymupdf.Rect(300, 224, 560, 300))]
+        reflow_columns(prepared, [], [pymupdf.Rect(300, 180, 560, 195)],
+                       source_rects, 600, pdf_layout.is_prose)
+        self.assertEqual(prepared[2][2]["rect"], [300, 224, 560, 300])
+
     def test_full_width_two_line_body_is_not_centered(self):
         rect = pymupdf.Rect(100, 100, 500, 123)
         style = self.style([[100, 100, 500, 110], [100, 113, 498, 123]])

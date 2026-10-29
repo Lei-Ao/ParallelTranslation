@@ -66,6 +66,20 @@ test('selection preserves the clicked paragraph position and mirrors range selec
   assert.ok(r.originals.get('b').classes.has('selected'));
   assert.ok(r.translations.get('c').classes.has('selected'));
 });
+test('clicking blank space clears the selection, block clicks keep selecting',()=>{
+  const r=reader();r.eval("selectBlock('b','source')");
+  r.eval("selectBlock('c','translation',true)");
+  assert.equal(r.eval('readingInteraction.selection.size'),2);
+  r.eval("readerClick({target:{closest:()=>null}},'source')");
+  assert.equal(r.eval('state.selected'),null);
+  assert.equal(r.eval('readingInteraction.selection.size'),0);
+  assert.ok(!r.originals.get('b').classes.has('selected'));
+  assert.ok(!r.translations.get('c').classes.has('selected'));
+  r.eval("readerClick({target:{closest:selector=>selector==='[data-block]'?{dataset:{block:'b'}}:null}},'translation')");
+  assert.equal(r.eval('state.selected'),'b');
+  assert.ok(r.originals.get('b').classes.has('selected'));
+  assert.ok(r.translations.get('b').classes.has('selected'));
+});
 test('hover is shared, and escape clears selection on both sides',()=>{
   const r=reader();r.eval("hoverBlock('b');selectBlock('b','source')");
   assert.ok(r.originals.get('b').classes.has('linked-hover'));

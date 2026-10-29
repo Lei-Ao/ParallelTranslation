@@ -47,6 +47,54 @@ class LayoutTests(unittest.TestCase):
         equation = self.native_block("2L sin θ ≤ D", [50, 50, 280, 100], "STIXTwoMath")
         self.assertIn("公式", pdf_layout.inspect_block([equation], pymupdf.Rect(50, 50, 280, 100))[1])
 
+    def test_small_caps_heading_measures_nominal_size(self):
+        def span(text, box, size):
+            return {"bbox": box, "text": text, "font": "NimbusRomNo9L-Regu", "size": size, "color": 0, "flags": 0}
+        caps_line = {"bbox": [50, 50, 265, 62], "dir": (1, 0), "spans": [
+            span("IV. M", [50, 50, 72, 62], 10), span("ODEL-BASED", [72, 51.5, 130, 61], 8),
+            span(" FOR", [130, 51.5, 160, 61], 8)]}
+        native = [{"type": 0, "bbox": caps_line["bbox"], "lines": [caps_line]}]
+        style, reason = pdf_layout.inspect_block(native, pymupdf.Rect(caps_line["bbox"]))
+        self.assertIsNone(reason)
+        self.assertEqual(style["size"], 10)
+        lower_line = {"bbox": [50, 80, 200, 92], "dir": (1, 0), "spans": [
+            span("Fig. ", [50, 80, 68, 92], 10), span("model measurement", [68, 81.5, 130, 91], 8)]}
+        style, reason = pdf_layout.inspect_block(
+            [{"type": 0, "bbox": lower_line["bbox"], "lines": [lower_line]}],
+            pymupdf.Rect(lower_line["bbox"]))
+        self.assertIsNone(reason)
+        self.assertEqual(style["size"], 8)
+
+    def test_wrapped_numbered_heading_lines_merge_into_one_block(self):
+        with pymupdf.open() as pdf:
+            page = pdf.new_page(width=400, height=400)
+            native = [self.native_block("IV. MODEL-BASED META-LEARNING FOR", [50, 50, 350, 62]),
+                      self.native_block("QUADCOPTER PAYLOAD TRANSPORT", [60, 64, 340, 76])]
+            blocks = [{"id": "0", "text": native[0]["lines"][0]["spans"][0]["text"],
+                       "bbox": [.125, .125, .875, .155], "translation": "IV. 基于模型的元学习用于", "target": "简体中文"},
+                      {"id": "1", "text": native[1]["lines"][0]["spans"][0]["text"],
+                       "bbox": [.15, .16, .85, .19], "translation": "四旋翼飞行器载荷运输", "target": "简体中文"}]
+            grouped = pdf_layout.layout_blocks(page, {"blocks": blocks}, native, "简体中文")
+            self.assertEqual(len(grouped), 1)
+            self.assertEqual(grouped[0]["_members"], ["0", "1"])
+            self.assertEqual(grouped[0]["translation"], "IV. 基于模型的元学习用于四旋翼飞行器载荷运输")
+
+    def test_numbered_heading_stays_separate_from_other_structures(self):
+        with pymupdf.open() as pdf:
+            page = pdf.new_page(width=400, height=400)
+            upper = self.native_block("IV. MODEL-BASED META-LEARNING FOR", [50, 50, 350, 62])
+            for lower_text, lower_box in (
+                    ("A. Suspending a payload under a quadcopter", [50, 64, 350, 76]),
+                    ("The method is useful for the control of a robot here.", [50, 64, 350, 100])):
+                with self.subTest(lower=lower_text[:14]):
+                    lower = self.native_block(lower_text, lower_box)
+                    blocks = [{"id": "0", "text": upper["lines"][0]["spans"][0]["text"],
+                               "bbox": [.125, .125, .875, .155], "translation": "IV. 标题", "target": "简体中文"},
+                              {"id": "1", "text": lower_text,
+                               "bbox": [n / 400 for n in lower_box], "translation": "后续内容。", "target": "简体中文"}]
+                    grouped = pdf_layout.layout_blocks(page, {"blocks": blocks}, [upper, lower], "简体中文")
+                    self.assertEqual(len(grouped), 2)
+
     def test_inline_math_normalization_preserves_script_markup_and_operators(self):
         self.assertEqual(pdf_layout.normalized_inline_math("z_B = [0, 0, T_r]^T"), "zB=[0,0,Tr]T")
         self.assertEqual(pdf_layout.normalized_inline_math("g = [0, 0, −9.81]^T"), "g=[0,0,-9.81]T")

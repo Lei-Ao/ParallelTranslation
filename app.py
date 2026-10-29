@@ -17,7 +17,7 @@ from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from pdf_layout import PDF_LOCK, build_layout
+from pdf_layout import PDF_LOCK, build_layout, goto_fraction
 from pdf_references import normalize_document, translation_source, format_translation
 from pdf_text import DROP_CAP_SCHEMA, normalize_drop_caps
 
@@ -128,12 +128,21 @@ def load_doc(doc_id: str) -> dict:
     directory = doc_dir(doc_id)
     with WRITE_LOCK:
         document = json.loads((directory / "document.json").read_text(encoding="utf-8"))
-        if ((not document.get("reference_scan") or document.get("drop_cap_schema") != DROP_CAP_SCHEMA)
+        if ((not document.get("reference_scan") or document.get("drop_cap_schema") != DROP_CAP_SCHEMA
+                or not document.get("links_scan"))
                 and (directory / "source.pdf").is_file()):
             with PDF_LOCK, pymupdf.open(directory / "source.pdf") as pdf:
                 if not document.get("reference_scan"):
                     normalize_document(document, pdf)
                     document["reference_scan"] = 1
+                if not document.get("links_scan"):
+                    try:
+                        names = pdf.resolve_names()
+                    except Exception:
+                        names = {}
+                    for saved_page, page in zip(document["pages"], pdf):
+                        saved_page["links"] = scan_page_links(page, pdf, names)
+                    document["links_scan"] = 1
                 normalize_drop_caps(document, pdf)
             save_doc(directory, document)
     return document
@@ -158,6 +167,68 @@ def find_block(doc, block_id):
     raise HTTPException(404, "段落不存在")
 
 
+_URL_TEXT = re.compile(r"https?://[^\s\u3400-\u9fff<>\"'，。；：！？）】」』《【〕]+")
+_URL_TRAILING = ".,;:!?)]}'\"。、；，！？）：」』）"
+
+
+def scan_page_links(page, pdf, names):
+    """Clickable regions of a source page, in displayed normalized coordinates.
+
+    Annotation links come first; literal URLs painted as plain text are then
+    detected from the characters, so references the publisher never linked
+    still work in the reader. Rectangles normalize like text block bboxes.
+    """
+    bounds = page.rect
+    entries, taken = [], []
+
+    def add(rect, kind, **payload):
+        rect = pymupdf.Rect(rect)
+        if rect.is_empty or not rect.is_valid or rect.get_area() <= 0:
+            return
+        for other in taken:
+            shared = (max(0, min(rect.x1, other.x1) - max(rect.x0, other.x0))
+                      * max(0, min(rect.y1, other.y1) - max(rect.y0, other.y0)))
+            if shared > min(rect.get_area(), other.get_area()) * .6:
+                return
+        taken.append(pymupdf.Rect(rect))
+        entries.append({"kind": kind,
+                        "from": [round(rect.x0 / bounds.width, 5), round(rect.y0 / bounds.height, 5),
+                                 round(rect.x1 / bounds.width, 5), round(rect.y1 / bounds.height, 5)],
+                        **payload})
+
+    for link in page.get_links():
+        if link.get("kind") == pymupdf.LINK_URI:
+            uri = (link.get("uri") or "").strip()
+            if re.match(r"(?:https?|mailto):", uri, re.I):
+                add(link["from"], "uri", uri=uri)
+            continue
+        target, point = link.get("page"), link.get("to")
+        if link.get("kind") == pymupdf.LINK_NAMED and names:
+            resolved = names.get(link.get("name") or link.get("nameddest") or "")
+            if resolved:
+                target, point = resolved.get("page"), resolved.get("to") or point
+        if isinstance(target, int) and 0 <= target < len(pdf):
+            add(link["from"], "goto", page=target + 1, fraction=goto_fraction(pdf[target], point))
+    for block in page.get_text("rawdict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            direction = line.get("dir", (1, 0))
+            if abs(direction[0] - 1) > .01 or abs(direction[1]) > .01:
+                continue
+            chars = [char for span in line.get("spans", []) for char in span.get("chars", [])]
+            text = "".join(char.get("c", "") for char in chars)
+            for match in _URL_TEXT.finditer(text):
+                uri = match[0].rstrip(_URL_TRAILING)
+                if len(uri) < 9:
+                    continue
+                box = pymupdf.Rect(chars[match.start()]["bbox"])
+                for char in chars[match.start() + 1:match.start() + len(uri)]:
+                    box |= pymupdf.Rect(char["bbox"])
+                add(box * page.rotation_matrix, "uri", uri=uri)
+    return entries
+
+
 def extract_document(raw: bytes, name: str) -> tuple[str, dict]:
     with PDF_LOCK:
         return _extract_document(raw, name)
@@ -174,6 +245,10 @@ def _extract_document(raw: bytes, name: str) -> tuple[str, dict]:
         if not 1 <= len(pdf) <= 300:
             raise HTTPException(400, "支持 1–300 页的 PDF，请将较长文档拆分后导入")
         pages = []
+        try:
+            names = pdf.resolve_names()
+        except Exception:
+            names = {}
         for number, page in enumerate(pdf):
             blocks = []
             # Extraction coordinates are unrotated; map them to displayed page coordinates.
@@ -192,6 +267,7 @@ def _extract_document(raw: bytes, name: str) -> tuple[str, dict]:
                                "target": "", "edited": False})
             pages.append({"number": number + 1, "width": page.rect.width,
                           "height": page.rect.height, "blocks": blocks,
+                          "links": scan_page_links(page, pdf, names),
                           "needs_ocr": not bool(blocks)})
         doc_id = uuid.uuid4().hex
         doc = {"id": doc_id, "name": name, "created": datetime.now(timezone.utc).isoformat(),
@@ -199,6 +275,7 @@ def _extract_document(raw: bytes, name: str) -> tuple[str, dict]:
         normalize_document(doc, pdf)
         normalize_drop_caps(doc, pdf)
         doc["reference_scan"] = 1
+        doc["links_scan"] = 1
         path = DATA / doc_id
         path.mkdir()
         (path / "source.pdf").write_bytes(raw)

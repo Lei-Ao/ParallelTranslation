@@ -18,15 +18,24 @@ import pymupdf
 from pdf_typography import font_resources, font_signature, space_cjk_latin
 from pdf_flow import (visible_drawings, heading as section_heading, original_formula_units,
                       column_lanes, reflow_columns, text_ink_bounds)
-from pdf_references import prepare_bibliography
+from pdf_references import (REFERENCE_MARK, fallback_reference_regions, prepare_bibliography,
+                            reference_fallback_pages)
 from pdf_text import normalize_drop_caps
 
 ET.register_namespace("", "http://www.w3.org/2000/svg")
 ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
 
 PDF_LOCK = threading.RLock()
-ENGINE_VERSION = 42
+ENGINE_VERSION = 55
 MATH_FONT = re.compile(r"math|symbol|cmmi|cmsy|cmex|msam|msbm|stmary|rsfs", re.I)
+INSTITUTION = re.compile(r"universit|institut|laborator|department|school|academy|college|hospital|研究所|大学|学院|实验室", re.I)
+# Author lines mark affiliations with raised digits. Publishers put them right
+# after the surname ("Schoellig1,2"), after a comma ("Panerati,1,2"), after a
+# space or CJK punctuation, and sometimes beside a footnote symbol. The whole
+# marker is one superscript run; a preceding name is not part of the markup.
+AUTHOR_MARKS = re.compile(
+    r"(?<![\d])(?P<marks>\d{1,2}(?:\s*[,，]\s*\d{1,2})*)(?=[\s,，、;；*∗†‡]|$)",
+    re.UNICODE)
 _INLINE_MATH_FONT = re.compile(r"^(?:CM[A-Z]+\d*|MSAM\d*|MSBM\d*|STMARY\w*|RSFS\w*|SYMBOL\w*|.*MATH.*)$", re.I)
 _INLINE_MATH_PRIMARY = re.compile(r"^(?:CMMI|CMSY|CMEX|MSAM|MSBM|STMARY|RSFS|SYMBOL|.*MATH.*)", re.I)
 
@@ -63,6 +72,37 @@ def is_prose(text):
 
 def narrative_fragment(text):
     return is_prose(text) or bool(re.match(r"\s*where\b", text, re.I)) or bool(re.search(r"\b(?:is the|is a|when the|denotes the)\b", text, re.I))
+
+
+_LIST_LINE = re.compile(r"(?m)^\s*(?:[•·●▪▫◦‣∙⋅※■□◆◇]|\(?\d{1,2}[.)]|[A-Za-z][.)])\s+")
+
+
+def join_soft_lines(value):
+    """Treat line breaks inside one source paragraph as soft wraps.
+
+    Models sometimes return a paragraph as several lines. A single extraction
+    block is one paragraph, so those breaks must not become forced breaks in
+    the middle of the translation. Strong CJK punctuation still glues the two
+    lines directly; otherwise one space keeps Latin words separated.
+    """
+    text = re.sub(r"[ \t]*\r?\n+[ \t]*", " ", value or "").strip()
+    return re.sub(r"(?<=[。！？；：，、]) (?=[\u3400-\u9fff（“‘《【])", "", text)
+
+
+def soft_translation(block):
+    """Collapse translation-only line breaks for prose blocks, never for lists.
+
+    A translated paragraph must stay one paragraph. Blocks that are lists,
+    nomenclature tables or other line-structured fragments keep their breaks.
+    """
+    text = block.get("translation") or ""
+    if "\n" not in text and "\r" not in text:
+        return text
+    source = block.get("text") or ""
+    if (not is_prose(source) or _LIST_LINE.search(source)
+            or re.search(r"\n[ \t]*\n", source)):
+        return text
+    return join_soft_lines(text)
 
 
 def normalized_text(value):
@@ -191,7 +231,7 @@ def _normalized_page_chars(page):
     return "".join(normalized), mapping, chars
 
 
-def _inline_math_match(text, needle, start, mapping, chars):
+def _inline_math_match(text, needle, start, mapping, chars, strict=True):
     if not needle:
         return None
     while True:
@@ -201,10 +241,12 @@ def _inline_math_match(text, needle, start, mapping, chars):
         before = text[index - 1] if index else ""
         after_index = index + len(needle)
         after = text[after_index] if after_index < len(text) else ""
-        boundary = not (needle[0].isascii() and needle[0].isalnum()
-                        and before.isascii() and before.isalnum())
-        boundary = boundary and not (needle[-1].isascii() and needle[-1].isalnum()
-                                     and after.isascii() and after.isalnum())
+        boundary = True
+        if strict:
+            boundary = not (needle[0].isascii() and needle[0].isalnum()
+                            and before.isascii() and before.isalnum())
+            boundary = boundary and not (needle[-1].isascii() and needle[-1].isalnum()
+                                         and after.isascii() and after.isalnum())
         if not boundary:
             start = index + 1
             continue
@@ -353,6 +395,276 @@ def formula_glyph_bounds(page, spans, raw_native):
         return None
     x, y, width, height = map(float, ET.fromstring(assets[0]["svg"]).get("viewBox").split())
     return pymupdf.Rect(x, y, x + width, y + height)
+
+
+_AUTO_URL = re.compile(r"https?://[^\s\u3400-\u9fff<>\"'，。；：！？）】」』《【〕]+")
+_URL_TRAILING = ".,;:!?)]}'\"。、；，！？）：」』）》"
+
+
+def _trim_url(value):
+    return value.rstrip(_URL_TRAILING)
+
+
+def page_link_targets(page, names=None):
+    """Actionable link annotations of one page, in unrotated page coordinates.
+
+    PyMuPDF reports link rectangles in displayed coordinates, and clearing the
+    runtime rotation does not change them. Derotate with the page's current
+    rotation, so callers must not reset the rotation first: the rectangles then
+    share the coordinate space of text extraction and block rectangles. Only
+    kinds the reader can act on are kept: web/mailto references and jumps
+    inside the document.
+    """
+    targets = []
+    for link in page.get_links():
+        kind = link.get("kind")
+        box = pymupdf.Rect(link.get("from") or (0, 0, 0, 0)) * page.derotation_matrix
+        if box.is_empty or not box.is_valid or box.get_area() <= 0:
+            continue
+        if kind == pymupdf.LINK_URI:
+            uri = (link.get("uri") or "").strip()
+            if re.match(r"(?:https?|mailto):", uri, re.I):
+                targets.append({"rect": [box.x0, box.y0, box.x1, box.y1], "kind": "uri", "uri": uri})
+            continue
+        target, point = link.get("page"), link.get("to")
+        if kind == pymupdf.LINK_NAMED and names:
+            resolved = names.get(link.get("name") or link.get("nameddest") or "")
+            if resolved:
+                target = resolved.get("page")
+                point = resolved.get("to") or point
+        if not isinstance(target, int) or target < 0:
+            continue
+        where = pymupdf.Point(point) if point else pymupdf.Point(0, 0)
+        targets.append({"rect": [box.x0, box.y0, box.x1, box.y1], "kind": "goto",
+                        "page": target, "to": [where.x, where.y]})
+    return targets
+
+
+def goto_fraction(page, point):
+    """Vertical reading fraction of a link destination on its target page."""
+    point = pymupdf.Point(point or (0, 0))
+    height = page.rect.height
+    if not height:
+        return 0.0
+    value = point.x if page.rotation % 180 else point.y
+    return max(0.0, min(1.0, value / height))
+
+
+_LINK_TRIM = ",.;:!?，。；：！？、·…—–-\"'“”‘’"
+
+
+def link_needle(value):
+    """Normalize an annotation's visible text into a search needle.
+
+    Translations regularly move or change the punctuation at the edge of the
+    linked phrase ("[19]," becomes "[19]"), so edge punctuation is not part of
+    the needle. Brackets stay: they identify citation and figure references.
+    """
+    return normalized_inline_math((value or "").strip().strip(_LINK_TRIM).strip())
+
+
+def link_needle_usable(needle):
+    # Very short needles match unrelated text; URLs and citation markers are
+    # longer than this after normalization.
+    return 3 <= len(needle or "") <= 600
+
+
+def _link_text_items(native, box=None):
+    """Visible characters (or spans) of `native`, optionally inside one box.
+
+    Character boxes make the annotation's own text precise: a link that covers
+    only "[19]" inside a long extracted line must not borrow the whole line as
+    its anchor text. `native` is a rawdict block list when characters are
+    available, otherwise a plain dict block list.
+    """
+    items = []
+    for item in native:
+        if item.get("type", 0) != 0:
+            continue
+        for line in item.get("lines", []):
+            for span in line.get("spans", []):
+                color = span.get("color", 0)
+                chars = span.get("chars")
+                if chars:
+                    for char in chars:
+                        value = char.get("c", "")
+                        if not value.strip():
+                            continue
+                        char_box = pymupdf.Rect(char["bbox"])
+                        if box is not None and not (
+                                overlap(char_box, box) >= char_box.get_area() * .5
+                                or box.contains((char_box.tl + char_box.br) * .5)):
+                            continue
+                        items.append((round(char_box.y0, 1), char_box.x0, value, color))
+                else:
+                    text = span.get("text", "")
+                    if not text.strip():
+                        continue
+                    span_box = pymupdf.Rect(span["bbox"])
+                    if box is not None and not (
+                            overlap(span_box, box) >= span_box.get_area() * .5
+                            or box.contains((span_box.tl + span_box.br) * .5)):
+                        continue
+                    items.append((round(span_box.y0, 1), span_box.x0, text, color))
+    items.sort(key=lambda item: (item[0], item[1]))
+    return items
+
+
+def block_link_hints(page_links, rect, native, raw_native=None):
+    """Link annotations inside one block, with the source text they cover.
+
+    That text becomes the search needle which re-anchors the link onto the
+    translated paragraph; without a reliable text match no hint is emitted,
+    because a guessed rectangle would point at unrelated content. A link that
+    covers nearly the whole block is also marked as a whole-block link: if its
+    text cannot be found in the translation, the link is attached to the
+    translated block instead of being dropped (fully linked titles, author
+    lines and license sentences are common).
+
+    `color` is the source link text's color when the annotation covers text
+    (publishers style links black, blue or gray); it lets the translation keep
+    the original appearance instead of the HTML default link blue.
+    """
+    source = raw_native if raw_native is not None else native
+    block_parts = _link_text_items(source, rect)
+    block_text = normalized_inline_math(" ".join(text for _, _, text, _ in block_parts))
+    hints = []
+    for link in page_links:
+        box = pymupdf.Rect(link["rect"])
+        if overlap(box, rect) < box.get_area() * .5:
+            continue
+        parts = _link_text_items(source, box)
+        needle = link_needle(" ".join(text for _, _, text, _ in parts))
+        if not link_needle_usable(needle):
+            continue
+        colors = Counter(color for _, _, text, color in parts for _ in text.strip())
+        hint = {"needle": needle, "kind": link["kind"], "source": link["rect"],
+                "color": "#%06x" % colors.most_common(1)[0][0] if colors else None,
+                "whole_block": bool(block_text) and len(needle) / len(block_text) >= .9}
+        if link["kind"] == "uri":
+            hint["uri"] = link["uri"]
+        else:
+            hint["page"] = link["page"]
+            hint["to"] = link.get("to") or [0, 0]
+        hints.append(hint)
+    return hints
+
+
+def _needle_occurrences(text, needle, strict=True):
+    """Boundary-aware occurrence positions.
+
+    The same boundary rule runs when the anchor is located on the rendered
+    overlay page, so occurrence ordinals stay aligned between both searches.
+    Link needles opt out of the boundary rule: normalized text removes the
+    spaces around a URL or cross-reference, and such needles come from real
+    annotations or unambiguous scheme-prefixed URLs, not short variables.
+    """
+    positions, start = [], 0
+    while True:
+        index = text.find(needle, start)
+        if index < 0:
+            return positions
+        start = index + 1
+        if strict:
+            end = index + len(needle)
+            before = text[index - 1] if index else ""
+            after = text[end] if end < len(text) else ""
+            if needle[0].isascii() and needle[0].isalnum() and before.isascii() and before.isalnum():
+                continue
+            if needle[-1].isascii() and needle[-1].isalnum() and after.isascii() and after.isalnum():
+                continue
+        positions.append(index)
+
+
+def _link_ranges(value, text, mapping, matches, links):
+    """Resolve link hints and literal URLs to ranges in the displayed text.
+
+    Annotated links match by normalized source text (whitespace and NFKC
+    differences ignored); any further http(s) URL that survived translation
+    is anchored too. Math images win over links, and overlapping candidates
+    keep the earliest, most specific one.
+    """
+    candidates = []
+    math_ranges = [(start, end) for start, end, _ in matches]
+    for hint in links or ():
+        needle = link_needle(hint.get("needle") or "")
+        if not link_needle_usable(needle):
+            continue
+        for ordinal, index in enumerate(_needle_occurrences(text, needle, strict=False)):
+            end = index + len(needle)
+            start, stop = mapping[index], mapping[end - 1] + 1
+            candidates.append({"start": start, "end": stop, "kind": hint["kind"],
+                               "uri": hint.get("uri"), "page": hint.get("page"),
+                               "to": hint.get("to"), "source": hint.get("source"),
+                               "color": hint.get("color"),
+                               "ordinal": ordinal, "text": value[start:stop]})
+    for match in _AUTO_URL.finditer(value):
+        url = _trim_url(match[0])
+        if len(url) < 9:
+            continue
+        start = match.start()
+        needle = normalized_inline_math(url)
+        occurrences = _needle_occurrences(text, needle, strict=False)
+        ordinal = next((order for order, index in enumerate(occurrences)
+                        if mapping[index] == start), None)
+        if ordinal is None:
+            continue
+        candidates.append({"start": start, "end": start + len(url), "kind": "uri",
+                           "uri": url, "page": None, "to": None, "source": None,
+                           "ordinal": ordinal, "text": url})
+    accepted = []
+    for item in sorted(candidates, key=lambda item: (item["start"], -item["end"])):
+        if any(item["start"] < end and start < item["end"] for start, end in math_ranges):
+            continue
+        if any(item["start"] < other["end"] and other["start"] < item["end"] for other in accepted):
+            continue
+        accepted.append(item)
+    return accepted
+
+
+def anchor_overlay_rects(page, anchors):
+    """Rendered rectangles of link anchor texts on a preflight overlay page.
+
+    The search runs over the painted characters, so ligatures, line breaks and
+    hyphenation inside a URL do not prevent matching. An anchor wrapped across
+    lines yields one rectangle per line. Repeated URLs are told apart by the
+    occurrence ordinal recorded when the markup was built.
+    """
+    text, mapping, chars = _normalized_page_chars(page)
+    if not text:
+        return []
+    placed = []
+    for anchor in anchors:
+        needle = normalized_inline_math(anchor.get("text", ""))
+        if len(needle) < 3:
+            continue
+        found, position = None, 0
+        for _ in range(int(anchor.get("ordinal", 0)) + 1):
+            # Anchor text was already matched in the translation; normalized
+            # text removes the space before a URL ("URL http://..."), so the
+            # generic word-boundary rule must not reject it here.
+            found = _inline_math_match(text, needle, position, mapping, chars, strict=False)
+            if not found:
+                break
+            position = found["end"]
+        if not found:
+            continue
+        rows = {}
+        for char in chars[found["first"]:found["last"] + 1]:
+            rows.setdefault(char["line"], []).append(char)
+        rects = []
+        for group in rows.values():
+            box = pymupdf.Rect(group[0]["bbox"])
+            for char in group[1:]:
+                box |= pymupdf.Rect(char["bbox"])
+            box = box + (-.2, -.2, .2, .2)
+            if box.width > 1 and box.height > 1:
+                rects.append([box.x0, box.y0, box.x1, box.y1])
+        if rects:
+            placed.append({"kind": anchor.get("kind", "uri"), "uri": anchor.get("uri"),
+                           "page": anchor.get("page"), "to": anchor.get("to"),
+                           "source": anchor.get("source"), "rects": rects})
+    return placed
 
 
 BOLD_MARKER = re.compile(r"(Q\d+[\).]|(?<!\d)\d{1,2}[\).]|(?<![A-Za-z])[A-Za-z][\).]|[•·●▪◆])\s*$")
@@ -573,7 +885,7 @@ def list_marker_style(block, style, size):
                      "size": size * ratio, "weight": weight}
 
 
-def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None):
+def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None, links=()):
     marker = lead_list_marker(value) if marker_style is not None else None
     if marker is not None:
         first, last = marker.start(2), marker.end(2)
@@ -592,14 +904,17 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
             start, end = max(0, start - removed), end - removed
             if end > 0 and start < end:
                 shifted.append((max(0, start), end))
-        contents, plain, labels = inline_math_markup(
-            suffix, assets, archive, scale, shifted, fallback)
+        contents, plain, labels, resolved = inline_math_markup(
+            suffix, assets, archive, scale, shifted, fallback, links=links)
+        # Resolved ranges address the suffix; map them back behind the marker.
+        resolved = [dict(item, start=item["start"] + removed, end=item["end"] + removed)
+                    for item in resolved]
         marker_html = (f'<span style="font-family:{marker_style["family"]};'
                        f'font-size:{marker_style["size"]:.2f}pt;'
                        f'font-weight:{marker_style["weight"]};line-height:0">'
                        f'{html.escape(value[first:last])}</span>')
         return (_text_html(prefix, fallback) + marker_html + gap + contents,
-                prefix + value[first:last] + (" " if gap else "") + plain, labels)
+                prefix + value[first:last] + (" " if gap else "") + plain, labels, resolved)
     normalized, mapping = [], []
     for index, char in enumerate(value):
         for item in normalized_inline_math(char):
@@ -624,22 +939,44 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
         if index < 0:
             continue
         matches.append((index, index + len(needle), asset))
-    pieces, plain, labels, raw_cursor = [], [], [], 0
-    for index, normalized_end, asset in sorted(matches, key=lambda match: match[0]):
-        start, end = mapping[index], mapping[normalized_end - 1] + 1
-        prefix = value[raw_cursor:start]
+    # Match coordinates are normalized-string indices; map them back to the
+    # displayed text before cutting bold ranges, labels and link anchors.
+    placed = [(mapping[start], mapping[end - 1] + 1, asset) for start, end, asset in matches]
+    ranges = _link_ranges(value, text, mapping, placed, links)
+    events = [(start, end, "math", asset) for start, end, asset in placed]
+    events += [(item["start"], item["end"], "link", item) for item in ranges]
+    events.sort(key=lambda event: event[0])
+    pieces, plain, labels, resolved, raw_cursor = [], [], [], [], 0
+    for start, end, kind, payload in events:
+        if start < raw_cursor:
+            continue
         pieces.append(_bold_html(value, raw_cursor, start, bold, fallback))
-        plain.append(prefix)
-        name = "math-" + hashlib.sha256(asset["svg"]).hexdigest()[:20] + ".svg"
-        archive.add((asset["svg"], name))
-        pieces.append(f'<img src="{name}" style="width:{asset["width"] * scale}pt;'
-                      f'height:{asset["height"] * scale}pt;vertical-align:{-asset["descent"] * scale}pt">')
-        labels.append(value[start:end])
+        plain.append(value[raw_cursor:start])
+        if kind == "math":
+            name = "math-" + hashlib.sha256(payload["svg"]).hexdigest()[:20] + ".svg"
+            archive.add((payload["svg"], name))
+            pieces.append(f'<img src="{name}" style="width:{payload["width"] * scale}pt;'
+                          f'height:{payload["height"] * scale}pt;vertical-align:{-payload["descent"] * scale}pt">')
+            labels.append(value[start:end])
+        else:
+            # Goto anchors carry no href; the reader overlay navigates, and the
+            # markup only marks the text so its rendered position can be found.
+            inner = _bold_html(value, start, end, bold, fallback)
+            if payload.get("color"):
+                # Publishers style links black, blue or gray. Keep that color
+                # instead of MuPDF's default HTML link blue.
+                inner = f'<span style="color:{payload["color"]}">{inner}</span>'
+            if payload["kind"] == "uri" and payload.get("uri"):
+                pieces.append('<a href="' + html.escape(payload["uri"], quote=True) + '">'
+                              + inner + "</a>")
+            else:
+                pieces.append("<a>" + inner + "</a>")
+            plain.append(value[start:end])
+            resolved.append(dict(payload))
         raw_cursor = end
-    suffix = value[raw_cursor:]
     pieces.append(_bold_html(value, raw_cursor, len(value), bold, fallback))
-    plain.append(suffix)
-    return "".join(pieces), "".join(plain), labels
+    plain.append(value[raw_cursor:])
+    return "".join(pieces), "".join(plain), labels, resolved
 
 
 def _map_overlay_point(point, clip, destination):
@@ -812,10 +1149,60 @@ def _flow_lines(native, rect):
     return sorted(lines, key=lambda line: (round(line["bbox"][1], 2), line["bbox"][0]))
 
 
+def small_caps_nominal_size(lines, size):
+    """True small caps report the reduced glyph size; translations need the nominal size.
+
+    Small-caps glyphs are uppercase letters at 70–85% of the nominal size in
+    the same font, set directly beside full-cap letters. Measuring such a
+    heading from its dominant reduced spans would typeset it below body size.
+    """
+    if size <= 0:
+        return None
+    for line in lines:
+        ordered = [s for s in line.get("spans", []) if s.get("text", "").strip()]
+        for left, right in zip(ordered, ordered[1:]):
+            if round(left["size"], 1) == round(right["size"], 1):
+                continue
+            small, large = (left, right) if round(left["size"], 1) == size else (right, left)
+            if (round(small["size"], 1) != size or not re.search(r"[A-Z]", small["text"])
+                    or not re.search(r"[A-Z]", large["text"]) or small["font"] != large["font"]):
+                continue
+            candidate = round(large["size"], 1)
+            if not size * 1.15 <= candidate <= size * 1.5:
+                continue
+            gap = pymupdf.Rect(right["bbox"]).x0 - pymupdf.Rect(left["bbox"]).x1
+            if -1 <= gap <= size * 1.2:
+                return candidate
+    return None
+
+
 def _flow_size(lines):
     sizes = Counter(round(span["size"], 1) for line in lines
                     for span in line.get("spans", []) if span.get("text", "").strip())
-    return sizes.most_common(1)[0][0] if sizes else 0
+    if not sizes:
+        return 0
+    size = sizes.most_common(1)[0][0]
+    return small_caps_nominal_size(lines, size) or size
+
+
+def page_body_size(native):
+    """Character-weighted body size of one page, used to recognize display type.
+
+    Titles, author lines and body text can share a page; only text clearly above
+    the dominant body size is treated as display type. Math/font glyphs and
+    empty spans do not vote, so formula-heavy pages do not skew the reference.
+    """
+    weights = Counter()
+    for block in native:
+        if block.get("type", 0) != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = (span.get("text") or "").strip()
+                size = float(span.get("size") or 0)
+                if text and size >= 4 and not MATH_FONT.search(span.get("font", "")):
+                    weights[round(size, 1)] += len(text)
+    return weights.most_common(1)[0][0] if weights else 0
 
 
 def _narrative(text):
@@ -839,7 +1226,7 @@ def _flow_join(left, right):
     return left + " " + right
 
 
-def merge_continued_paragraphs(page, blocks, native, target):
+def merge_continued_paragraphs(page, blocks, native, target, cover_page=False):
     """Flow a paragraph that extraction split into adjacent text blocks.
 
     Extractors often cut a paragraph after a line ending in inline math or a
@@ -849,7 +1236,8 @@ def merge_continued_paragraphs(page, blocks, native, target):
     continuation: same column and left edge, a full-width last line above,
     no first-line indent below, a line-sized gap, matching type size, and
     nothing (text, image or rule) in between. References, captions, headings
-    and special blocks never join.
+    and special blocks never join — except the wrapped lines of one numbered
+    heading, which `heading_joinable` handles.
     """
     count = len(blocks)
     if count < 2:
@@ -857,6 +1245,7 @@ def merge_continued_paragraphs(page, blocks, native, target):
     rects = [source_rect(page, block) for block in blocks]
     lines = [_flow_lines(native, rect) for rect in rects]
     sizes = [_flow_size(item) for item in lines]
+    body_size = page_body_size(native) if cover_page else 0
     rotation = page.rotation
     if rotation:
         page.set_rotation(0)
@@ -922,18 +1311,125 @@ def merge_continued_paragraphs(page, blocks, native, target):
         if first_line.x0 - b.x0 > 3 or abs(first_line.x0 - a.x0) > 3:
             return False
         band = pymupdf.Rect(a.x0, a.y1 + .2, max(a.x1, b.x1), b.y0 - .2)
-        if band.height > 0:
-            if any(overlap(band, box) > .1 for box in graphics):
+        return band_clear(band, upper, lower)
+
+    def band_clear(band, upper, lower):
+        if band.height <= 0:
+            return True
+        if any(overlap(band, box) > .1 for box in graphics):
+            return False
+        if any(overlap(band, rects[index]) > .1
+               for index in range(count) if index not in (upper, lower)
+               and root(index) not in {root(upper), root(lower)}):
+            return False
+        # The joined blocks' own lines share the band through font ascent and
+        # descent padding; only a line belonging to neither block blocks the join.
+        own = [pymupdf.Rect(rects[upper]), pymupdf.Rect(rects[lower])]
+        return not any(overlap(band, pymupdf.Rect(line["bbox"])) > .1
+                       for block in native if block.get("type", 0) == 0
+                       for line in block.get("lines", [])
+                       if not any(overlap(pymupdf.Rect(line["bbox"]), box)
+                                  >= pymupdf.Rect(line["bbox"]).get_area() * .5 for box in own))
+
+    def heading_joinable(upper, lower):
+        """Join the wrapped lines of one numbered heading split across blocks.
+
+        Extraction keeps each centered heading line as its own block, and one
+        line alone has no leading to spare — its translation is forced below
+        body size. Only an unnumbered non-prose line joins a numbered heading
+        above it; another numbered heading, prose, captions, lists, labels and
+        formulas stay separate structures.
+        """
+        first, second = blocks[upper], blocks[lower]
+        if special(first) or special(second):
+            return False
+        if not (first.get("translation") and first.get("target") == target
+                and second.get("translation") and second.get("target") == target):
+            return False
+        if not section_heading(blocks[root(upper)]["text"]):
+            return False
+        value = (second.get("text") or "").strip()
+        if (not value or section_heading(value) or is_prose(second["text"])
+                or _FLOW_CAPTION.match(value) or TABLE_CAPTION.match(value)
+                or _FLOW_LIST.match(value) or re.match(r"^\s*\[\d{1,4}\]", value)
+                or re.fullmatch(r"[\s\d.,()%:：、。·-]+", value)
+                or not re.search(r"[A-Za-z]{2,}|[\u3400-\u9fff]{2,}", value)):
+            return False
+        if cover_page and min(rects[upper].y0, rects[lower].y0) < page.rect.height * .22:
+            return False  # Leave cover title groups to the cover pre-layout.
+        if any(MATH_FONT.search(span["font"]) for line in lines[lower]
+               for span in line.get("spans", []) if span.get("text", "").strip()):
+            return False
+        a, b = rects[upper], rects[lower]
+        size = max(sizes[upper], sizes[lower])
+        if not -1 <= b.y0 - a.y1 <= max(3.0, size * .6):
+            return False
+        if min(a.x1, b.x1) - max(a.x0, b.x0) < min(a.width, b.width) * .85:
+            return False
+        if abs(sizes[upper] - sizes[lower]) > max(.6, size * .08):
+            return False
+        band = pymupdf.Rect(a.x0, a.y1 + .2, max(a.x1, b.x1), b.y0 - .2)
+        return band_clear(band, upper, lower)
+
+    def author_display(value, size):
+        """Author, affiliation and footnote lines never join a title group."""
+        if "@" in value or re.search(r"[∗†‡]", value) or INSTITUTION.search(value):
+            return True
+        # Author lists use display-sized capitals at author sizes. Titles are
+        # larger than this band, so their own capitalized words are unaffected.
+        return (size <= 14 and not is_prose(value)
+                and len(re.findall(r"\b[A-Z][a-z]+\b", value)) >= 2
+                and bool(re.search(r",|\band\b", value)))
+
+    def display_title_joinable(upper, lower):
+        """Join the visual lines of one cover title that extraction split apart.
+
+        A title is one typographic object: setting each extracted line on its
+        own lets the first line shrink while the second keeps the source size,
+        and lets only the wider line qualify for title handling. Two same-size
+        display lines directly above each other on the cover page, aligned on
+        one axis and with nothing in the gap, form one title group. Subtitles
+        of another size, authors, affiliations, captions, equations, lists and
+        prose stay separate. Rotated covers keep the conservative per-line path.
+        """
+        if not cover_page or page.rotation or not body_size:
+            return False
+        first, second = blocks[upper], blocks[lower]
+        if special(first) or special(second):
+            return False
+        if not (first.get("translation") and first.get("target") == target
+                and second.get("translation") and second.get("target") == target):
+            return False
+        a, b = rects[upper], rects[lower]
+        size = max(sizes[upper], sizes[lower])
+        if size < max(6.0, body_size * 1.25):
+            return False
+        if a.y0 > page.rect.height * .45:
+            return False
+        if abs(sizes[upper] - sizes[lower]) > max(.8, size * .08):
+            return False
+        for block in (first, second):
+            value = (block.get("text") or "").strip()
+            if not value or not re.search(r"[A-Za-z\u3400-\u9fff]{2,}", value):
                 return False
-            if any(overlap(band, rects[index]) > .1
-                   for index in range(count) if index not in (upper, lower)
-                   and root(index) not in {root(upper), root(lower)}):
+            if author_display(value, size):
                 return False
-            if any(overlap(band, pymupdf.Rect(line["bbox"])) > .1
-                   for block in native if block.get("type", 0) == 0
-                   for line in block.get("lines", [])):
+            if (section_heading(value) or TABLE_CAPTION.match(value)
+                    or _FLOW_CAPTION.match(value) or _FLOW_LIST.match(value)
+                    or re.match(r"^\s*\[\d{1,4}\]", value)):
                 return False
-        return True
+        gap = b.y0 - a.y1
+        if not -1 <= gap <= max(4.0, size * .8):
+            return False
+        if min(a.x1, b.x1) - max(a.x0, b.x0) <= 0:
+            return False
+        tolerance = max(2.0, size * .5)
+        axis_aligned = abs((a.x0 + a.x1) / 2 - (b.x0 + b.x1) / 2) <= tolerance
+        edge_aligned = abs(a.x0 - b.x0) <= 3 or abs(a.x1 - b.x1) <= 3
+        if not (axis_aligned or edge_aligned):
+            return False
+        band = pymupdf.Rect(a.x0, a.y1 + .2, max(a.x1, b.x1), b.y0 - .2)
+        return band_clear(band, upper, lower)
 
     for lower in range(count):
         # Only the nearest block above in the same horizontal band can be the
@@ -947,7 +1443,8 @@ def merge_continued_paragraphs(page, blocks, native, target):
         if not candidates:
             continue
         upper = candidates[0]
-        if root(upper) != root(lower) and joinable(upper, lower):
+        if root(upper) != root(lower) and (joinable(upper, lower) or heading_joinable(upper, lower)
+                                           or display_title_joinable(upper, lower)):
             parents[root(lower)] = root(upper)
 
     groups, order = {}, []
@@ -984,7 +1481,7 @@ def merge_continued_paragraphs(page, blocks, native, target):
     return merged
 
 
-def layout_blocks(page, saved_page, native, target):
+def layout_blocks(page, saved_page, native, target, cover_page=False):
     """Join overlapping extraction fragments of prose with inline mathematics.
 
     Source translations and IDs stay intact; this grouping is only for typesetting.
@@ -1046,7 +1543,7 @@ def layout_blocks(page, saved_page, native, target):
                            "_members": [b["id"] for b in members]})
         else:
             result.extend(members)
-    return merge_continued_paragraphs(page, result, native, target)
+    return merge_continued_paragraphs(page, result, native, target, cover_page)
 
 
 def inspect_block(native, rect, combine=False):
@@ -1094,6 +1591,7 @@ def inspect_block(native, rect, combine=False):
     size = weights.most_common(1)[0][0]
     if size <= 0:
         return None, "无效字号"
+    size = small_caps_nominal_size(lines, size) or size
     # A long bold label or vector name must not determine a whole paragraph's
     # weight when ordinary body text was extracted into many short spans.
     emphasis = [s for s in spans if not MATH_FONT.search(s["font"])
@@ -1126,7 +1624,6 @@ def cover_text_role(block, page, rect, style):
 
 def prepare_cover_metadata(page, working, rects, native, overlays, typography, target):
     """Preflight the author/affiliation/contact cluster as one layout transaction."""
-    institution = re.compile(r"universit|institut|laborator|department|school|academy|college|hospital|研究所|大学|学院|实验室", re.I)
     body_start = re.compile(r"^\s*(?:abstract\b|keywords?\b|\d+\s+introduction\b|摘要|关键词)", re.I)
     candidates = []
     for block in working:
@@ -1142,7 +1639,7 @@ def prepare_cover_metadata(page, working, rects, native, overlays, typography, t
     title_bottom = max((rect.y1 for _, style, rect in candidates if style["size"] >= 14), default=0)
     seed = next((i for i, (block, style, rect) in enumerate(candidates)
                  if rect.y0 >= title_bottom and 7 <= style["size"] <= 13.5 and not is_prose(block["text"])
-                 and not institution.search(block["text"]) and "@" not in block["text"]
+                 and not INSTITUTION.search(block["text"]) and "@" not in block["text"]
                  and len(re.findall(r"\b[A-Z][a-z]+\b", block["text"])) >= 2
                  and (re.search(r",|\band\b", block["text"])
                       or (len(re.findall(r"\b[A-Z][a-z]+\b", block["text"])) >= 3
@@ -1155,7 +1652,7 @@ def prepare_cover_metadata(page, working, rects, native, overlays, typography, t
         previous = group[-1][2]
         if (rect.y0 - previous.y1 > max(18, group[0][1]["size"] * 2.2)
                 or body_start.search(block["text"]) or style["size"] > group[0][1]["size"] * 1.25
-                or (is_prose(block["text"]) and not institution.search(block["text"]) and "@" not in block["text"])):
+                or (is_prose(block["text"]) and not INSTITUTION.search(block["text"]) and "@" not in block["text"])):
             break
         group.append(item)
     members = [block for block, _, _ in group]
@@ -1186,10 +1683,11 @@ def prepare_cover_metadata(page, working, rects, native, overlays, typography, t
             or any(overlap(box, pymupdf.Rect(span["bbox"])) > .1 for span in foreign)):
         return None, members, "作者信息区含图形或相邻文字，暂保留完整原文以避免重叠"
     markup = []
+    anchors = []
     email = re.compile(r"(\{[^{}]+\}@[\w.\-]+|[\w.+\-]+@[\w.\-]+)")
     for block, style, _ in group:
         text = printable_text(block["translation"])
-        is_author = "@" not in block["text"] and not institution.search(block["text"])
+        is_author = "@" not in block["text"] and not INSTITUTION.search(block["text"])
         pieces = [text.replace("\n", " ")] if is_author else email.split(text)
         for piece in pieces:
             if not piece.strip():
@@ -1197,8 +1695,13 @@ def prepare_cover_metadata(page, working, rects, native, overlays, typography, t
             contact = bool(email.fullmatch(piece.strip()))
             role = "author" if is_author else "email" if contact else "affiliation"
             content = html.escape(piece.strip()).replace("\n", "<br>")
+            if contact:
+                content = ('<a href="mailto:' + html.escape(piece.strip(), quote=True)
+                           + '">' + content + "</a>")
+                anchors.append({"text": piece.strip(), "kind": "uri", "uri": "mailto:" + piece.strip(),
+                                "ordinal": sum(1 for item in anchors if item["text"] == piece.strip())})
             if is_author:
-                content = re.sub(r"(?<=[^\W\d_])(\d{1,2}(?:[,，]\d{1,2})*)(?=[,，、;；\s]|$)", r"<sup>\1</sup>", content)
+                content = AUTHOR_MARKS.sub(r"<sup>\g<marks></sup>", content)
             elif not contact:
                 content = re.sub(r"(?<![\w])(\d{1,2})(?=\s+[\w\u3400-\u9fff])", r"<sup>\1</sup>", content)
             size = style["size"]
@@ -1211,7 +1714,9 @@ def prepare_cover_metadata(page, working, rects, native, overlays, typography, t
             family = "monospace" if role == "email" else typography["family"]
             contents.append(f'<div style="font-family:{family};font-size:{size * factor}pt;'
                             f'font-weight:{600 if bold else 400};line-height:{1.28 if role == "email" else 1.5};margin:0 0 1.5pt">{content}</div>')
-        css = typography["css"] + "body{margin:0;padding:0;text-align:center}sup{font-size:65%;line-height:0}"
+        css = typography["css"] + ("body{margin:0;padding:0;text-align:center}"
+                                   "a:link,a:visited,a:hover{color:inherit;text-decoration:none}"
+                                   "sup{font-size:65%;line-height:0}")
         spare, scale = scratch.insert_htmlbox(box, "".join(contents), css=css,
                                               archive=typography["archive"], scale_low=1)
         visible = Counter(c for c in unicodedata.normalize("NFKC", scratch.get_text()) if not c.isspace())
@@ -1237,6 +1742,9 @@ def prepare_cover_metadata(page, working, rects, native, overlays, typography, t
                     "_members": [key for b in members for key in b.get("_members", [b["id"]])]}
         style = {**group[0][1], "spans": [span for span in spans if id(span) in own_spans]}
         result = {"overlay": len(overlays) - 1, "rect": list(crop), "clip": list(crop), "scale": factor}
+        contact_links = anchor_overlay_rects(scratch, anchors) if anchors else []
+        if contact_links:
+            result["links"] = contact_links
         rects[combined["id"]] = region
         return (combined, style, result), members, ""
     return None, members, "作者、单位和邮箱无法在摘要前安全容纳，暂保留完整原文信息区"
@@ -1317,8 +1825,10 @@ def source_paragraph_style(style, rect, text, page_width=None, text_obstacles=()
     size = style["size"]
     fragments = []
     for line in style.get("lines", []):
+        # Small caps measure ~.8 of the nominal size and belong to the same
+        # line; only superscripts and other true sub-runs are excluded.
         spans = [s for s in line.get("spans", []) if s.get("text", "").strip()
-                 and size * .8 <= s.get("size", size) <= size * 1.25]
+                 and size * .75 <= s.get("size", size) <= size * 1.25]
         if spans:
             box = pymupdf.Rect(spans[0]["bbox"])
             for span in spans[1:]:
@@ -1392,6 +1902,8 @@ def source_paragraph_style(style, rect, text, page_width=None, text_obstacles=()
 
 def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=None,
                    horizontal_obstacles=None, bold_hints=None):
+    if block.get("translation"):
+        block = {**block, "translation": soft_translation(block)}
     typography = typography or font_resources(block["translation"])
     archive = pymupdf.Archive()
     if typography["archive"] is not None:
@@ -1404,7 +1916,10 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     cover_role = cover_text_role(block, page, rect, style)
     if cover_role == "title" and alignment != "center":
         cover_role = None
-    size = style["size"] * (1.12 if cover_role == "title" else 1)
+    # Keep the source's nominal title size. Inflating cover titles by 12% made
+    # the translated title larger than the source and forced tight lines to
+    # shrink; a title group now fits at the size the document actually used.
+    size = style["size"]
     display_text, marker_style = list_marker_style(block, style, size)
     validation_text = display_text
     single_line = (bool(style["lines"])
@@ -1453,7 +1968,7 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     if cover_role == "authors":
         line_heights = [1.18, 1.08] if not typography.get("compact_fallback") else [1.12, 1.04]
 
-    def render_box(box, markup, css, count_lines, minimum_scale):
+    def render_box(box, markup, css, count_lines, minimum_scale, anchors=()):
         scratch = overlays.new_page(width=page.rect.width, height=page.rect.height)
         spare, scale = scratch.insert_htmlbox(box, markup, css=css,
                                               archive=archive, scale_low=minimum_scale)
@@ -1496,16 +2011,35 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
         if visible is not None:
             for item in images:
                 visible |= pymupdf.Rect(item["bbox"])
-        return {"overlay": len(overlays) - 1, "rect": list(crop),
-                "clip": list(crop), "scale": scale, "math_labels": math_labels[:],
-                "ink_insets": [visible.y0 - crop.y0, crop.y1 - visible.y1]
-                if visible is not None else None}, line_count
+        result = {"overlay": len(overlays) - 1, "rect": list(crop),
+                  "clip": list(crop), "scale": scale, "math_labels": math_labels[:],
+                  "ink_insets": [visible.y0 - crop.y0, crop.y1 - visible.y1]
+                  if visible is not None else None}
+        if anchors:
+            placed_links = anchor_overlay_rects(scratch, anchors)
+            if placed_links:
+                result["links"] = placed_links
+        return result, line_count
+
+    # Display type keeps the source's bold weight even when its text contains
+    # ordinary function words: "Learning ... for ..." is prose to is_prose but
+    # still a bold cover title. Body paragraphs keep the conservative rule so a
+    # bold run-in label cannot make the entire paragraph heavy.
+    display_weight = cover_role == "title"
+    if not display_weight and style["bold"]:
+        display_weight = prominent_heading(style, block["text"], horizontal_obstacles or ())
+    weight = 600 if section_heading(block["text"]) or (
+        style["bold"] and (display_weight or not is_prose(block["text"]))) else 400
 
     for variant in variants:
         ranges = bold_ranges(variant, bold_hints) if bold_hints else ()
-        contents, validation_text, math_labels = inline_math_markup(
+        contents, validation_text, math_labels, resolved_links = inline_math_markup(
             variant, block.get("_inline_assets", []), archive, bold=ranges,
-            fallback=typography.get("fallback_characters", ""), marker_style=marker_style)
+            fallback=typography.get("fallback_characters", ""), marker_style=marker_style,
+            links=block.get("_link_hints", []))
+        anchors = [{"text": item["text"], "kind": item["kind"], "uri": item.get("uri"),
+                    "page": item.get("page"), "to": item.get("to"), "source": item.get("source"),
+                    "ordinal": item["ordinal"]} for item in resolved_links]
         markup = "<div>" + contents + "</div>"
         # Try every safe box/leading at the original font size before shrinking.
         # A tight source glyph frame should not force the whole paragraph small.
@@ -1513,21 +2047,22 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                                           for leading in line_heights]:
             css = typography["css"] + (f"*{{margin:0;padding:0}} body{{font-family:{typography['family']};font-size:{size}pt;"
                    f"line-height:{line_height};color:#{style['color']:06x};"
-                   f"font-weight:{600 if section_heading(block['text']) or (style['bold'] and not is_prose(block['text'])) else 400};"
-                   f"font-style:{'italic' if style['italic'] else 'normal'};}} b{{font-weight:600}}")
+                   f"font-weight:{weight};"
+                   f"font-style:{'italic' if style['italic'] else 'normal'};}} b{{font-weight:600}}"
+                   " a:link,a:visited,a:hover{color:inherit;text-decoration:none}")
             centered = cover_role in {"title", "authors"} or alignment == "center"
             css += f"body{{text-align:{'center' if centered else alignment};text-indent:{0 if centered else indent}pt}}"
             boxes = [expanded, rect] if cover_role in {"title", "authors"} else [rect, expanded]
             for box in boxes:
                 result, line_count = render_box(
                     box, markup, css, is_short_cjk_line(block, style, variant) and not centered,
-                    minimum_scale)
+                    minimum_scale, anchors)
                 if result:
                     if line_count > 1:
                         for wider_box in short_cjk_line_boxes(
                                 rect, box, page, block, style, horizontal_obstacles,
                                 variant, size, centered):
-                            wider_result, wider_lines = render_box(wider_box, markup, css, True, minimum_scale)
+                            wider_result, wider_lines = render_box(wider_box, markup, css, True, minimum_scale, anchors)
                             if wider_result and wider_lines == 1:
                                 return wider_result
                             if wider_result:
@@ -1687,9 +2222,23 @@ def table_regions(page):
     return regions
 
 
-def typeset(source: Path, document: dict, target: str, page_numbers=None, typography=None):
+def typeset(source: Path, document: dict, target: str, page_numbers=None, typography=None,
+            page_links=None, reference_fallbacks=None):
+    """Typeset translated blocks onto the original pages.
+
+    `page_links` maps each original page index to its link annotations in
+    unrotated coordinates, as collected by `build_layout` from the full
+    document; without it, links are read from the opened pages directly.
+    `reference_fallbacks` maps page indexes to bibliography column areas that
+    cannot be rebuilt into complete entries; `build_layout` derives it from the
+    whole document so continuation pages follow the heading page's decision.
+    """
     typography = typography or font_resources("\n".join(b.get("translation", "") for p in document["pages"] for b in p["blocks"]))
     pdf = pymupdf.open(source)
+    # Internal jump destinations are document page indexes; keep the full count
+    # before selecting the one page this pass typesets (the assembled document
+    # restores them, but the report must accept every valid target).
+    total_pages = pdf.page_count
     if page_numbers is not None:
         pdf.select(page_numbers)
     report = {"target": target, "pages": len(pdf), "replaced": 0, "untranslated": 0,
@@ -1703,8 +2252,15 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             rotation = page.rotation
             native = [b for b in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"] if b["type"] == 0]
             raw_native = page.get_text("rawdict")["blocks"]
-            working = layout_blocks(page, saved_page, native, target)
+            working = layout_blocks(page, saved_page, native, target,
+                                    cover_page=source_page_number == 0)
             rects = {b["id"]: source_rect(page, b) for b in working}
+            # Link hints must share the unrotated coordinate space of rects and
+            # native text, so collect them before clearing the page rotation.
+            if page_links is None:
+                links_on_page = page_link_targets(page)
+            else:
+                links_on_page = list(page_links.get(source_page_number, ()))
             page.set_rotation(0)
             source_ink = page.get_bboxlog()
             graphics = [pymupdf.Rect(image["bbox"]) for image in page.get_image_info()]
@@ -1718,6 +2274,28 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             prepared = []
             formula_candidates = []
             table_blocks = 0
+            dropped_links = 0
+            fallback_ids = set()
+            if not saved_page.get("reference_layout") and not has_redactions:
+                # A bibliography whose complete entries cannot be rebuilt (for
+                # example an unquoted book title or a multi-page list) is kept
+                # whole: translating its line fragments independently mixes
+                # languages inside one entry and overlaps the lines left
+                # original. The heading itself still translates normally.
+                regions = (reference_fallbacks.get(source_page_number, [])
+                           if reference_fallbacks is not None else
+                           fallback_reference_regions(page))
+                fallback = [block for block in working
+                            if any(region.contains((rects[block["id"]].tl + rects[block["id"]].br) * .5)
+                                   for region in regions)]
+                if any(REFERENCE_MARK.search(block["text"]) for block in fallback):
+                    fallback_ids = {block["id"] for block in fallback}
+                    members = sum(len(block.get("_members", [block["id"]])) for block in fallback)
+                    report["preserved"] += members
+                    report["issues"].append({
+                        "page": saved_page["number"], "block_id": None, "kind": "reference",
+                        "message": f"此页参考文献无法按完整条目重建，已整段保留原文（{members} 个文本块），"
+                                   "避免译文与原文错配或重叠"})
             with pymupdf.open() as overlays:
                 cover, cover_members, cover_reason = (None, [], "")
                 if source_page_number == 0 and not has_redactions:
@@ -1730,6 +2308,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                     if cover[2]["scale"] < .99:
                         report["scaled"] += len(cover[0]["_members"])
                 for block in working:
+                    if block["id"] in fallback_ids:
+                        continue
                     if block.get("kind") in {"reference", "reference_heading"}:
                         continue
                     entry = {"page": saved_page["number"], "block_id": block["id"]}
@@ -1797,6 +2377,9 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                             runs = inline_math_runs(raw_native, rect, combine="_members" in block)
                             if runs:
                                 block = {**block, "_inline_assets": inline_math_assets(page, runs, block["translation"])}
+                        hints = block_link_hints(links_on_page, rect, native, raw_native)
+                        if hints:
+                            block = {**block, "_link_hints": hints}
                         block = {**block, "_source_page": source_page_number}
                         result = fitted_overlay(overlays, page, block, fit_rect, style, obstacles,
                                                 typography, text_obstacles,
@@ -1804,6 +2387,29 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         if result and runs:
                             result["inline_math_runs"] = runs
                             result["carried_graphics"] = inline_math_graphics(drawings, runs)
+                        if result and hints:
+                            resolved_links = result.get("links") or []
+                            whole_links = []
+                            # A link that covers the block proves the whole
+                            # translated block is its anchor (fully linked
+                            # titles, author lines, license sentences). Only a
+                            # single-link block is unambiguous.
+                            if len(hints) == 1 and hints[0].get("whole_block"):
+                                hint = hints[0]
+                                matched = any(
+                                    item.get("kind") == hint["kind"]
+                                    and (item.get("uri") or None) == (hint.get("uri") or None)
+                                    and item.get("source") == hint.get("source")
+                                    for item in resolved_links)
+                                if not matched:
+                                    whole_links.append({**hint, "whole": True})
+                            if whole_links:
+                                result["whole_links"] = whole_links
+                            kept = {(item.get("kind"), item.get("uri") or None)
+                                    for item in resolved_links + whole_links}
+                            dropped_links += sum(
+                                1 for hint in hints if hint["kind"] == "uri"
+                                and ("uri", hint.get("uri") or None) not in kept)
                         if result is None:
                             reason = "译文超出可用空间或含无法可靠排印的字符，保留原文；请编辑后重新排版"
                     if reason and reason.startswith("公式") and not has_redactions and not is_prose(block["text"]):
@@ -1862,7 +2468,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 if moved_formulas or inline_strokes or heading_strokes:
                     page.apply_redactions(images=0, graphics=1, text=0)
                 if saved_page.get("reference_layout"):
-                    bibliography = prepare_bibliography(page, saved_page, native, overlays, prepared, rects, typography, target)
+                    bibliography = prepare_bibliography(page, saved_page, native, overlays, prepared, rects, typography, target,
+                                                        anchor_rects=anchor_overlay_rects)
                     if bibliography:
                         bibliography_items, details = bibliography
                         prepared.extend(bibliography_items)
@@ -1908,16 +2515,85 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         report["placements"][block_id] = [displayed.x0 / page.rect.width, displayed.y0 / page.rect.height,
                                                          displayed.x1 / page.rect.width, displayed.y1 / page.rect.height]
                     page.set_rotation(0)
+                    # Link anchors travel with the translated text. insert_pdf
+                    # drops annotations, so build_layout re-creates these on the
+                    # assembled document from the placed_links report entries.
+                    for item in [*result.get("links", ()), *result.get("whole_links", ())]:
+                        clip = pymupdf.Rect(result["clip"])
+                        destination = pymupdf.Rect(result["rect"])
+                        whole = bool(item.get("whole"))
+                        # Every rectangle of one wrapped link shares a group so
+                        # the reader can highlight the whole link at once.
+                        group = hashlib.sha1(json.dumps(
+                            [saved_page["number"], item["kind"], item.get("uri"),
+                             item.get("page"), item.get("to"), item.get("source"),
+                             item.get("ordinal")], sort_keys=True, default=str).encode()).hexdigest()[:16]
+                        for overlay_box in ([list(destination)] if whole else item.get("rects", ())):
+                            area = (pymupdf.Rect(overlay_box) if whole
+                                    else _map_overlay_rect(pymupdf.Rect(overlay_box), clip, destination)) & page.rect
+                            if area.is_empty or area.get_area() <= 0:
+                                continue
+                            entry = {"page": saved_page["number"], "kind": item["kind"],
+                                     "rect": [area.x0, area.y0, area.x1, area.y1],
+                                     "source_rect": item.get("source"), "group": group}
+                            if item["kind"] == "uri" and item.get("uri"):
+                                entry["uri"] = item["uri"]
+                                try:
+                                    page.insert_link({"kind": pymupdf.LINK_URI, "from": area, "uri": item["uri"]})
+                                except (RuntimeError, ValueError):
+                                    pass
+                            elif (item.get("kind") == "goto" and isinstance(item.get("page"), int)
+                                    and 0 <= item["page"] < total_pages):
+                                entry["target_page"] = item["page"]
+                                entry["to"] = item.get("to") or [0, 0]
+                                try:
+                                    page.insert_link({"kind": pymupdf.LINK_GOTO, "from": area,
+                                                      "page": item["page"],
+                                                      "to": pymupdf.Point(item["to"][0], item["to"][1])})
+                                except (RuntimeError, ValueError):
+                                    pass
+                            else:
+                                continue
+                            report.setdefault("placed_links", []).append(entry)
             page.set_rotation(rotation)
             if table_blocks:
                 report["issues"].append({"page": saved_page["number"], "block_id": None, "kind": "table",
                                          "message": f"表格内容保留原文（{table_blocks} 个文本块）；仅翻译表题与表注"})
+            if dropped_links:
+                report["issues"].append({
+                    "page": saved_page["number"], "block_id": None, "kind": "link",
+                    "message": f"本页有 {dropped_links} 个原文外部链接因译文改写锚文本而未能定位，"
+                               "译文 PDF 中不可点击；可保留原网址后重新翻译或排版。"})
             if saved_page.get("needs_ocr"):
                 report["issues"].append({"page": saved_page["number"], "block_id": None, "kind": "image_page", "message": "无文字层的页面保持原样"})
         pdf.subset_fonts()
         return pdf.tobytes(garbage=4, deflate=True), report
     finally:
         pdf.close()
+
+
+def _reader_link(page_obj, raw_rect, entry, fraction=None, source_page=None, group=None):
+    """A link in displayed normalized coordinates for the reader overlays.
+
+    `source_page` is the page the link lives on (1-based); the reader filters
+    overlays by it. For internal jumps `page` is the *target* page, so the two
+    values differ and must not be conflated. `group` identifies rectangles of
+    one wrapped link so the reader highlights all of them together.
+    """
+    box = pymupdf.Rect(raw_rect) * page_obj.rotation_matrix
+    bounds = page_obj.rect
+    link = {"kind": entry["kind"],
+            "from": [round(box.x0 / bounds.width, 5), round(box.y0 / bounds.height, 5),
+                     round(box.x1 / bounds.width, 5), round(box.y1 / bounds.height, 5)],
+            "source_page": source_page if source_page is not None else page_obj.number + 1}
+    if group:
+        link["group"] = group
+    if entry["kind"] == "uri":
+        link["uri"] = entry["uri"]
+    else:
+        link["page"] = entry["target_page"] + 1
+        link["fraction"] = round(fraction if fraction is not None else 0.0, 5)
+    return link
 
 
 def build_layout(directory: Path, document: dict, target: str):
@@ -1938,6 +2614,27 @@ def build_layout(directory: Path, document: dict, target: str):
         report = {"target": target, "pages": len(document["pages"]), "replaced": 0,
                   "untranslated": 0, "preserved": 0, "scaled": 0, "issues": [], "placements": {}}
         typography = font_resources("\n".join(b.get("translation", "") for p in document["pages"] for b in p["blocks"]))
+        # One pass over the source resolves named destinations and collects every
+        # page's links in unrotated coordinates; per-page typeset calls then see
+        # the full document's targets even though only one page is selected.
+        source_links = None
+        reference_fallbacks = None
+        try:
+            with pymupdf.open(source) as scanned:
+                try:
+                    names = scanned.resolve_names()
+                except Exception:
+                    names = {}
+                source_links = {}
+                for index, page in enumerate(scanned):
+                    # page_link_targets derotates PyMuPDF's displayed link
+                    # rectangles itself; resetting the rotation first would
+                    # lose the transform on rotated source pages.
+                    source_links[index] = page_link_targets(page, names)
+                reference_fallbacks = reference_fallback_pages(scanned)
+        except Exception:
+            source_links = None
+            reference_fallbacks = None
         with pymupdf.open() as combined:
             for index, saved_page in enumerate(document["pages"]):
                 page_signature = json.dumps({"version": ENGINE_VERSION, "font": font_signature(), "source_size": source.stat().st_size,
@@ -1949,7 +2646,9 @@ def build_layout(directory: Path, document: dict, target: str):
                 if page_pdf.is_file() and page_report.is_file():
                     details = json.loads(page_report.read_text(encoding="utf-8"))
                 else:
-                    page_raw, details = typeset(source, {"pages": [saved_page]}, target, page_numbers=[index], typography=typography)
+                    page_raw, details = typeset(source, {"pages": [saved_page]}, target, page_numbers=[index],
+                                                typography=typography, page_links=source_links,
+                                                reference_fallbacks=reference_fallbacks)
                     page_temp = page_cache / (key + ".tmp")
                     page_temp.write_bytes(page_raw)
                     page_temp.replace(page_pdf)
@@ -1967,17 +2666,106 @@ def build_layout(directory: Path, document: dict, target: str):
                 for field in ("original_placements", "erased_spans", "inline_math"):
                     if details.get(field):
                         report.setdefault(field, []).extend(details[field])
-            # Single-page caches cannot resolve links to other pages; restore them
-            # from the original only after assembling the full document.
+                if details.get("placed_links"):
+                    report.setdefault("placed_links", []).extend(details["placed_links"])
+            # Single-page caches cannot resolve links to other pages; rebuild them
+            # from the original only after assembling the full document. Anchors
+            # that the layout re-attached to translated text replace the original
+            # rectangles, and links whose source text was erased are dropped
+            # instead of pointing at unrelated content.
             with pymupdf.open(source) as original:
                 combined.set_metadata(original.metadata)
                 toc = original.get_toc()
                 if toc:
                     combined.set_toc(toc)
+                try:
+                    named_targets = original.resolve_names()
+                except Exception:
+                    named_targets = {}
+                reader_links = []
+                placed_sources = {}
+                for entry in report.get("placed_links", []):
+                    source = entry.get("source_rect")
+                    if source:
+                        placed_sources.setdefault(entry["page"], set()).add(
+                            (entry["kind"], tuple(round(float(value), 1) for value in source)))
                 for index, page in enumerate(original):
+                    number = index + 1
+                    for entry in (item for item in report.get("placed_links", []) if item["page"] == number):
+                        box = pymupdf.Rect(entry["rect"])
+                        if box.is_empty or box.get_area() <= 0:
+                            continue
+                        if entry["kind"] == "uri" and entry.get("uri"):
+                            spec = {"kind": pymupdf.LINK_URI, "from": box, "uri": entry["uri"]}
+                        elif (entry["kind"] == "goto" and isinstance(entry.get("target_page"), int)
+                                and 0 <= entry["target_page"] < len(original)):
+                            spec = {"kind": pymupdf.LINK_GOTO, "from": box, "page": entry["target_page"],
+                                    "to": pymupdf.Point(*(entry.get("to") or (0, 0)))}
+                        else:
+                            continue
+                        try:
+                            combined[index].insert_link(spec)
+                        except (RuntimeError, ValueError):
+                            continue
+                        fraction = (goto_fraction(original[entry["target_page"]], entry.get("to"))
+                                    if entry["kind"] == "goto" else 0.0)
+                        reader_links.append(_reader_link(combined[index], box, entry, fraction,
+                                                         source_page=number, group=entry.get("group")))
+                    erased = [pymupdf.Rect(box) for item in report.get("erased_spans", [])
+                              if item["page"] == number for box in item["boxes"]]
                     for link in page.get_links():
+                        raw = pymupdf.Rect(link.get("from") or (0, 0, 0, 0)) * page.derotation_matrix
+                        if raw.is_empty or not raw.is_valid or raw.get_area() <= 0:
+                            continue
+                        kind_name = ("uri" if link.get("kind") == pymupdf.LINK_URI else
+                                     "goto" if link.get("kind") in {pymupdf.LINK_GOTO, pymupdf.LINK_NAMED}
+                                     else None)
+                        # A re-anchored link replaces its source annotation; do
+                        # not also restore the original rectangle (it may now sit
+                        # over unrelated translated text).
+                        if kind_name and (kind_name, tuple(round(value, 1) for value in raw)) in placed_sources.get(number, ()):
+                            continue
+                        erased_overlap = any(overlap(raw, box) > raw.get_area() * .3 for box in erased)
+                        # A web link whose anchor text was erased must not open
+                        # from unrelated translated text. A jump target stays
+                        # valid even when its cross-reference was reworded, so
+                        # unre-anchored goto links keep their original position.
+                        if erased_overlap and link.get("kind") == pymupdf.LINK_URI:
+                            continue
                         restored = {key: value for key, value in link.items() if key not in {"xref", "id"}}
-                        combined[index].insert_link(restored)
+                        restored["from"] = raw
+                        target_page, target_to = link.get("page"), link.get("to")
+                        if link.get("kind") == pymupdf.LINK_NAMED:
+                            # Viewer support for named destinations varies and
+                            # PyMuPDF may not expose their target page; resolve
+                            # the name once and store a plain page jump instead.
+                            target = named_targets.get(link.get("name") or link.get("nameddest") or "", {}) or {}
+                            if isinstance(target.get("page"), int):
+                                target_page = target["page"]
+                                target_to = target.get("to") or target_to
+                                restored = {"kind": pymupdf.LINK_GOTO, "from": raw,
+                                            "page": target_page,
+                                            "to": pymupdf.Point(*(target_to or (0, 0)))}
+                        try:
+                            combined[index].insert_link(restored)
+                        except (RuntimeError, ValueError):
+                            continue
+                        if link.get("kind") == pymupdf.LINK_URI:
+                            uri = (link.get("uri") or "").strip()
+                            if re.match(r"(?:https?|mailto):", uri, re.I):
+                                reader_links.append(_reader_link(combined[index], raw, {"kind": "uri", "uri": uri},
+                                                                 source_page=number,
+                                                                 group=f"restored-{number}-uri-"
+                                                                       f"{round(raw.x0, 1)}-{round(raw.y0, 1)}"))
+                        elif (not erased_overlap and link.get("kind") in {pymupdf.LINK_GOTO, pymupdf.LINK_NAMED}
+                                and isinstance(target_page, int) and 0 <= target_page < len(original)):
+                            reader_links.append(_reader_link(
+                                combined[index], raw, {"kind": "goto", "target_page": target_page},
+                                goto_fraction(original[target_page], target_to), source_page=number,
+                                group=f"restored-{number}-goto-{round(raw.x0, 1)}-"
+                                      f"{round(raw.y0, 1)}-{target_page}"))
+                if reader_links:
+                    report["links"] = reader_links
             raw = combined.tobytes(garbage=4, deflate=True)
         report["revision"] = revision
         temporary = cache / (revision + ".tmp")

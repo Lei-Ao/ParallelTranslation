@@ -11,7 +11,9 @@ import pymupdf
 from fastapi import HTTPException
 import app as service
 import pdf_layout
-from pdf_references import clean_text, discover, format_translation, normalize_document, split_reference, translation_source
+from pdf_references import (clean_text, discover, format_translation,
+                            normalize_document, reference_fallback_pages, split_reference,
+                            translation_source)
 
 
 def fixture(rotation=0):
@@ -218,6 +220,83 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn('across columns', text)
         self.assertIn('Third title', text)
         self.assertTrue(any(item['kind'] == 'preserved' for item in report['issues']))
+
+
+class ReferenceFallbackTests(unittest.TestCase):
+    def test_unrebuildable_bibliography_is_preserved_as_one_region(self):
+        with tempfile.TemporaryDirectory() as temp, pymupdf.open() as pdf:
+            page = pdf.new_page(width=612, height=792)
+            page.insert_textbox((48, 80, 286, 300),
+                                "Left column prose stays translated. " * 12, fontsize=9)
+            page.insert_text((330, 70), "REFERENCES", fontsize=8)
+            entries = ['[1] A. Author, "A paper title," Venue, 2020.',
+                       '[2] B. Author, A book title without quotes. Publisher, 2021.',
+                       '[3] C. Author, "Another paper," Venue, 2022.']
+            for index, line in enumerate(entries):
+                page.insert_text((330, 90 + index * 12), line, fontsize=8)
+            blocks = []
+            for index, native in enumerate(page.get_text("blocks")):
+                text = native[4].strip()
+                if text.startswith("Left"):
+                    translation = "左栏正文译文。" * 6
+                elif text.startswith("REFERENCES"):
+                    translation = "参考文献"
+                else:
+                    translation = "参考文献条目译文。" * 8
+                blocks.append({"id": f"p1-b{index}", "text": text, "translation": translation,
+                               "target": "简体中文", "edited": False,
+                               "bbox": [native[0] / 612, native[1] / 792,
+                                        native[2] / 612, native[3] / 792]})
+            path = Path(temp) / "source.pdf"
+            pdf.save(path)
+            raw, report = pdf_layout.typeset(path, {"pages": [{"number": 1, "blocks": blocks}]},
+                                             "简体中文")
+        words = [block["text"] for block in blocks]
+        self.assertTrue(any("A book title" in text for text in words))
+        self.assertTrue(any(issue["kind"] == "reference" for issue in report["issues"]), report["issues"])
+        self.assertGreaterEqual(report["preserved"], 1)
+        output = pymupdf.open(stream=raw, filetype="pdf")
+        self.addCleanup(output.close)
+        rendered = output[0]
+        right = rendered.get_text(clip=pymupdf.Rect(306, 85, 612, 420))
+        left = rendered.get_text(clip=pymupdf.Rect(0, 80, 300, 420))
+        self.assertIn("A book title without quotes", right)
+        self.assertNotRegex(right, r"[\u3400-\u9fff]")
+        self.assertIn("左栏", left)
+
+
+    def test_continuation_pages_use_the_heading_page_fallback(self):
+        with tempfile.TemporaryDirectory() as temp, pymupdf.open() as pdf:
+            first = pdf.new_page(width=612, height=792)
+            first.insert_textbox((48, 80, 286, 300), "Left column prose. " * 10, fontsize=9)
+            first.insert_text((330, 70), "REFERENCES", fontsize=8)
+            first.insert_text((330, 90), '[1] A. Author, "First," Venue, 2020.', fontsize=8)
+            first.insert_text((330, 102), '[2] B. Author, "Second," Venue, 2021.', fontsize=8)
+            second = pdf.new_page(width=612, height=792)
+            for left, number in ((60, 3), (330, 5)):
+                second.insert_text((left, 80), f'[{number}] C. Author, "Third," Venue, 2022.', fontsize=8)
+                second.insert_text((left, 92), f'[{number + 1}] D. Author, "Fourth," Venue, 2023.', fontsize=8)
+            mapping = reference_fallback_pages(pdf)
+            self.assertIn(0, mapping)
+            self.assertIn(1, mapping)
+            blocks = []
+            for index, native in enumerate(second.get_text("blocks")):
+                blocks.append({"id": f"p2-b{index}", "text": native[4].strip(),
+                               "translation": "参考文献条目译文。" * 8, "target": "简体中文",
+                               "edited": False,
+                               "bbox": [native[0] / 612, native[1] / 792,
+                                        native[2] / 612, native[3] / 792]})
+            path = Path(temp) / "source.pdf"
+            pdf.save(path)
+            raw, report = pdf_layout.typeset(
+                path, {"pages": [{"number": 2, "blocks": blocks}]}, "简体中文",
+                page_numbers=[1], reference_fallbacks=mapping)
+        self.assertTrue(any(issue["kind"] == "reference" for issue in report["issues"]), report["issues"])
+        output = pymupdf.open(stream=raw, filetype="pdf")
+        self.addCleanup(output.close)
+        text = output[0].get_text()
+        self.assertIn("[3] C. Author", text)
+        self.assertNotRegex(text, r"[\u3400-\u9fff]")
 
 
 if __name__ == '__main__':

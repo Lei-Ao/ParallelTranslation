@@ -35,7 +35,7 @@ class InlineMathLayoutTests(unittest.TestCase):
         with pymupdf.open() as pdf:
             asset = self.asset_fixture(pdf.new_page())
             archive = pymupdf.Archive()
-            markup, plain, labels = layout.inline_math_markup("保留 ax0，变量 x_0 的说明。", [asset], archive)
+            markup, plain, labels, _ = layout.inline_math_markup("保留 ax0，变量 x_0 的说明。", [asset], archive)
             self.assertIn("ax0", markup)
             self.assertEqual(markup.count("<img"), 1)
             self.assertEqual(labels, ["x_0"])
@@ -63,7 +63,7 @@ class InlineMathLayoutTests(unittest.TestCase):
         with pymupdf.open() as pdf:
             asset = self.asset_fixture(pdf.new_page())
             assets = [{**asset, "normalized": key} for key in ("u", "u=M(Ω)T", "T")]
-            markup, plain, labels = layout.inline_math_markup(
+            markup, plain, labels, _ = layout.inline_math_markup(
                 "由 T 通过 u=M(Ω)T 得到控制量 u。", assets, pymupdf.Archive())
             self.assertEqual(labels, ["T", "u=M(Ω)T", "u"])
             self.assertEqual(markup.count("<img"), 3)
@@ -79,7 +79,7 @@ class InlineMathLayoutTests(unittest.TestCase):
             style = {"size": 10, "lines": [], "bold": False, "italic": False, "color": 0}
             result = layout.fitted_overlay(overlays, page,
                 {"text": "The vector is used for control of the robot.", "translation": text},
-                pymupdf.Rect(40, 50, 350, 150), style, [], typography)
+                pymupdf.Rect(40, 50, 200, 150), style, [], typography)
             self.assertIsNotNone(result)
             spans = [s for b in overlays[result["overlay"]].get_text("dict")["blocks"] if b["type"] == 0
                      for line in b["lines"] for s in line["spans"] if any("\u3400" <= c <= "\u9fff" for c in s["text"])]

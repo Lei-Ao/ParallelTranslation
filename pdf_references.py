@@ -9,6 +9,9 @@ import pymupdf
 from pdf_typography import space_cjk_latin
 
 SCHEMA = 1
+HEADING = re.compile(r"REFERENCES|BIBLIOGRAPHY|参考文献", re.I)
+REFERENCE_MARK = re.compile(
+    r"(?m)^\s*(?:\[\s*\d{1,4}\s*\]|\(?\s*\d{1,4}\s*\)?[.)])\s+")
 
 
 def clean_text(value):
@@ -34,6 +37,51 @@ def split_reference(text):
 def translation_source(block):
     reference = block.get("reference")
     return reference["title"] if reference else block["text"]
+
+
+_URL_TEXT = re.compile(r"https?://[^\s<>\"'，。；：！？）】」』《【〕]+")
+_URL_TRAILING = ".,;:!?)]}'\"。、；，！？）：」』）"
+
+
+def _url_ranges(content):
+    """Literal http(s) URLs in an entry, as (start, end, uri, ordinal) ranges."""
+    ranges = []
+    for match in _URL_TEXT.finditer(content):
+        value = match[0].rstrip(_URL_TRAILING)
+        if len(value) < 9:
+            continue
+        start = match.start()
+        ordinal, position = 0, content.find(value)
+        while 0 <= position < start:
+            ordinal += 1
+            position = content.find(value, position + 1)
+        ranges.append((start, start + len(value), value, ordinal))
+    return ranges
+
+
+def _entry_inner(content, regions, ranges):
+    """Escape entry text once, layering meta/title spans and link anchors."""
+    cuts = {0, len(content)}
+    for start, end, _, _ in ranges:
+        cuts.update((start, end))
+    # Region boundaries are cuts too: without them the whole entry is one
+    # piece and the title never receives its own font/size.
+    for begin, finish, _ in regions:
+        cuts.update((max(0, begin), min(len(content), finish)))
+    ordered = sorted(cuts)
+    pieces = []
+    for start, end in zip(ordered, ordered[1:]):
+        if end <= start:
+            continue
+        piece = html.escape(content[start:end])
+        region = next((name for begin, finish, name in regions if begin <= start and end <= finish), None)
+        if region:
+            piece = f'<span class="{region}">{piece}</span>'
+        link = next((item for item in ranges if item[0] <= start and end <= item[1]), None)
+        if link:
+            piece = f'<a href="{html.escape(link[2], quote=True)}">{piece}</a>'
+        pieces.append(piece)
+    return "".join(pieces)
 
 
 def format_translation(block, title):
@@ -80,7 +128,7 @@ def discover(pdf):
     """Fail closed for multi-page bibliographies; never merge half an entry."""
     for page_index, page in enumerate(pdf):
         lines = _visual_lines(page)
-        heading = next((line for line in lines if re.fullmatch(r"REFERENCES|BIBLIOGRAPHY|参考文献", line["text"], re.I)), None)
+        heading = next((line for line in lines if HEADING.fullmatch(line["text"].strip())), None)
         if heading is None:
             continue
         bounds = page.rect * page.derotation_matrix
@@ -126,6 +174,96 @@ def discover(pdf):
                 return None
         return {"page": page_index + 1, "heading_rect": list(heading["rect"]), "regions": regions, "entries": entries}
     return None
+
+
+def fallback_reference_regions(page):
+    """Column areas of a bibliography that cannot be rebuilt into full entries.
+
+    A multi-page bibliography, an unquoted book title or a non-contiguous
+    numbering makes `discover` fail closed. Translating those line fragments
+    one by one mixes languages inside one entry and lets expanded translations
+    overlap the lines that had to stay original. Return the columns below the
+    reference heading instead, so the caller can keep that whole region intact.
+    """
+    if page.rotation:
+        return []
+    lines = _visual_lines(page)
+    heading = next((line for line in lines if HEADING.fullmatch(line["text"].strip())), None)
+    if heading is None:
+        return []
+    bounds = page.rect * page.derotation_matrix
+    mid = bounds.width / 2
+    double = (any(line["rect"].width > bounds.width * .2 and line["rect"].x1 <= mid + 6 for line in lines)
+              and any(line["rect"].width > bounds.width * .2 and line["rect"].x0 >= mid - 6 for line in lines))
+    if not double:
+        return [pymupdf.Rect(bounds.x0, heading["rect"].y1, bounds.x1, bounds.y1)]
+    start_column = int((heading["rect"].x0 + heading["rect"].x1) / 2 >= mid)
+    regions = []
+    for column in range(start_column, 2):
+        x0 = bounds.x0 if column == 0 else mid
+        x1 = mid if column == 0 else bounds.x1
+        y0 = heading["rect"].y1 if column == start_column else bounds.y0
+        regions.append(pymupdf.Rect(x0, y0, x1, bounds.y1))
+    return regions
+
+
+def reference_fallback_pages(pdf):
+    """Map page indexes to the column areas of a non-rebuildable bibliography.
+
+    A bibliography can start on one page and run over several pages; only the
+    first page carries the heading. Once that heading is found, following pages
+    with several numbered entries in the reference columns are part of the same
+    unrebuildable section. Returning every affected page keeps the fallback
+    consistent instead of protecting only the heading page.
+    """
+    pages = list(pdf)
+    result = {}
+    for index, page in enumerate(pages):
+        if page.rotation:
+            continue
+        lines = _visual_lines(page)
+        heading = next((line for line in lines if HEADING.fullmatch(line["text"].strip())), None)
+        if heading is None:
+            continue
+        bounds = page.rect * page.derotation_matrix
+        mid = bounds.width / 2
+        double = (any(line["rect"].width > bounds.width * .2 and line["rect"].x1 <= mid + 6 for line in lines)
+                  and any(line["rect"].width > bounds.width * .2 and line["rect"].x0 >= mid - 6 for line in lines))
+        columns = [(bounds.x0, mid), (mid, bounds.x1)] if double else [(bounds.x0, bounds.x1)]
+        start_column = int((heading["rect"].x0 + heading["rect"].x1) / 2 >= mid) if double else 0
+        regions = []
+        for column in range(start_column, len(columns)):
+            x0, x1 = columns[column]
+            y0 = heading["rect"].y1 if column == start_column else bounds.y0
+            regions.append(pymupdf.Rect(x0, y0, x1, bounds.y1))
+        result[index] = regions
+        for next_index in range(index + 1, len(pages)):
+            following = pages[next_index]
+            if following.rotation:
+                break
+            following_lines = _visual_lines(following)
+            following_bounds = following.rect * following.derotation_matrix
+            following_mid = following_bounds.width / 2
+            following_double = (
+                any(line["rect"].width > following_bounds.width * .2
+                    and line["rect"].x1 <= following_mid + 6 for line in following_lines)
+                and any(line["rect"].width > following_bounds.width * .2
+                        and line["rect"].x0 >= following_mid - 6 for line in following_lines))
+            following_columns = ([(following_bounds.x0, following_mid),
+                                  (following_mid, following_bounds.x1)] if following_double
+                                 else [(following_bounds.x0, following_bounds.x1)])
+            markers = [line for line in following_lines
+                       if REFERENCE_MARK.match(line["text"])
+                       and any(x0 - 2 <= (line["rect"].x0 + line["rect"].x1) / 2 <= x1 + 2
+                               for x0, x1 in following_columns)]
+            if len(markers) < 2:
+                break
+            if any(re.fullmatch(r"(?:APPENDIX|SUPPLEMENTARY|ACKNOWLEDG(?:E?MENTS?)?).*",
+                                line["text"].strip(), re.I) for line in following_lines):
+                break
+            result[next_index] = [pymupdf.Rect(x0, following_bounds.y0, x1, following_bounds.y1)
+                                  for x0, x1 in following_columns]
+    return result
 
 
 def normalize_document(document, pdf, *, force=False):
@@ -177,7 +315,8 @@ def normalize_document(document, pdf, *, force=False):
     document["total_blocks"] = sum(len(page["blocks"]) for page in document["pages"])
     return True
 
-def prepare_bibliography(page, saved_page, native, overlays, prepared, source_rects, typography, target):
+def prepare_bibliography(page, saved_page, native, overlays, prepared, source_rects, typography, target,
+                         anchor_rects=None):
     """Preflight complete entries with hanging labels; never shrink each fragment."""
     layout = saved_page.get("reference_layout")
     if not layout:
@@ -214,15 +353,22 @@ def prepare_bibliography(page, saved_page, native, overlays, prepared, source_re
             publication = reference.get("publication", "")
             if content.startswith(author_prefix) and publication and content.endswith(publication):
                 title = space_cjk_latin(content[len(author_prefix):-len(publication)])
-                inner = ('<span class="meta">' + html.escape(author_prefix) + '</span>'
-                         + '<span class="title">' + html.escape(title) + '</span>'
-                         + '<span class="meta">' + html.escape(publication) + '</span>')
+                display = author_prefix + title + publication
+                span_regions = [(0, len(author_prefix), "meta"),
+                                (len(author_prefix), len(author_prefix) + len(title), "title"),
+                                (len(author_prefix) + len(title), len(display), "meta")]
             else:
-                inner = html.escape(content)
+                display = content
+                span_regions = []
+            ranges = _url_ranges(display)
+            inner = _entry_inner(display, span_regions, ranges)
+            anchors = [{"text": value, "kind": "uri", "uri": value, "ordinal": ordinal}
+                       for _, _, value, ordinal in ranges]
             markup = f'<div class="entry">[{block["reference_number"]}] {inner}</div>'
             meta_size = max(7.5, size - .5)
             css = typography["css"] + (f"*{{margin:0;padding:0}}body{{font-family:serif;font-size:{meta_size}pt;"
                                         "line-height:1.24;text-align:left;font-weight:400}"
+                                        "a:link,a:visited,a:hover{color:inherit;text-decoration:none}"
                                         ".entry{margin-left:14pt;text-indent:-14pt}"
                                         f".title{{font-family:{typography['family']};font-size:{size}pt}}")
             placed = None
@@ -240,6 +386,10 @@ def prepare_bibliography(page, saved_page, native, overlays, prepared, source_re
                     crop = pymupdf.Rect(box)
                     crop.y1 = min(box.y1, max(item[3] for item in ink) + 1)
                     placed = {"overlay": len(overlays) - 1, "rect": list(crop), "clip": list(crop), "scale": 1}
+                    if anchors and anchor_rects is not None:
+                        links = anchor_rects(scratch, anchors)
+                        if links:
+                            placed["links"] = links
                     top = crop.y1 + 3
                     break
                 overlays.delete_page(-1)

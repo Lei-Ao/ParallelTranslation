@@ -10,11 +10,13 @@ import pdf_layout
 
 
 class CoverMetadataTests(unittest.TestCase):
-    def fixture(self, rotation=0, split=False, graphic=False, punctuated=True):
+    def fixture(self, rotation=0, split=False, graphic=False, punctuated=True, comma_markers=False):
         pdf = pymupdf.open()
         page = pdf.new_page(width=612, height=792)
         page.insert_text((100, 80), "A General Research Paper About Robots", fontsize=18, fontname="hebo")
         names = ["John Doe1, Jane Smith2, Alan Researcher1,", "Alice Example2 and Robert Scientist1"]
+        if comma_markers:
+            names = ["John Doe,1, Jane Smith,2, Alan Researcher,1,", "Alice Example,2 and Robert Scientist,1"]
         if not punctuated:
             names = [text.replace(",", "").replace(" and ", " ") for text in names]
         for index, text in enumerate(names):
@@ -48,9 +50,9 @@ class CoverMetadataTests(unittest.TestCase):
                                     rect.x1 / page.rect.width, rect.y1 / page.rect.height]})
         return pdf, {"pages": [{"number": 1, "blocks": blocks}]}
 
-    def render(self, rotation=0, split=False, edit=None, graphic=False, punctuated=True):
+    def render(self, rotation=0, split=False, edit=None, graphic=False, punctuated=True, comma_markers=False):
         with tempfile.TemporaryDirectory() as temp:
-            pdf, document = self.fixture(rotation, split, graphic, punctuated)
+            pdf, document = self.fixture(rotation, split, graphic, punctuated, comma_markers)
             if edit:
                 edit(document)
             path = Path(temp) / "source.pdf"
@@ -89,6 +91,19 @@ class CoverMetadataTests(unittest.TestCase):
                            for line in block["lines"] for span in line["spans"]
                            if span["text"].strip() in {"1", "2"} and span["size"] < 8]
                 self.assertGreaterEqual(len(markers), 3)
+
+    def test_affiliation_markers_after_commas_are_superscripted(self):
+        output, report, document = self.render(comma_markers=True)
+        self.assertFalse(report["issues"], report)
+        spans = [span for block in output[0].get_text("dict")["blocks"] if block["type"] == 0
+                 for line in block["lines"] for span in line["spans"] if span["text"].strip()]
+        markers = [span for span in spans if span["text"].strip() in {"1", "2"} and span["size"] < 8]
+        self.assertGreaterEqual(len(markers), 4, markers)
+        # Affiliation digits must not stay on the baseline next to the surname.
+        names = [span for span in spans
+                 if any(name in span["text"] for name in
+                        ("Doe", "Smith", "Researcher", "Example", "Scientist"))]
+        self.assertFalse([span for span in names if any(char.isdigit() for char in span["text"])], names)
 
     def test_cover_group_retains_rotation_and_all_metadata(self):
         for rotation in (90, 180, 270):

@@ -65,7 +65,7 @@ class ListMarkerTests(unittest.TestCase):
 
     def test_marker_markup_keeps_the_space_after_the_bullet(self):
         marker = {"family": "'Times New Roman',serif", "size": 10, "weight": 400}
-        contents, plain, labels = pdf_layout.inline_math_markup(
+        contents, plain, labels, _ = pdf_layout.inline_math_markup(
             "• 中文条目", [], pymupdf.Archive(), marker_style=marker)
         self.assertIn("Times New Roman", contents)
         self.assertIn("&nbsp;", contents)
@@ -74,7 +74,7 @@ class ListMarkerTests(unittest.TestCase):
 
     def test_bold_range_after_bullet_keeps_its_first_character(self):
         marker = {"family": "'Times New Roman',serif", "size": 10, "weight": 400}
-        contents, _, _ = pdf_layout.inline_math_markup(
+        contents, _, _, _ = pdf_layout.inline_math_markup(
             "• 无机体坐标系：正文", [], pymupdf.Archive(), bold=[(2, 8)], marker_style=marker)
         self.assertIn("<b>无机体坐标系</b>", contents)
         self.assertNotIn("<b>机体坐标系", contents)
