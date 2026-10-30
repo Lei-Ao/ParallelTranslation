@@ -191,6 +191,19 @@ def caption(block):
     return bool(re.match(r"^\s*(?:fig(?:ure)?[.\s]|table\b|algorithm\b|图\s*\d|表\s*\d)", block["text"], re.I))
 
 
+def source_flow_spacing(style, result, prior_style, prior_result, source_gap):
+    """Preserve source ink spacing without overlapping translated font frames."""
+    size = max(style["size"], prior_style["size"])
+    gap, ink_gap, padding = max(source_gap, 1.5, size * .2), None, None
+    if (style.get("ink_bounds") and prior_style.get("ink_bounds")
+            and result.get("ink_insets") is not None
+            and prior_result.get("ink_insets") is not None):
+        ink_gap = style["ink_bounds"][1] - prior_style["ink_bounds"][3]
+        padding = prior_result["ink_insets"][1] + result["ink_insets"][0]
+        gap = max(1.5, size * .2, ink_gap - padding)
+    return gap, ink_gap, padding
+
+
 def reflow_columns(prepared, native, graphics, source_rects, page_width, prose):
     """Remove translation-created gaps while retaining source paragraph spacing.
 
@@ -259,17 +272,8 @@ def reflow_columns(prepared, native, graphics, source_rects, page_width, prose):
                 if -max(3, size * .3) <= source_gap <= max(24, size * 2.5):
                     # Retain measured source spacing, including heading and
                     # equation gaps, instead of imposing a uniform small gap.
-                    gap = max(source_gap, 1.5, size * .2)
-                    ink_gap = None
-                    ink_padding = None
-                    if (style.get("ink_bounds") and prior_style.get("ink_bounds")
-                            and result.get("ink_insets") is not None
-                            and prior_result.get("ink_insets") is not None):
-                        ink_gap = style["ink_bounds"][1] - prior_style["ink_bounds"][3]
-                        ink_padding = prior_result["ink_insets"][1] + result["ink_insets"][0]
-                        # Match the painted gap, subtracting each translated
-                        # font frame's empty edges. Never overlap layout boxes.
-                        gap = max(1.5, size * .2, ink_gap - ink_padding)
+                    gap, ink_gap, ink_padding = source_flow_spacing(
+                        style, result, prior_style, prior_result, source_gap)
                     box = pymupdf.Rect(result["rect"])
                     top = pymupdf.Rect(prior_result["rect"]).y1 + gap
                     if top < box.y0 - 2:

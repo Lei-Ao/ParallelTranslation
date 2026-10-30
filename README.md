@@ -51,6 +51,8 @@ cd ParallelTranslation
 
 托盘图标双击打开工作台；右键菜单可以「打开工作台」「重新启动服务」「启动服务 / 停止服务」或「停止并退出」。关闭浏览器不会停止服务；需要完全停止时从托盘菜单选择「停止并退出」，也可以双击 **`stop.bat`** 强制停止。服务日志位于 `tmp/parallel.log`。再次启动已运行的实例只会打开工作台，不会重复启动服务。
 
+托盘使用绿色双页图标，悬停显示「页间 Parallel」。如果 Windows 将它收进隐藏区域，可点击任务栏右下角的 `⌃` 查看，再将图标拖到任务栏常驻显示。更新图标后，先退出旧托盘程序，再双击 `start.vbs`；浏览器标签页也使用同一图标。
+
 不要直接打开 `static/index.html`；PDF 解析、译文保存与接口调用需要本机后端服务。当前测试环境为 Windows / Python 3.12。
 
 ### 手动安装与启动
@@ -172,6 +174,7 @@ tray.ps1                Windows 托盘菜单（打开/重启/停止/退出）
 pdf_text.py             首字下沉与完整单词恢复
 pdf_layout.py           PDF 排版、图表避让与按页缓存
 pdf_flow.py             分栏重排与公式区域移动
+pdf_lists.py            列表结构恢复、编号与悬挂缩进
 pdf_typography.py       字体子集、字重与符号回退
 pdf_references.py       参考文献恢复、题名翻译与排版
 static/                 无构建依赖的 HTML、CSS、JavaScript

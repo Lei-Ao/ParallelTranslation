@@ -17,16 +17,18 @@ from pathlib import Path
 import pymupdf
 from pdf_typography import font_resources, font_signature, space_cjk_latin
 from pdf_flow import (visible_drawings, heading as section_heading, original_formula_units,
-                      column_lanes, reflow_columns, text_ink_bounds)
+                      column_lanes, reflow_columns, source_flow_spacing, text_ink_bounds,
+                      caption as flow_caption, lane_options)
 from pdf_references import (REFERENCE_MARK, fallback_reference_regions, prepare_bibliography,
                             reference_fallback_pages)
 from pdf_text import normalize_drop_caps
+from pdf_lists import ListLayoutError, source_list_structure, translated_list_layout, BULLETS
 
 ET.register_namespace("", "http://www.w3.org/2000/svg")
 ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
 
 PDF_LOCK = threading.RLock()
-ENGINE_VERSION = 55
+ENGINE_VERSION = 60
 MATH_FONT = re.compile(r"math|symbol|cmmi|cmsy|cmex|msam|msbm|stmary|rsfs", re.I)
 INSTITUTION = re.compile(r"universit|institut|laborator|department|school|academy|college|hospital|研究所|大学|学院|实验室", re.I)
 # Author lines mark affiliations with raised digits. Publishers put them right
@@ -885,8 +887,8 @@ def list_marker_style(block, style, size):
                      "size": size * ratio, "weight": weight}
 
 
-def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None, links=()):
-    marker = lead_list_marker(value) if marker_style is not None else None
+def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None, links=(), paragraphs=()):
+    marker = lead_list_marker(value) if marker_style is not None and not paragraphs else None
     if marker is not None:
         first, last = marker.start(2), marker.end(2)
         prefix, suffix = value[:first], value[last:]
@@ -946,11 +948,47 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
     events = [(start, end, "math", asset) for start, end, asset in placed]
     events += [(item["start"], item["end"], "link", item) for item in ranges]
     events.sort(key=lambda event: event[0])
+    decorations, separators = {}, set()
+    for paragraph in paragraphs:
+        start, end = paragraph["start"], paragraph["end"]
+        left = paragraph["left"]
+        indent = 0 if paragraph["marker"] else paragraph["indent"]
+        opening = (f'<div style="padding-left:{left * scale:.4f}pt;text-indent:{indent * scale:.4f}pt;'
+                   f'text-align:{paragraph["alignment"]};margin-top:{paragraph.get("space_before", 0) * scale:.4f}pt;'
+                   f'padding-right:{2 * scale if paragraph["marker"] else 0:.4f}pt">')
+        if paragraph["marker"]:
+            hanging = (paragraph["body"] - paragraph["left"]) * scale
+            extra = "font-family:'Times New Roman',serif;" if paragraph["marker"] in BULLETS else ""
+            # Story adds a small frame inset; leave it inside the source box
+            # rather than allowing a 100%-width table to paint past its edge.
+            opening += ('<table style="width:100%;border-collapse:collapse;border-spacing:0;table-layout:fixed"><tr>'
+                        f'<td style="padding:0;width:{hanging:.4f}pt;vertical-align:baseline;'
+                        f'text-indent:0;text-align:left;white-space:nowrap;font-style:normal;'
+                        f'font-weight:{600 if paragraph["marker_bold"] else 400};{extra}">')
+            decorations.setdefault(paragraph["prefix_end"], []).append(
+                f'</td><td style="padding:0;vertical-align:baseline;text-indent:0;text-align:{paragraph["alignment"]}">')
+        decorations.setdefault(start, []).append(opening)
+        decorations.setdefault(end, []).append("</td></tr></table></div>" if paragraph["marker"] else "</div>")
+        if end < len(value):
+            separators.add(end)
+    if any(start < cut < end for start, end, _, _ in events for cut in decorations):
+        raise ListLayoutError("列表边界与公式或链接相交，无法可靠分段，已保留完整原文")
     pieces, plain, labels, resolved, raw_cursor = [], [], [], [], 0
+
+    def emit_text(start, end):
+        cursor = start
+        for position in sorted(p for p in decorations if start <= p <= end):
+            if position > cursor:
+                pieces.append(_bold_html(value, cursor, position, bold, fallback))
+            pieces.extend(decorations.pop(position))
+            cursor = position + (1 if position in separators else 0)
+        if cursor < end:
+            pieces.append(_bold_html(value, cursor, end, bold, fallback))
+
     for start, end, kind, payload in events:
         if start < raw_cursor:
             continue
-        pieces.append(_bold_html(value, raw_cursor, start, bold, fallback))
+        emit_text(raw_cursor, start)
         plain.append(value[raw_cursor:start])
         if kind == "math":
             name = "math-" + hashlib.sha256(payload["svg"]).hexdigest()[:20] + ".svg"
@@ -974,7 +1012,7 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
             plain.append(value[start:end])
             resolved.append(dict(payload))
         raw_cursor = end
-    pieces.append(_bold_html(value, raw_cursor, len(value), bold, fallback))
+    emit_text(raw_cursor, len(value))
     plain.append(value[raw_cursor:])
     return "".join(pieces), "".join(plain), labels, resolved
 
@@ -1900,10 +1938,18 @@ def source_paragraph_style(style, rect, text, page_width=None, text_obstacles=()
     return alignment, indent, leading
 
 
+def minimum_font_scale(size):
+    minimum = 8 if size >= 8 else max(4.5, size * .75)
+    return min(1, max(.70, minimum / size))
+
+
 def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=None,
-                   horizontal_obstacles=None, bold_hints=None):
+                   horizontal_obstacles=None, bold_hints=None, *, font_scale=1, allow_shrink=True):
+    if "_list_structure" not in style:
+        style["_list_structure"] = source_list_structure(page, style, rect)
+    list_structure = style["_list_structure"]
     if block.get("translation"):
-        block = {**block, "translation": soft_translation(block)}
+        block = {**block, "translation": block["translation"] if list_structure else soft_translation(block)}
     typography = typography or font_resources(block["translation"])
     archive = pymupdf.Archive()
     if typography["archive"] is not None:
@@ -1919,7 +1965,7 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     # Keep the source's nominal title size. Inflating cover titles by 12% made
     # the translated title larger than the source and forced tight lines to
     # shrink; a title group now fits at the size the document actually used.
-    size = style["size"]
+    size = style["size"] * font_scale
     display_text, marker_style = list_marker_style(block, style, size)
     validation_text = display_text
     single_line = (bool(style["lines"])
@@ -1927,8 +1973,7 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                    - min(line["bbox"][1] for line in style["lines"]) < size * .5)
     # Keep an 8 pt floor for body text. Labels that were already smaller may
     # still shrink to 75% instead of being pinned at 100% and overflowing.
-    minimum = 8 if size >= 8 else max(4.5, size * .75)
-    scale_low = min(1, max(.70, minimum / size))
+    scale_low = minimum_font_scale(size) if allow_shrink else 1
     # Built-in CJK fallback lacks some Mathematical Alphanumeric Symbols and
     # superscript digits. Their compatibility equivalents preserve the
     # variable/number rather than discarding an otherwise printable block.
@@ -1992,6 +2037,9 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
         ink = [item for item in scratch.get_text("blocks") if item[6] == 0 and item[4].strip()]
         images = scratch.get_image_info()
         ink.extend(image["bbox"] for image in images)
+        if list_structure and any(item[0] < box.x0 - 1 or item[2] > box.x1 + 1 for item in ink):
+            overlays.delete_page(-1)
+            return None, 0
         if not ink:
             overlays.delete_page(-1)
             return None, 0
@@ -2030,13 +2078,26 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
         display_weight = prominent_heading(style, block["text"], horizontal_obstacles or ())
     weight = 600 if section_heading(block["text"]) or (
         style["bold"] and (display_weight or not is_prose(block["text"]))) else 400
+    if list_structure:
+        weight = 600 if style["bold"] else 400
 
     for variant in variants:
+        paragraphs = ()
+        if list_structure:
+            try:
+                variant, paragraphs = translated_list_layout(variant, list_structure, join_soft_lines)
+            except ListLayoutError as error:
+                style["list_layout_issue"] = str(error)
+                return None
         ranges = bold_ranges(variant, bold_hints) if bold_hints else ()
-        contents, validation_text, math_labels, resolved_links = inline_math_markup(
-            variant, block.get("_inline_assets", []), archive, bold=ranges,
-            fallback=typography.get("fallback_characters", ""), marker_style=marker_style,
-            links=block.get("_link_hints", []))
+        try:
+            contents, validation_text, math_labels, resolved_links = inline_math_markup(
+                variant, block.get("_inline_assets", []), archive, scale=font_scale, bold=ranges,
+                fallback=typography.get("fallback_characters", ""), marker_style=marker_style,
+                links=block.get("_link_hints", []), paragraphs=paragraphs)
+        except ListLayoutError as error:
+            style["list_layout_issue"] = str(error)
+            return None
         anchors = [{"text": item["text"], "kind": item["kind"], "uri": item.get("uri"),
                     "page": item.get("page"), "to": item.get("to"), "source": item.get("source"),
                     "ordinal": item["ordinal"]} for item in resolved_links]
@@ -2074,11 +2135,132 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
         # prose to a heavier sans face just because one glyph failed.
         result = fitted_overlay(overlays, page, block, rect, style, obstacles,
                                 {**typography, "compact_fallback": True}, horizontal_obstacles,
-                                bold_hints=bold_hints)
+                                bold_hints=bold_hints, font_scale=font_scale, allow_shrink=allow_shrink)
         if result:
             result["leading_fallback"] = True
         return result
     return None
+
+
+def body_flow_candidate(block, style=None):
+    return (is_prose(block["text"]) and not section_heading(block["text"])
+            and not flow_caption(block) and not _LIST_LINE.search(block["text"])
+            and not block.get("kind") and not block.get("_formula")
+            and not block.get("_cover_metadata") and not (style or {}).get("_list_structure"))
+
+
+def finish_overlay_links(block, result):
+    hints = block.get("_link_hints", [])
+    resolved = result.get("links") or []
+    whole = []
+    if len(hints) == 1 and hints[0].get("whole_block"):
+        hint = hints[0]
+        if not any(item.get("kind") == hint["kind"]
+                   and (item.get("uri") or None) == (hint.get("uri") or None)
+                   and item.get("source") == hint.get("source") for item in resolved):
+            whole.append({**hint, "whole": True})
+    result["whole_links"] = whole
+    kept = {(item.get("kind"), item.get("uri") or None) for item in resolved + whole}
+    return sum(1 for hint in hints if hint["kind"] == "uri" and ("uri", hint.get("uri") or None) not in kept)
+
+
+def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typography):
+    """Preflight adjacent same-size prose together before accepting local shrinkage.
+
+    Source geometry and fixed content bound each transaction. Nothing is erased
+    until the entire run fits at one font scale with complete searchable text.
+    """
+    lanes = column_lanes(prepared, source_rects, page.rect.width, is_prose)
+    per_lane = {}
+
+    for index, (block, style, result) in enumerate(prepared):
+        choices = lane_options(source_rects[block["id"]], lanes)
+        if choices:
+            lane = min(choices, key=lambda item: item[1])[0]
+            per_lane.setdefault(lane, []).append(index)
+    runs = []
+    for indexes in per_lane.values():
+        indexes.sort(key=lambda i: source_rects[prepared[i][0]["id"]].y0)
+        run = []
+        for index in indexes:
+            block, style, _ = prepared[index]
+            if run:
+                prior, prior_style, _ = prepared[run[-1]]
+                box, before = source_rects[block["id"]], source_rects[prior["id"]]
+                size = max(style["size"], prior_style["size"])
+                if (not body_flow_candidate(block, style) or abs(style["size"] - prior_style["size"]) > .1
+                        or (style["bold"], style["italic"]) != (prior_style["bold"], prior_style["italic"])
+                        or not -max(3, size * .3) <= box.y0 - before.y1 <= max(24, size * 2.5)):
+                    runs.append(run)
+                    run = []
+            if body_flow_candidate(block, style):
+                run.append(index)
+        if run:
+            runs.append(run)
+    adjustments = []
+    for indexes in runs:
+        if len(indexes) < 2 or not any(prepared[i][2]["scale"] < .99 for i in indexes):
+            continue
+        members = set(indexes)
+        owned = {id(span) for i in indexes for span in prepared[i][1]["spans"]}
+        fixed = [pymupdf.Rect(span["bbox"]) for item in native for line in item["lines"]
+                 for span in line["spans"] if span["text"].strip() and id(span) not in owned]
+        carried = {tuple(box) for i in indexes for box in prepared[i][2].get("carried_graphics", [])}
+        fixed += [pymupdf.Rect(box) + (-.3, -.3, .3, .3) for box in graphics if tuple(box) not in carried]
+        fixed += [pymupdf.Rect(result["rect"]) for i, (_, _, result) in enumerate(prepared) if i not in members]
+        bottom = max(max(source_rects[prepared[i][0]["id"]].y1, prepared[i][2]["rect"][3]) for i in indexes)
+        region = pymupdf.Rect(source_rects[prepared[indexes[0]][0]["id"]])
+        for index in indexes[1:]:
+            region |= source_rects[prepared[index][0]["id"]]
+        if any(overlap(region, obstacle) > .1 for obstacle in fixed):
+            continue  # Artwork, formulas and preserved text separate flow runs.
+        floor = max(minimum_font_scale(prepared[i][1]["size"]) for i in indexes)
+        factors = list(dict.fromkeys([1] + [1 - step * .02 for step in range(1, 16)
+                                                    if 1 - step * .02 >= floor] + [floor]))
+        for factor, compact in [(factor, compact) for factor in factors for compact in (False, True)]:
+            start = len(overlays)
+            staged, moves = [], []
+            run_typography = {**typography, "compact_fallback": True} if compact else typography
+            for index in indexes:
+                block, style, old = prepared[index]
+                source = source_rects[block["id"]]
+                top = source.y0 if not staged else staged[-1][2]["rect"][3] + max(1.5, style["size"] * .2)
+                box = pymupdf.Rect(source.x0, top, source.x1, bottom)
+                if box.height <= 0:
+                    break
+                result = fitted_overlay(overlays, page, block, box, style, fixed, run_typography,
+                                        [s for item in native for line in item["lines"] for s in line["spans"]
+                                         if id(s) not in owned], inline_bold_hints(style, block["text"]),
+                                        font_scale=factor, allow_shrink=False)
+                if result is None:
+                    break
+                if staged:
+                    prior, prior_style, prior_result = staged[-1]
+                    source_gap = source.y0 - source_rects[prior["id"]].y1
+                    gap, ink_gap, padding = source_flow_spacing(style, result, prior_style, prior_result, source_gap)
+                    top = prior_result["rect"][3] + gap
+                    moves.append({"blocks": block.get("_members", [block["id"]]),
+                                  "previous": prior.get("_members", [prior["id"]]),
+                                  "previous_bottom": prior_result["rect"][3], "source_gap": source_gap,
+                                  "gap": gap, "source_ink_gap": ink_gap, "ink_padding": padding,
+                                  "shift": top - old["rect"][1]})
+                area = pymupdf.Rect(result["rect"])
+                area = pymupdf.Rect(area.x0, top, area.x1, top + area.height)
+                if area.y1 > bottom + .01 or any(overlap(area, obstacle) > .1 for obstacle in fixed):
+                    break
+                result["rect"], result["scale"] = list(area), factor
+                for field in ("inline_math_runs", "carried_graphics", "whole_links"):
+                    if field in old:
+                        result[field] = old[field]
+                staged.append((block, style, result))
+            if len(staged) == len(indexes):
+                for index, item in zip(indexes, staged):
+                    prepared[index] = item
+                adjustments.extend(moves)
+                break
+            while len(overlays) > start:
+                overlays.delete_page(-1)
+    return adjustments
 
 
 TABLE_CAPTION = re.compile(r"^\s*(?:TABLE|Table)\s+[IVXLC\d]+(?:$|\s|[.:])|^\s*表\s*[IVXLC\d]+", re.I)
@@ -2384,34 +2566,15 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         result = fitted_overlay(overlays, page, block, fit_rect, style, obstacles,
                                                 typography, text_obstacles,
                                                 bold_hints=inline_bold_hints(style, block["text"]))
+                        if result is None and body_flow_candidate(block, style) and not style.get("list_layout_issue"):
+                            # A body block that cannot fit alone may still fit
+                            # with its shorter neighbors at the original size.
+                            result = {"rect": list(fit_rect), "scale": 0, "pending": True}
                         if result and runs:
                             result["inline_math_runs"] = runs
                             result["carried_graphics"] = inline_math_graphics(drawings, runs)
-                        if result and hints:
-                            resolved_links = result.get("links") or []
-                            whole_links = []
-                            # A link that covers the block proves the whole
-                            # translated block is its anchor (fully linked
-                            # titles, author lines, license sentences). Only a
-                            # single-link block is unambiguous.
-                            if len(hints) == 1 and hints[0].get("whole_block"):
-                                hint = hints[0]
-                                matched = any(
-                                    item.get("kind") == hint["kind"]
-                                    and (item.get("uri") or None) == (hint.get("uri") or None)
-                                    and item.get("source") == hint.get("source")
-                                    for item in resolved_links)
-                                if not matched:
-                                    whole_links.append({**hint, "whole": True})
-                            if whole_links:
-                                result["whole_links"] = whole_links
-                            kept = {(item.get("kind"), item.get("uri") or None)
-                                    for item in resolved_links + whole_links}
-                            dropped_links += sum(
-                                1 for hint in hints if hint["kind"] == "uri"
-                                and ("uri", hint.get("uri") or None) not in kept)
                         if result is None:
-                            reason = "译文超出可用空间或含无法可靠排印的字符，保留原文；请编辑后重新排版"
+                            reason = style.get("list_layout_issue") or "译文超出可用空间或含无法可靠排印的字符，保留原文；请编辑后重新排版"
                     if reason and reason.startswith("公式") and not has_redactions and not is_prose(block["text"]):
                         formula_candidates.append((block, rect))
                     if reason:
@@ -2439,7 +2602,35 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         separators = [tuple(drawing["rect"]) for drawing in drawings
                                       if heading_separator(drawing, rects[block["id"]])]
                         result.setdefault("carried_graphics", []).extend(separators)
-                adjustments = reflow_columns(prepared, native, graphics, rects, page.rect.width, is_prose)
+                previous_scaled = sum(len(block.get("_members", [block["id"]]))
+                                      for block, _, result in prepared if result["scale"] < .99)
+                adjustments = fit_body_runs(overlays, page, prepared, native, graphics, rects, typography)
+                for block, _, result in prepared:
+                    if result.get("pending"):
+                        member_ids = block.get("_members", [block["id"]])
+                        report["replaced"] -= len(member_ids)
+                        report["preserved"] += len(member_ids)
+                        report["issues"].extend({"page": saved_page["number"], "block_id": key,
+                                                 "kind": "preserved", "message": "译文超出可用空间或含无法可靠排印的字符，保留原文；请编辑后重新排版"}
+                                                for key in member_ids)
+                    else:
+                        dropped_links += finish_overlay_links(block, result)
+                prepared[:] = [item for item in prepared if not item[2].get("pending")]
+                report["scaled"] += sum(len(block.get("_members", [block["id"]]))
+                                        for block, _, result in prepared if result["scale"] < .99) - previous_scaled
+                adjustments.extend(reflow_columns(prepared, native, graphics, rects, page.rect.width, is_prose))
+                # Both passes can move a run's preceding block. Reports must
+                # describe final geometry, not an earlier preflight snapshot.
+                final = {key: (style, result) for block, style, result in prepared
+                         for key in block.get("_members", [block["id"]])}
+                latest = {tuple(item["blocks"]): item for item in adjustments}
+                adjustments = []
+                for item in latest.values():
+                    current = final[item["blocks"][0]]
+                    prior = final[item["previous"][0]]
+                    gap, ink_gap, padding = source_flow_spacing(*current, *prior, item["source_gap"])
+                    adjustments.append({**item, "previous_bottom": prior[1]["rect"][3], "gap": gap,
+                                        "source_ink_gap": ink_gap, "ink_padding": padding})
                 report.setdefault("flow", []).extend({"page": saved_page["number"], **item} for item in adjustments)
                 moved_formulas = [item for item in formulas if item[2]["rect"] != item[2]["clip"]]
                 for _, _, result in moved_formulas:

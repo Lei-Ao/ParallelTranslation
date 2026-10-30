@@ -9,11 +9,26 @@ $script:logFile = Join-Path $script:logDirectory 'parallel.log'
 $script:errorLogFile = Join-Path $script:logDirectory 'parallel.err.log'
 $script:serverProcess = $null
 $script:notify = $null
+$script:trayIcon = $null
 $script:context = $null
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+function New-TrayIcon {
+    $iconPath = Join-Path $script:root 'static\parallel.ico'
+    try {
+        return [System.Drawing.Icon]::new($iconPath, [System.Windows.Forms.SystemInformation]::SmallIconSize)
+    } catch {
+        # A missing/damaged optional icon must not stop the local service.
+        try {
+            New-Item -ItemType Directory -Force -Path $script:logDirectory | Out-Null
+            [System.IO.File]::AppendAllText($script:errorLogFile, "托盘图标加载失败：$($_.Exception.Message)`r`n")
+        } catch {}
+        return [System.Drawing.SystemIcons]::Information.Clone()
+    }
+}
 
 function Test-Server {
     try {
@@ -142,7 +157,8 @@ try {
     }
 
     $script:notify = New-Object System.Windows.Forms.NotifyIcon
-    $script:notify.Icon = [System.Drawing.SystemIcons]::Application
+    $script:trayIcon = New-TrayIcon
+    $script:notify.Icon = $script:trayIcon
     $script:notify.Text = '页间 Parallel'
     $script:notify.Visible = $true
 
@@ -184,5 +200,8 @@ try {
     if ($script:notify) {
         $script:notify.Visible = $false
         $script:notify.Dispose()
+    }
+    if ($script:trayIcon) {
+        $script:trayIcon.Dispose()
     }
 }

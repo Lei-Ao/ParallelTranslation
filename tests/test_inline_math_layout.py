@@ -104,6 +104,30 @@ class InlineMathLayoutTests(unittest.TestCase):
             self.assertAlmostEqual(box.width / box.height, asset["width"] / asset["height"], places=4)
             self.assertIn("x0", rendered.get_text())
             self.assertGreater(image["width"], box.width * 5)
+            scaled = layout.fitted_overlay(overlays, page, block, pymupdf.Rect(40, 120, 280, 220),
+                                           style, [], {"css": "", "family": "serif", "archive": None},
+                                           font_scale=.8, allow_shrink=False)
+            self.assertIsNotNone(scaled)
+            smaller = overlays[scaled["overlay"]]
+            smaller_box = pymupdf.Rect(smaller.get_image_info()[0]["bbox"])
+            self.assertAlmostEqual(smaller_box.width, box.width * .8, delta=.01)
+            self.assertAlmostEqual(smaller_box.height, box.height * .8, delta=.01)
+            self.assertIn("x0", smaller.get_text())
+            chinese = [s for b in smaller.get_text("dict")["blocks"] if b["type"] == 0
+                       for line in b["lines"] for s in line["spans"] if "测试" in s["text"]]
+            self.assertTrue(chinese)
+            self.assertTrue(all(abs(s["size"] - 8) < .01 for s in chinese))
+            numbered_style = {**style, "_list_structure": [{"marker": "2)", "left": 5, "body": 20,
+                                                            "indent": 0, "alignment": "left", "marker_bold": False}]}
+            numbered = layout.fitted_overlay(overlays, page,
+                {**block, "translation": "2) " + translation + " https://example.org/method"},
+                pymupdf.Rect(40, 120, 280, 250), numbered_style, [],
+                {"css": "", "family": "serif", "archive": None})
+            self.assertIsNotNone(numbered)
+            listed = overlays[numbered["overlay"]]
+            self.assertEqual(len(listed.get_image_info()), 1)
+            self.assertIn("x0", listed.get_text())
+            self.assertTrue(any(link["uri"] == "https://example.org/method" for link in numbered.get("links", [])))
 
     def test_zero_descender_font_redaction_intersects_actual_ascender(self):
         strip = layout.span_strip({"bbox": (50, 70, 64, 80), "origin": (50, 80),

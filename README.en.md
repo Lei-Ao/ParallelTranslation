@@ -51,6 +51,8 @@ cd ParallelTranslation
 
 Double-click the tray icon to open the workbench. Its context menu offers **打开工作台**, **重新启动服务**, **启动服务 / 停止服务**, and **停止并退出**. Closing the browser does not stop the service; use **停止并退出** in the tray menu, or double-click **`stop.bat`**, to stop it completely. Server logs are written to `tmp/parallel.log`. Launching an already running instance only opens the workbench again.
 
+The tray uses a green double-page icon, with “页间 Parallel” shown on hover. If Windows places it in the hidden area, click `⌃` near the clock and drag the icon onto the taskbar to keep it visible. After updating the icon, exit the old tray controller before launching `start.vbs` again. Browser tabs use the same icon.
+
 Do not open `static/index.html` directly: PDF extraction, persistence, and API requests require the local backend. The current regression environment is Windows / Python 3.12.
 
 ### Manual installation
@@ -172,6 +174,7 @@ tray.ps1                Windows tray menu (open/restart/stop/exit)
 pdf_text.py             Drop-cap recovery and complete words
 pdf_layout.py           Typesetting, obstacle handling, page caches
 pdf_flow.py             Column reflow and equation relocation
+pdf_lists.py            List reconstruction, numbering, hanging indents
 pdf_typography.py       Font subsetting, weights, symbol fallback
 pdf_references.py       Reference reconstruction and title translation
 static/                 HTML, CSS, JavaScript without a build step
