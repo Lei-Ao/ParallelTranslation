@@ -145,6 +145,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 - A model may return one paragraph as several lines; the layout and reader merge soft line breaks inside one source paragraph (line-structured lists and notation blocks keep their breaks). The edit dialog and saved translation text are not rewritten.
 - Display equations, complex tables, vertical text, or text that cannot fit safely may retain the complete original. Tables generally retain their contents while their captions and notes are translated.
 - Text inside images is not recognized or replaced. Translation progress counts saved paragraph translations, not the proportion of PDF regions successfully replaced.
+- Text labels in figure regions identified from visible drawings, images, and nearby captions stay with the original artwork to preserve node and label positions; captions are translated separately. Text-only diagrams without reliable graphic evidence may not be detected.
 - The source is displayed as rendered pages with paragraph interactions. Free text selection, full-text search, and embedded PDF annotations are not implemented in the source reader.
 - Chinese typesetting first looks for locally installed Noto Serif SC or DengXian fonts, then uses a built-in fallback. Appearance may vary across systems.
 - Review generated content and retained regions, especially equations, tables, important numbers, and technical terminology.
@@ -173,6 +174,7 @@ stop.bat                Stop the local server and tray
 tray.ps1                Windows tray menu (open/restart/stop/exit)
 pdf_text.py             Drop-cap recovery and complete words
 pdf_layout.py           Typesetting, obstacle handling, page caches
+pdf_figures.py          Figure regions and protection of embedded labels
 pdf_flow.py             Column reflow and equation relocation
 pdf_lists.py            List reconstruction, numbering, hanging indents
 pdf_typography.py       Font subsetting, weights, symbol fallback

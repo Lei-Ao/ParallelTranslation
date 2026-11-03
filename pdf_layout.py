@@ -23,12 +23,13 @@ from pdf_references import (REFERENCE_MARK, fallback_reference_regions, prepare_
                             reference_fallback_pages)
 from pdf_text import normalize_drop_caps
 from pdf_lists import ListLayoutError, source_list_structure, translated_list_layout, BULLETS
+from pdf_figures import figure_regions, is_figure_caption
 
 ET.register_namespace("", "http://www.w3.org/2000/svg")
 ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
 
 PDF_LOCK = threading.RLock()
-ENGINE_VERSION = 60
+ENGINE_VERSION = 61
 MATH_FONT = re.compile(r"math|symbol|cmmi|cmsy|cmex|msam|msbm|stmary|rsfs", re.I)
 INSTITUTION = re.compile(r"universit|institut|laborator|department|school|academy|college|hospital|研究所|大学|学院|实验室", re.I)
 # Author lines mark affiliations with raised digits. Publishers put them right
@@ -670,6 +671,9 @@ def anchor_overlay_rects(page, anchors):
 
 
 BOLD_MARKER = re.compile(r"(Q\d+[\).]|(?<!\d)\d{1,2}[\).]|(?<![A-Za-z])[A-Za-z][\).]|[•·●▪◆])\s*$")
+CAPTION_LABEL = re.compile(
+    r"^\s*(?:(?:fig(?:ure)?\.?|table|algorithm)\s*|[图表]\s*)"
+    r"(?:[A-Za-z]?\d+(?:[.\-]\d+)*|[IVXLC]+)\s*[.:：]?\s*", re.I)
 
 
 def inline_bold_hints(style, text):
@@ -683,7 +687,8 @@ def inline_bold_hints(style, text):
     total = sum(len(span["text"].strip()) for line in lines for span in line["spans"] if span["text"].strip())
     bold = sum(len(span["text"].strip()) for line in lines for span in line["spans"]
                if span["text"].strip() and span["flags"] & 16)
-    if not total or not bold or bold > total * .55:
+    caption = CAPTION_LABEL.match(text)
+    if not total or not bold or bold > total * .55 and not caption:
         return []
     hints = []
     history = ""
@@ -701,7 +706,24 @@ def inline_bold_hints(style, text):
                 run.append(spans[index])
                 index += 1
             run_text = "".join(span["text"] for span in run).strip()
-            after = "".join(span["text"] for span in spans[index:]).lstrip()
+            source_after = next(i + 1 for i, span in enumerate(line["spans"]) if span is run[-1])
+            after = "".join(span["text"] for span in line["spans"][source_after:]).lstrip()
+            if not after:
+                # Visual wrapping may split a bold label or put its delimiter
+                # on the next line. Follow the real source run and punctuation
+                # instead of treating an empty suffix as an implied colon.
+                for following in lines[line_index + 1:]:
+                    continuation = [span for span in following["spans"] if span["text"].strip()]
+                    end = 0
+                    while end < len(continuation) and continuation[end]["flags"] & 16:
+                        end += 1
+                    if end:
+                        run_text += " " + "".join(span["text"] for span in continuation[:end]).strip()
+                    following_after = (next(i + 1 for i, span in enumerate(following["spans"])
+                                            if span is continuation[end - 1]) if end else 0)
+                    after = "".join(span["text"] for span in following["spans"][following_after:]).lstrip()
+                    if after or not end:
+                        break
             prefix = before.strip()
             marker = BOLD_MARKER.search(prefix)
             ordinal = (max(0, _marker_count(history + before, marker[1]) - 1) if marker else 0)
@@ -715,13 +737,21 @@ def inline_bold_hints(style, text):
                 terminator, include = "dash", True
             elif run_text[-1] in ".。":
                 terminator, include = "period", True
-            elif after[:1] in ":：":
+            elif after and after[0] in ":：":
                 terminator, include = "colon", False
-            elif after[:1] in "—–":
+            elif after and after[0] in "—–":
                 terminator, include = "dash", False
+            elif caption and re.match(r"^(?:[。！？]|\.(?=\s|$))", after):
+                terminator, include = "period", False
             marker = BOLD_MARKER.search(prefix)
+            caption_prefix = CAPTION_LABEL.fullmatch(prefix)
             single_word = len(run_text) <= 20 and not re.search(r"\s", run_text)
-            if marker:
+            if caption and line_index == 0 and not prefix and CAPTION_LABEL.fullmatch(run_text):
+                kind = "caption_label"
+                include = run_text[-1] in ".:："
+            elif line_index == 0 and caption_prefix:
+                kind = "caption_title"
+            elif marker:
                 kind = "marker"
             elif line_index == 0 and not prefix and not terminator and single_word:
                 kind = "lead_token"
@@ -729,7 +759,7 @@ def inline_bold_hints(style, text):
                 kind = "lead"
             else:
                 continue
-            if kind != "lead_token" and not terminator:
+            if kind not in {"lead_token", "caption_label"} and not terminator:
                 continue
             hints.append({"kind": kind, "marker": marker[1] if marker else "",
                           "ordinal": ordinal, "terminator": terminator, "include": include,
@@ -796,6 +826,19 @@ def bold_ranges(text, hints):
             end = _bold_end(text, start, hint["terminator"], hint["include"], hint["limit"])
             if end:
                 ranges.append((start, end))
+        elif hint["kind"] in {"caption_label", "caption_title"}:
+            label = CAPTION_LABEL.match(text)
+            if label:
+                if hint["kind"] == "caption_label":
+                    end = len(text[:label.end()].rstrip())
+                    if not hint["include"] and text[end - 1] in ".:：":
+                        end = len(text[:end - 1].rstrip())
+                    ranges.append((len(text) - len(text.lstrip()), end))
+                else:
+                    start = label.end()
+                    end = _bold_end(text, start, hint["terminator"], hint["include"], hint["limit"])
+                    if end:
+                        ranges.append((start, end))
         elif hint["kind"] == "marker":
             matches = _marker_matches(text, hint["marker"])
             ordinal = hint.get("ordinal", 0)
@@ -1557,7 +1600,11 @@ def layout_blocks(page, saved_page, native, target, cover_page=False):
         remaining.remove(first)
         while frontier:
             index = frontier.pop()
-            neighbors = {i for i in remaining if narrative_fragment(blocks[index]["text"])
+            # A prose block wrapping around an illustration has a wide union
+            # bbox that may enclose its separate caption. Inline mathematics in
+            # that prose must not turn the caption into part of the paragraph.
+            neighbors = {i for i in remaining if not flow_caption(blocks[index])
+                         and not flow_caption(blocks[i]) and narrative_fragment(blocks[index]["text"])
                          and narrative_fragment(blocks[i]["text"]) and overlap(rects[index], rects[i]) > 1}
             remaining.difference_update(neighbors)
             component.update(neighbors)
@@ -1588,7 +1635,14 @@ def inspect_block(native, rect, combine=False):
     candidates = [b for b in native if overlap(rect, pymupdf.Rect(b["bbox"])) > .5]
     if not candidates:
         return None, "未找到可靠的原文样式"
-    best = max(candidates, key=lambda b: overlap(rect, pymupdf.Rect(b["bbox"])))
+    def match(block):
+        box = pymupdf.Rect(block["bbox"])
+        shared = overlap(rect, box)
+        # A wrapped paragraph's union bbox can contain an independent caption.
+        # Prefer the native block that actually matches the saved region;
+        # absolute overlap alone ties these two and depends on drawing order.
+        return shared / max(.001, rect.get_area() + box.get_area() - shared), shared
+    best = max(candidates, key=match)
     if combine:
         best = {"lines": [line for block in candidates
                           for line in block["lines"]]}
@@ -2005,9 +2059,17 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     # references/labels whose glyph box is barely as tall as the font. This
     # keeps already-fitting lines from creeping into the line above.
     cjk = bool(re.search(r"[\u3400-\u9fff]", printable))
-    preferred_leading = max(source_leading, 1.45 if cjk else 1.2)
+    is_caption = flow_caption(block)
+    # MuPDF expands the sparse spaces around a Chinese caption number and
+    # Latin terms when justifying. Keep those spaces natural rather than
+    # stretching only them across an otherwise continuous Chinese sentence.
+    if cjk and is_caption and alignment == "justify":
+        alignment = "left"
+    # Captions commonly have tighter source baselines than body paragraphs.
+    # Retain that distinction while leaving room for Chinese glyphs.
+    preferred_leading = max(source_leading, (1.25 if is_caption else 1.45) if cjk else 1.2)
     line_heights = ([1.25, 1.12, 1.0] if single_line else
-                    list(dict.fromkeys([preferred_leading, max(source_leading, 1.3), 1.2])))
+                    list(dict.fromkeys([preferred_leading, max(source_leading, 1.2 if is_caption else 1.3), 1.2])))
     if typography.get("compact_fallback"):
         line_heights = [1.15, 1.04, 1.0] if single_line or size < 9 else [1.15]
     if cover_role == "authors":
@@ -2080,6 +2142,10 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
         style["bold"] and (display_weight or not is_prose(block["text"]))) else 400
     if list_structure:
         weight = 600 if style["bold"] else 400
+    elif is_caption:
+        caption_spans = [span for line in style.get("lines", []) for span in line["spans"]
+                         if span["text"].strip() and not MATH_FONT.search(span.get("font", ""))]
+        weight = 600 if caption_spans and all(span["flags"] & 16 for span in caption_spans) else 400
 
     for variant in variants:
         paragraphs = ()
@@ -2434,9 +2500,31 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             rotation = page.rotation
             native = [b for b in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"] if b["type"] == 0]
             raw_native = page.get_text("rawdict")["blocks"]
-            working = layout_blocks(page, saved_page, native, target,
-                                    cover_page=source_page_number == 0)
+            # Diagram labels can share an extraction block despite belonging to
+            # different nodes. Keep the whole illustration's text on the source
+            # page, before paragraph grouping or formula relocation can touch it.
+            # Detection and artwork use unrotated coordinates; saved block boxes
+            # and reader links use displayed coordinates.
+            page.set_rotation(0)
+            drawings = visible_drawings(page)
+            figures = figure_regions(page, native, drawings=drawings)
+            page.set_rotation(rotation)
+            figure_ids = set()
+            for block in saved_page["blocks"]:
+                if is_figure_caption(block["text"]) or TABLE_CAPTION.match(block["text"]):
+                    continue
+                box = source_rect(page, block)
+                if box.get_area() > 0 and any(
+                        region.contains((box.tl + box.br) * .5)
+                        and overlap(box, region) >= box.get_area() * .5 for region in figures):
+                    figure_ids.add(block["id"])
+            working = layout_blocks(page, {**saved_page, "blocks": [
+                block for block in saved_page["blocks"] if block["id"] not in figure_ids]},
+                native, target, cover_page=source_page_number == 0)
+            working.extend(block for block in saved_page["blocks"] if block["id"] in figure_ids)
             rects = {b["id"]: source_rect(page, b) for b in working}
+            caption_rects = [rects[b["id"]] for b in working
+                             if is_figure_caption(b["text"]) or TABLE_CAPTION.match(b["text"])]
             # Link hints must share the unrotated coordinate space of rects and
             # native text, so collect them before clearing the page rotation.
             if page_links is None:
@@ -2446,7 +2534,6 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             page.set_rotation(0)
             source_ink = page.get_bboxlog()
             graphics = [pymupdf.Rect(image["bbox"]) for image in page.get_image_info()]
-            drawings = visible_drawings(page)
             graphics += [drawing["rect"] for drawing in drawings]
             table_boxes = table_regions(page)
             obstacles = [pymupdf.Rect(b["bbox"]) for b in native] + graphics
@@ -2456,6 +2543,7 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             prepared = []
             formula_candidates = []
             table_blocks = 0
+            figure_blocks = 0
             dropped_links = 0
             fallback_ids = set()
             if not saved_page.get("reference_layout") and not has_redactions:
@@ -2468,7 +2556,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                            if reference_fallbacks is not None else
                            fallback_reference_regions(page))
                 fallback = [block for block in working
-                            if any(region.contains((rects[block["id"]].tl + rects[block["id"]].br) * .5)
+                            if block["id"] not in figure_ids
+                            and any(region.contains((rects[block["id"]].tl + rects[block["id"]].br) * .5)
                                    for region in regions)]
                 if any(REFERENCE_MARK.search(block["text"]) for block in fallback):
                     fallback_ids = {block["id"] for block in fallback}
@@ -2482,7 +2571,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 cover, cover_members, cover_reason = (None, [], "")
                 if source_page_number == 0 and not has_redactions:
                     cover, cover_members, cover_reason = prepare_cover_metadata(
-                        page, working, rects, native, overlays, typography, target)
+                        page, [block for block in working if block["id"] not in figure_ids],
+                        rects, native, overlays, typography, target)
                 cover_ids = {b["id"] for b in cover_members}
                 if cover:
                     prepared.append(cover)
@@ -2490,6 +2580,10 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                     if cover[2]["scale"] < .99:
                         report["scaled"] += len(cover[0]["_members"])
                 for block in working:
+                    if block["id"] in figure_ids:
+                        report["preserved"] += 1
+                        figure_blocks += 1
+                        continue
                     if block["id"] in fallback_ids:
                         continue
                     if block.get("kind") in {"reference", "reference_heading"}:
@@ -2529,6 +2623,14 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         continue
                     rect = rects[block["id"]]
                     style, reason = inspect_block(native, rect, combine="_members" in block)
+                    if not flow_caption(block) and any(
+                            overlap(rect, caption) > min(rect.get_area(), caption.get_area()) * .25
+                            for caption in caption_rects):
+                        # A wrapped paragraph is not a rectangular text area.
+                        # Keeping it separate from the caption is necessary but
+                        # insufficient: a rectangular replacement could still
+                        # paint across the caption's independent translated text.
+                        reason = "正文与独立图注形成绕排区域，当前无法安全按矩形重排，保留完整原文"
                     if block.get("drop_cap_preserve"):
                         reason = block["drop_cap_preserve"]
                     if block.get("drop_cap_review"):
@@ -2747,6 +2849,10 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                                 continue
                             report.setdefault("placed_links", []).append(entry)
             page.set_rotation(rotation)
+            if figure_blocks:
+                report["issues"].append({"page": saved_page["number"], "block_id": None, "kind": "figure",
+                                         "message": f"图内文字与原图整体保留（{figure_blocks} 个文本块）；"
+                                                    "图内标签无法按独立位置可靠重排，仅翻译图注"})
             if table_blocks:
                 report["issues"].append({"page": saved_page["number"], "block_id": None, "kind": "table",
                                          "message": f"表格内容保留原文（{table_blocks} 个文本块）；仅翻译表题与表注"})
