@@ -70,6 +70,10 @@ body.reading-focus.translating .reader .progress-track{top:0}
 .source-pane,.translation-pane{overflow-anchor:none}
 .block-overlay.linked-hover:not(.selected){background:#9cd9b52e;border-color:#76ae8a99}
 .translation-card.linked-hover:not(.selected){background:#f0f6ed;border-color:#dce8d6}
+.pdf-page .block-overlay.group-member{background:transparent;border-color:transparent;box-shadow:none}
+.pdf-page .block-group-highlight{position:absolute;pointer-events:none;border:1px solid transparent;border-radius:2px;background:transparent;transition:background .15s}
+.pdf-page .block-group-highlight.linked-hover:not(.selected){background:#9cd9b52e;border-color:#76ae8a99}
+.pdf-page .block-group-highlight.selected{background:#91cfb33d;border-color:#50a181;box-shadow:inset 3px 0 #3e9976}
 body.reading .panes{column-gap:1px;background:var(--line)}
 body.reading .source-pane{padding:16px 18px 44px;background:#e9ede5;border-right:0}
 body.reading .source-pane .pdf-page,body.reading .translation-pane.pdf-mode .pdf-page{box-shadow:0 3px 16px #23312517;background:#fff}

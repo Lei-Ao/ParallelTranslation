@@ -3,7 +3,6 @@
 <head>
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>页间 Parallel · PDF 对照翻译</title>
-  <link rel="icon" type="image/x-icon" href="/static/parallel.ico">
   <style>
     #launch-notice{display:none}
     html.needs-server body{margin:0;background:#f4f7f1;color:#293e32;font:16px/1.8 'Segoe UI','Microsoft YaHei',sans-serif}
@@ -121,6 +120,8 @@
     <label id="url-label">Base URL<input name="base_url" type="url" placeholder="https://api.apigoto.com/v1" required></label><small id="url-help" class="field-help">自动追加 /chat/completions，也可填写完整端点。</small>
     <div class="form-row"><label for="api-key">API Key<span class="api-key-field"><input id="api-key" name="api_key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="输入一次，保存后自动读取"><button id="toggle-api-key" type="button" aria-label="显示 API Key" aria-controls="api-key" aria-pressed="false">显示</button></span></label><label>模型名称<input name="model" placeholder="填写服务商支持的模型 ID"></label></div>
     <small class="field-help">保存配置后，密钥保存在当前浏览器的本机存储中（未加密），默认隐藏显示。<button id="clear-api-key" type="button" class="text-button">清除已保存密钥</button></small>
+    <label>思考强度<select name="reasoning" id="agent-reasoning"><option value="">服务端默认</option><option value="off">关闭思考</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高（仅部分服务商）</option></select></label>
+    <small id="reasoning-help" class="field-help">仅 OpenAI 兼容接口生效。服务端默认通常开启思考且强度为高；关闭可省时间与费用，调高会变慢并可能顶到超时。</small>
     <div id="custom-fields" class="hidden"><label>请求 JSON 模板<textarea name="template" rows="4" spellcheck="false"></textarea></label><small class="field-help">可用变量：{{prompt}}（含翻译要求和上下文）、{{text}}、{{target}}、{{model}}。认证使用 Bearer Token。</small><label>译文响应字段路径<input name="response_path" placeholder="output 或 data.text 或 choices.0.message.content"></label></div>
     <label>请求超时（秒）<input name="timeout" type="number" min="10" max="600" value="120"></label>
     <p id="connection-status" class="connection-status" role="status"></p>

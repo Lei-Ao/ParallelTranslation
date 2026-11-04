@@ -393,6 +393,47 @@ class LayoutTests(unittest.TestCase):
         text = "四旋翼动力学：我们建立机器人的动力学模型。"
         self.assertEqual([text[start:end] for start, end in pdf_layout.bold_ranges(text, hints)], ["四旋翼动力学："])
 
+    def test_wrapped_caption_bold_title_excludes_number_and_description(self):
+        style = {"lines": [{"spans": [
+            {"text": "TABLE VI: ", "flags": 0},
+            {"text": "Controller Performance under Domain Ran-", "flags": 16}]},
+            {"spans": [{"text": "domization.", "flags": 16},
+                       {"text": " Comparison of the controllers.", "flags": 0}]}]}
+        hints = pdf_layout.inline_bold_hints(style, "")
+        text = "表 VI：域随机化下的控制器性能。比较各个控制器。"
+        self.assertEqual([text[a:b] for a, b in pdf_layout.bold_ranges(text, hints)],
+                         ["域随机化下的控制器性能。"])
+        for value in ("表 VII：其他标题。说明。", "图 VI：其他标题。说明。",
+                      "表 VI：没有可靠的句末边界"):
+            self.assertEqual(pdf_layout.bold_ranges(value, hints), [])
+
+    def test_caption_bold_survives_pdf_export_across_geometry(self):
+        for columns, width, rotation in ((1, 420, 0), (1, 500, 90),
+                                          (2, 595, 180), (2, 650, 270)):
+            with self.subTest(columns=columns, width=width, rotation=rotation):
+                with pymupdf.open() as source:
+                    page = source.new_page(width=width, height=400)
+                    for column in range(columns):
+                        left = 35 + column * width / columns
+                        page.insert_htmlbox((left, 45, left + width / columns - 70, 230),
+                            '<div style="font:10pt Times,serif">TABLE VI: '
+                            '<b>Controller Performance under Domain Randomization.</b> '
+                            'A comparison.</div>')
+                    page.set_rotation(rotation)
+                    raw = source.tobytes()
+                doc_id, doc = service.extract_document(raw, "caption-weight.pdf")
+                for block in service.all_blocks(doc):
+                    block.update(translation="表 VI：域随机化下的控制器性能。比较实验中不同设置下的控制器。",
+                                 target="简体中文")
+                report = build_layout(self.directory / doc_id, doc, "简体中文")
+                self.assertEqual(report['replaced'], columns)
+                with pymupdf.open(self.directory / doc_id / 'layout' / (report['revision'] + '.pdf')) as output:
+                    spans = [s for b in output[0].get_text('dict')['blocks'] if b.get('type') == 0
+                             for line in b['lines'] for s in line['spans']]
+                    bold = ''.join(s['text'] for s in spans if s['flags'] & 16)
+                    self.assertEqual(bold.replace(' ', ''), '域随机化下的控制器性能。' * columns)
+                    self.assertNotIn('比较', bold)
+
     def test_table_cells_stay_original_while_caption_translates(self):
         with pymupdf.open() as pdf:
             page = pdf.new_page(width=400, height=300)

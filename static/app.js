@@ -1,7 +1,7 @@
 'use strict';
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-const DEFAULT_AGENT = {mode:'openai', base_url:'https://api.apigoto.com/v1', api_key:'', model:'', template:'{\n  "input": "{{prompt}}"\n}', response_path:'output', timeout:120};
+const DEFAULT_AGENT = {mode:'openai', base_url:'https://api.apigoto.com/v1', api_key:'', model:'', reasoning:'', template:'{\n  "input": "{{prompt}}"\n}', response_path:'output', timeout:120};
 function stored(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
 function persist(key, data) { try { localStorage.setItem(key, JSON.stringify(data)); return true; } catch { toast('浏览器存储不可用，设置仅在当前页面有效'); return false; } }
 const state = {token:'', doc:null, library:[], page:0, selected:null, running:false, stop:false, uploading:false, loading:false, activeBlocks:new Set(), concurrency:[1,2,3,4,6,8,12].includes(stored('parallel-concurrency',3))?stored('parallel-concurrency',3):3, errors:{}, view:'pdf', layout:null, layoutKey:'', layoutBusy:false, layoutError:'',
@@ -172,7 +172,67 @@ function renderCard(block,index){
   const needsStatus=working || error || !block.translation || block.target!==state.target;
   return `<article class="translation-card ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" id="card-${block.id}" tabindex="0" aria-label="第 ${index+1} 段"><div class="card-meta ${needsStatus?'':'hidden'}"><span class="state ${error?'error':''}">${label}</span></div>${text}${error?`<div class="block-error">${escapeHtml(error)}</div>`:''}<div class="card-actions"><button data-action="translate" data-id="${block.id}">${block.translation?'↻ 重新翻译':'✦ 翻译此段'}</button><button data-action="edit" data-id="${block.id}">编辑译文</button>${block.translation?`<button data-action="copy" data-id="${block.id}">复制</button>`:''}</div></article>`;
 }
-function isBlockSelected(id){return state.selected===id || (state.selected!==null && readingInteraction.selection.has(id));}
+let blockGroupCache={doc:null,layout:null,groups:new Map()};
+function blockGroup(id){
+  if(state.view!=='pdf' || !state.layout)return [id];
+  if(blockGroupCache.doc!==state.doc || blockGroupCache.layout!==state.layout){
+    const groups=new Map();
+    for(const page of state.doc?.pages || []){
+      const ids=new Set(page.blocks.map(block=>block.id));
+      let entries=(state.layout.block_groups || []).filter(group=>group.page===page.number).map(group=>group.blocks);
+      // Older reports already assign all members of one rendered block the
+      // exact same placement. Read these without migrating saved documents.
+      if(!Array.isArray(state.layout.block_groups)){
+        const boxes=new Map();
+        for(const block of page.blocks){
+          const box=state.layout.placements?.[block.id];if(!box)continue;
+          const key=JSON.stringify(box);if(!boxes.has(key))boxes.set(key,[]);
+          boxes.get(key).push(block.id);
+        }
+        entries=[...boxes.values()];
+      }
+      for(const entry of entries){
+        const members=[...new Set(entry.filter(key=>ids.has(key)).flatMap(key=>groups.get(key) || [key]))];
+        for(const key of members)groups.set(key,members);
+      }
+    }
+    blockGroupCache={doc:state.doc,layout:state.layout,groups};
+  }
+  return blockGroupCache.groups.get(id) || [id];
+}
+function isBlockSelected(id){return state.selected!==null && blockGroup(id).some(key=>state.selected===key || readingInteraction.selection.has(key));}
+function sourceBlockBounds(block){return state.view==='pdf'?(state.layout?.source_placements?.[block.id] || block.bbox):block.bbox;}
+function groupHighlightHtml(page,side){
+  const seen=new Set(),html=[];
+  for(const block of page.blocks){
+    const members=blockGroup(block.id),key=members[0];
+    if(members.length<2 || seen.has(key))continue;
+    seen.add(key);
+    const boxes=page.blocks.filter(item=>members.includes(item.id)).map(item=>
+      side==='translation'?(state.layout?.placements?.[item.id] || item.bbox):sourceBlockBounds(item));
+    const x0=Math.min(...boxes.map(box=>box[0])),y0=Math.min(...boxes.map(box=>box[1]));
+    const x1=Math.max(...boxes.map(box=>box[2])),y1=Math.max(...boxes.map(box=>box[3]));
+    html.push(`<span class="block-group-highlight" data-block-group="${escapeHtml(key)}" aria-hidden="true" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></span>`);
+  }
+  return html.join('');
+}
+function refreshGroupHighlights(){
+  // Keep the saved fragment hit areas and editing IDs. Paint one union frame
+  // per typeset group on a separate, non-interactive layer on each PDF page.
+  for(const side of ['source','translation'])for(const element of pageElements($(`#${side}-pane`))){
+    if(!element.classList?.contains('pdf-page'))continue;
+    const page=state.doc?.pages[Number(element.dataset.pageIndex)];if(!page)continue;
+    element.querySelectorAll('.block-group-highlight').forEach(frame=>frame.remove());
+    element.querySelectorAll('.block-overlay').forEach(item=>
+      item.classList.toggle('group-member',blockGroup(item.dataset.block).length>1));
+    if(side==='source')for(const item of element.querySelectorAll('.block-overlay')){
+      const block=page.blocks.find(block=>block.id===item.dataset.block);if(!block)continue;
+      const [x0,y0,x1,y1]=sourceBlockBounds(block);
+      Object.assign(item.style,{left:`${x0*100}%`,top:`${y0*100}%`,width:`${(x1-x0)*100}%`,height:`${(y1-y0)*100}%`});
+    }
+    element.insertAdjacentHTML('beforeend',groupHighlightHtml(page,side));
+  }
+}
 function pageElements(pane){return pane && pane.querySelectorAll?[...pane.querySelectorAll('.reader-page')]:[];}
 function setPaneScroll(pane,top,left=pane.scrollLeft){
   pane.scrollTop=Math.max(0,top);pane.scrollLeft=left;
@@ -380,9 +440,11 @@ function renderTranslations(){
     }).join('');
     if(!valid){const notice=document.createElement('div');notice.className='layout-notice';notice.textContent=state.layoutError || (state.layoutBusy?'正在排版，暂显示原文…':state.running?'翻译中，每页译完后自动更新版式':'暂显示原文，请点击菜单中的重新排版');pane.prepend(notice);}
     $$('#translation-pane .pdf-page img').forEach(img=>img.addEventListener('error',()=>toast('译文页面加载失败，请点击重新排版或切换段落视图')));
+    refreshGroupHighlights();applyBlockSelection();hoverBlock(readingInteraction.hovered);
     applyViewportGeometry();restorePanePosition(pane,position,top);setPaneScroll(pane,pane.scrollTop,left);updateControls();alignReaderAfterRender();return;
   }
   pane.innerHTML=state.doc.pages.map((page,pageIndex)=>`<section class="reader-page paragraph-page" data-page-index="${pageIndex}" aria-label="第 ${page.number} 页译文"><div class="page-divider">第 ${page.number} 页</div>${page.blocks.length?page.blocks.map(renderCard).join(''):'<div class="ocr-notice"><strong>这一页没有可提取的文字</strong><br>可能是扫描件、图片页或空白页。第一版暂不包含 OCR，请先用 OCR 工具生成可搜索 PDF 后再导入。其他含文字的页面仍可正常翻译。</div>'}</section>`).join('');
+  refreshGroupHighlights();applyBlockSelection();hoverBlock(readingInteraction.hovered);
   applyViewportGeometry();restorePanePosition(pane,position,top);updateControls();alignReaderAfterRender();
 }
 function renderPage(){
@@ -455,6 +517,7 @@ function applyBlockSelection(){
     if(selected)el.setAttribute('aria-current','true');else el.removeAttribute('aria-current');
     if(el.matches('.block-overlay'))el.setAttribute('aria-pressed',String(selected));
   });
+  $$('[data-block-group]').forEach(el=>el.classList.toggle('selected',isBlockSelected(el.dataset.blockGroup)));
 }
 function blockElement(side,id){
   return (side==='source'?$('#source-pane'):$('#translation-pane')).querySelector(`[data-block="${id}"]`);
@@ -500,9 +563,10 @@ function readerClick(event,side){
   clearBlockSelection();
 }
 function hoverBlock(id){
-  if(readingInteraction.hovered===id)return;
   readingInteraction.hovered=id;
-  $$('[data-block]').forEach(el=>el.classList.toggle('linked-hover',Boolean(id) && el.dataset.block===id));
+  const members=new Set(id?blockGroup(id):[]);
+  $$('[data-block]').forEach(el=>el.classList.toggle('linked-hover',members.has(el.dataset.block)));
+  $$('[data-block-group]').forEach(el=>el.classList.toggle('linked-hover',members.has(el.dataset.blockGroup)));
 }
 function syncAnchors(index){
   const sourcePane=$('#source-pane'),translationPane=$('#translation-pane');
@@ -618,7 +682,7 @@ async function runTranslation(selectedBlocks){
   }
 }
 function formAgent(){const data=Object.fromEntries(new FormData($('#settings-form')));data.timeout=Number(data.timeout);return data;}
-function modeVisibility(){const custom=$('#agent-mode').value==='custom';$('#custom-fields').classList.toggle('hidden',!custom);$('#url-help').textContent=custom?'填写完整 POST 接口地址；目前支持非流式 JSON 响应。':'自动追加 /chat/completions，也可填写完整端点。';$('#settings-form [name=model]').required=!custom;}
+function modeVisibility(){const custom=$('#agent-mode').value==='custom';$('#custom-fields').classList.toggle('hidden',!custom);$('#url-help').textContent=custom?'填写完整 POST 接口地址；目前支持非流式 JSON 响应。':'自动追加 /chat/completions，也可填写完整端点。';$('#settings-form [name=model]').required=!custom;const reasoning=$('#agent-reasoning');reasoning.disabled=custom;reasoning.title=custom?'自定义接口由请求模板控制':'';$('#reasoning-help').textContent=custom?'自定义接口模式下由请求模板决定是否思考，此处设置不生效。':'仅 OpenAI 兼容接口生效。服务端默认通常开启思考且强度为高；关闭可省时间与费用，调高会变慢并可能顶到超时。';}
 function showSettings(){
   for(const [key,value]of Object.entries(state.agent)){const input=$(`#settings-form [name="${key}"]`);if(input)input.value=value;}
   setKeyVisible(false);

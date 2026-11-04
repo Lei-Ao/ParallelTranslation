@@ -88,6 +88,56 @@ class TranslationTests(unittest.TestCase):
         self.assertNotIn("test-secret", json.dumps(saved))
         self.assertEqual(self.client.get("/api/documents").json()[0]["translated"], 1)
 
+    def captured_agent_payload(self, agent):
+        """Translate one block and return the JSON body the agent received."""
+        doc = self.upload()
+        block_id = doc["pages"][0]["blocks"][1]["id"]
+        seen = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"choices": [{"message": {"content": "智能体译"}, "finish_reason": "stop"}]})
+
+        with self.mock_agent(handler):
+            response = self.client.post(f"/api/documents/{doc['id']}/blocks/{block_id}/translate",
+                                        json={"agent": agent})
+        self.assertEqual(response.status_code, 200, response.text)
+        return seen
+
+    def test_reasoning_effort_reaches_the_agent_request(self):
+        body = self.captured_agent_payload({**self.agent, "reasoning": "low"})
+        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertNotIn("thinking", body)
+
+    def test_reasoning_off_sends_only_the_thinking_switch(self):
+        body = self.captured_agent_payload({**self.agent, "reasoning": "off"})
+        self.assertEqual(body["thinking"], {"type": "disabled"})
+        self.assertNotIn("reasoning_effort", body)
+
+    def test_default_agent_sends_no_reasoning_fields(self):
+        body = self.captured_agent_payload(self.agent)
+        self.assertNotIn("reasoning_effort", body)
+        self.assertNotIn("thinking", body)
+
+    def test_batch_translation_carries_the_reasoning_setting(self):
+        doc = self.upload()
+        block_id = doc["pages"][0]["blocks"][1]["id"]
+        seen = {}
+
+        def handler(request):
+            payload = json.loads(request.content)
+            seen.update(payload)
+            context = json.loads(payload["messages"][1]["content"].split("参考资料与本次待翻译段落：\n", 1)[1])
+            blocks = [{"id": item["id"], "translation": "批量译文"} for item in context["current_blocks"]]
+            return httpx.Response(200, json={"choices": [{"message": {
+                "content": json.dumps({"blocks": blocks}, ensure_ascii=False)}, "finish_reason": "stop"}]})
+
+        with self.mock_agent(handler):
+            response = self.client.post(f"/api/documents/{doc['id']}/blocks/translate-batch",
+                                        json={"agent": {**self.agent, "reasoning": "high"}, "block_ids": [block_id]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(seen["reasoning_effort"], "high")
+
     def test_custom_json_handles_quotes_newlines_and_nested_response(self):
         def handler(request):
             body = json.loads(request.content)

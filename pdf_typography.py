@@ -1,5 +1,6 @@
 """Local, embedded book typography; subset before instancing variable fonts."""
 import io
+import math
 import os
 import re
 from functools import lru_cache
@@ -77,6 +78,47 @@ def subset_fonts(characters, regular, bold):
     return tuple(results)
 
 
+@lru_cache(maxsize=8)
+def oblique_font(data):
+    """Embed real slanted outlines when the CJK family has no italic master.
+
+    MuPDF does not reliably synthesize italic for an embedded upright face.
+    Preserve its family, weight, advances and Unicode map; shear outlines only.
+    """
+    from fontTools.ttLib import TTFont
+    from fontTools.pens.recordingPen import DecomposingRecordingPen
+    from fontTools.pens.transformPen import TransformPen
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+    with TTFont(io.BytesIO(data)) as font:
+        slant = math.tan(math.radians(12))
+        glyphs = font.getGlyphSet()
+        transformed = {}
+        for name in font.getGlyphOrder():
+            recording = DecomposingRecordingPen(glyphs)
+            glyphs[name].draw(recording)
+            pen = TTGlyphPen(None)
+            recording.replay(TransformPen(pen, (1, 0, slant, 1, 0, 0)))
+            transformed[name] = pen.glyph()
+        font['glyf'].glyphs.update(transformed)
+        for name, glyph in transformed.items():
+            glyph.recalcBounds(font['glyf'])
+            advance, _ = font['hmtx'][name]
+            font['hmtx'][name] = (advance, getattr(glyph, 'xMin', 0))
+        font['post'].italicAngle = -12
+        font['head'].macStyle |= 2
+        font['OS/2'].fsSelection = (font['OS/2'].fsSelection | 1) & ~64
+        font['hhea'].caretSlopeRise = 1000
+        font['hhea'].caretSlopeRun = round(slant * 1000)
+        style = 'Italic' if font['OS/2'].usWeightClass == 400 else 'SemiBold Italic'
+        for identifier, value in ((2, style), (4, 'ParallelBook ' + style),
+                                  (6, 'ParallelBook-' + style.replace(' ', ''))):
+            font['name'].setName(value, identifier, 3, 1, 0x409)
+        output = io.BytesIO()
+        font.save(output)
+        return output.getvalue()
+
+
 def font_resources(text):
     source = font_source()
     if source is None:
@@ -96,7 +138,11 @@ def font_resources(text):
     archive = pymupdf.Archive()
     archive.add((regular, "parallel-regular.ttf"))
     archive.add((semibold, "parallel-semibold.ttf"))
+    archive.add((oblique_font(regular), "parallel-italic.ttf"))
+    archive.add((oblique_font(semibold), "parallel-semibold-italic.ttf"))
     css = ("@font-face{font-family:ParallelBook;src:url(parallel-regular.ttf);font-weight:400;}"
-           "@font-face{font-family:ParallelBook;src:url(parallel-semibold.ttf);font-weight:600;}")
+           "@font-face{font-family:ParallelBook;src:url(parallel-semibold.ttf);font-weight:600;}"
+           "@font-face{font-family:ParallelBook;src:url(parallel-italic.ttf);font-weight:400;font-style:italic;}"
+           "@font-face{font-family:ParallelBook;src:url(parallel-semibold-italic.ttf);font-weight:600;font-style:italic;}")
     return {"css": css, "family": "ParallelBook,serif", "archive": archive, "label": source[2],
             "fallback_characters": fallback_characters}
