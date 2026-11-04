@@ -70,6 +70,10 @@ body.reading-focus.translating .reader .progress-track{top:0}
 .source-pane,.translation-pane{overflow-anchor:none}
 .block-overlay.linked-hover:not(.selected){background:#9cd9b52e;border-color:#76ae8a99}
 .translation-card.linked-hover:not(.selected){background:#f0f6ed;border-color:#dce8d6}
+.pdf-page .block-overlay.group-member{background:transparent;border-color:transparent;box-shadow:none}
+.pdf-page .block-group-highlight{position:absolute;pointer-events:none;border:1px solid transparent;border-radius:2px;background:transparent;transition:background .15s}
+.pdf-page .block-group-highlight.linked-hover:not(.selected){background:#9cd9b52e;border-color:#76ae8a99}
+.pdf-page .block-group-highlight.selected{background:#91cfb33d;border-color:#50a181;box-shadow:inset 3px 0 #3e9976}
 body.reading .panes{column-gap:1px;background:var(--line)}
 body.reading .source-pane{padding:16px 18px 44px;background:#e9ede5;border-right:0}
 body.reading .source-pane .pdf-page,body.reading .translation-pane.pdf-mode .pdf-page{box-shadow:0 3px 16px #23312517;background:#fff}
@@ -92,9 +96,17 @@ body.reading .translation-pane.pdf-mode{padding:16px 18px 44px;background:#e9ede
 .zoom-value:hover,.zoom-fit:hover,.zoom-fit[aria-pressed="true"]{background:#eaf0e5;color:var(--teal)}
 .source-pane .pdf-page,.translation-pane.pdf-mode .pdf-page{margin-inline:auto;max-width:none;user-select:none}
 .source-pane,.translation-pane{scrollbar-gutter:stable}
-.can-pan .pdf-page,.can-pan .block-overlay{cursor:grab}
-.can-pan .link-overlay{cursor:pointer}
-.reader-panning,.reader-panning *{cursor:grabbing!important;user-select:none!important}
+/* Transparent glyphs follow the actual PDF geometry and use native selection. */
+.pdf-text-layer{position:absolute;left:0;top:0;transform-origin:0 0;pointer-events:none;user-select:text;z-index:4;line-height:1;overflow:hidden;text-size-adjust:none;-webkit-text-size-adjust:none}
+.pdf-text-line{white-space:pre}
+.pdf-char{position:absolute;color:transparent;font-family:sans-serif;line-height:1;white-space:pre;transform-origin:0 0;pointer-events:auto;user-select:text;cursor:text}
+.pdf-char::selection{background:#2979db66;color:transparent}
+.pdf-text-line br{user-select:none}
+.pdf-page img{user-select:none;-webkit-user-drag:none}
+.pdf-page .link-overlay,.pdf-page .link-group{z-index:3}
+.pdf-page .link-overlay.text-link-hover,.pdf-page .link-group.text-link-hover .link-overlay{background:#21796524;box-shadow:inset 0 0 0 1px #21796559}
+.pdf-page .block-edit{display:none;position:absolute;z-index:5;transform:translateY(-100%);font-size:11px;line-height:1.5;padding:3px 7px;border:1px solid #b8d1c1;border-radius:4px;background:#f4faf5;color:var(--teal);user-select:none}
+.pdf-page .block-overlay.selected + .block-edit{display:block}
 body.reading-focus .reader-viewbar{display:none}
 @media(max-width:1100px){.zoom-hint{display:none}}
 @media(max-width:760px){.reader-viewbar{display:flex;justify-content:flex-end}.viewbar-source{display:none}.viewbar-translation{border:0;width:100%;padding:5px 10px}.viewbar-translation>span::before{content:"原文 / "}}

@@ -9,6 +9,7 @@ import pymupdf
 import app as service
 import pdf_layout
 from pdf_flow import reflow_columns
+from pdf_typography import font_resources
 
 PROSE = "The method is useful for the control of a robot."
 
@@ -249,6 +250,89 @@ class ParagraphSpacingTests(unittest.TestCase):
         native.append({"lines": [{"spans": [{"text": PROSE, "bbox": [40, 180, 260, 210]}]}]})
         self.assertFalse(reflow_columns(prepared, native, [], rects, 600, pdf_layout.is_prose))
         self.assertEqual(prepared[1][2]["rect"][1], 160)
+
+    def html_page(self, text, align="justify"):
+        pdf = pymupdf.open()
+        page = pdf.new_page(width=612, height=300)
+        typography = font_resources(text)
+        css = typography["css"] + ("*{margin:0;padding:0}body{font-family:%s;font-size:10pt;"
+                                   "line-height:1.4;text-align:%s}" % (typography["family"], align))
+        page.insert_htmlbox(pymupdf.Rect(49, 40, 300, 260), text, css=css,
+                            archive=typography["archive"])
+        return pdf
+
+    def word_gaps(self, page):
+        rows = {}
+        for word in page.get_text("words"):
+            rows.setdefault(round((word[1] + word[3]) / 2, 1), []).append(word)
+        gaps = []
+        for words in rows.values():
+            words.sort(key=lambda item: item[0])
+            gaps.extend(right[0] - left[2] for left, right in zip(words, words[1:]))
+        return gaps
+
+    def test_stretched_gap_measures_justified_spaces_only(self):
+        # A Han label followed by one unbreakable identifier is exactly what
+        # turns MuPDF's space-only justification into a hole several characters
+        # wide; the same text left-aligned keeps the natural space.
+        text = "中 Alpha " + "B" * 38
+        with self.html_page(text) as pdf:
+            self.assertTrue(pdf_layout.stretched_gap(pdf[0], 10))
+        with self.html_page(text, "left") as pdf:
+            self.assertFalse(pdf_layout.stretched_gap(pdf[0], 10))
+        # An inline formula image between two words is not a stretched space.
+        with self.html_page(text) as pdf:
+            page = pdf[0]
+            words = sorted(page.get_text("words"), key=lambda word: (word[1], word[0]))
+            line = [word for word in words if abs(word[1] - words[0][1]) < 1]
+            left, right = line[0], line[1]
+            self.assertGreater(right[0] - left[2], 12)
+            page.insert_image(pymupdf.Rect(left[2], min(left[1], right[1]),
+                                           right[0], max(left[3], right[3])),
+                              pixmap=pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 1, 1), 0))
+            self.assertFalse(pdf_layout.stretched_gap(page, 10))
+
+    def test_justified_cjk_block_with_unbreakable_token_has_no_hole(self):
+        text = "中 Alpha " + "B" * 38
+        source_text = ("The controller is evaluated in the simulation environment and the "
+                       "results show that the method improves tracking performance for the "
+                       "aerial manipulator in both tasks while the baseline remains stable. ")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(service, "DATA", root):
+                with pymupdf.open() as source:
+                    page = source.new_page(width=612, height=792)
+                    page.insert_textbox(pymupdf.Rect(49, 60, 300, 400), source_text * 4,
+                                        fontname="tiro", fontsize=10, lineheight=1.3,
+                                        align=pymupdf.TEXT_ALIGN_JUSTIFY)
+                    raw = source.tobytes()
+                doc_id, document = service.extract_document(raw, "justify.pdf")
+                block = document["pages"][0]["blocks"][0]
+                block.update(translation=text, target="简体中文")
+                output, report = pdf_layout.typeset(root / doc_id / "source.pdf", document, "简体中文")
+                self.assertEqual(report["replaced"], 1, report)
+                with pymupdf.open(stream=output, filetype="pdf") as result:
+                    page = result[0]
+                    gaps = self.word_gaps(page)
+                    self.assertTrue(gaps)
+                    self.assertLess(max(gaps), 10)
+                    expected = Counter(c for c in text if not c.isspace())
+                    visible = Counter(c for c in page.get_text() if not c.isspace())
+                    self.assertFalse(expected - visible)
+
+    def test_paragraph_gap_beyond_two_lines_still_follows_translation(self):
+        # Source paragraphs spaced 3.8 lines apart are paragraph spacing, not
+        # reserved whitespace: the shortened first paragraph must move the
+        # second one up instead of leaving a bigger hole between them.
+        prepared, native, rects = self.flow_fixture(source_gap=38)
+        changes = reflow_columns(prepared, native, [], rects, 600, pdf_layout.is_prose)
+        self.assertEqual(len(changes), 1)
+        self.assertAlmostEqual(changes[0]["source_gap"], 38)
+        self.assertAlmostEqual(changes[0]["gap"], 38)
+        self.assertAlmostEqual(changes[0]["shift"], -70)
+        # Four ems of blank space still count as intentional whitespace.
+        prepared, native, rects = self.flow_fixture(source_gap=50)
+        self.assertFalse(reflow_columns(prepared, native, [], rects, 600, pdf_layout.is_prose))
 
 
 if __name__ == "__main__":

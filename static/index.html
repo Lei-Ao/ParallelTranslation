@@ -102,7 +102,7 @@
       </div>
       <div class="progress-track"><div id="progress-bar"></div></div>
       <div class="reader-viewbar">
-        <div class="viewbar-source">原文<span>对照阅读</span></div>
+        <div class="viewbar-source">原文<span>单击定位 · 拖动选词 · Ctrl+C 复制</span></div>
         <div class="viewbar-translation"><span>译文</span><div class="zoom-controls" role="group" aria-label="原文与译文同步缩放">
           <span id="zoom-hint" class="zoom-hint">同步缩放 · Ctrl＋滚轮</span>
           <button id="zoom-out" class="icon-button" aria-label="缩小原文与译文" title="缩小">−</button>
@@ -121,6 +121,8 @@
     <label id="url-label">Base URL<input name="base_url" type="url" placeholder="https://api.apigoto.com/v1" required></label><small id="url-help" class="field-help">自动追加 /chat/completions，也可填写完整端点。</small>
     <div class="form-row"><label for="api-key">API Key<span class="api-key-field"><input id="api-key" name="api_key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="输入一次，保存后自动读取"><button id="toggle-api-key" type="button" aria-label="显示 API Key" aria-controls="api-key" aria-pressed="false">显示</button></span></label><label>模型名称<input name="model" placeholder="填写服务商支持的模型 ID"></label></div>
     <small class="field-help">保存配置后，密钥保存在当前浏览器的本机存储中（未加密），默认隐藏显示。<button id="clear-api-key" type="button" class="text-button">清除已保存密钥</button></small>
+    <label>思考强度<select name="reasoning" id="agent-reasoning"><option value="">服务端默认</option><option value="off">关闭思考</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高（仅部分服务商）</option></select></label>
+    <small id="reasoning-help" class="field-help">仅 OpenAI 兼容接口生效。默认不发送思考参数；各服务商支持范围不同，不支持时请改回服务端默认。</small>
     <div id="custom-fields" class="hidden"><label>请求 JSON 模板<textarea name="template" rows="4" spellcheck="false"></textarea></label><small class="field-help">可用变量：{{prompt}}（含翻译要求和上下文）、{{text}}、{{target}}、{{model}}。认证使用 Bearer Token。</small><label>译文响应字段路径<input name="response_path" placeholder="output 或 data.text 或 choices.0.message.content"></label></div>
     <label>请求超时（秒）<input name="timeout" type="number" min="10" max="600" value="120"></label>
     <p id="connection-status" class="connection-status" role="status"></p>

@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from pdf_layout import PDF_LOCK, build_layout, goto_fraction
 from pdf_references import normalize_document, translation_source, format_translation
 from pdf_text import DROP_CAP_SCHEMA, normalize_drop_caps
+from pdf_selection import page_selection
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("TRANSLATION_DATA_DIR", ROOT / ".data"))
@@ -90,6 +91,8 @@ class AgentConfig(BaseModel):
     base_url: str = Field(default="https://api.apigoto.com/v1", max_length=2000)
     api_key: str = Field(default="", max_length=10000)
     model: str = Field(default="", max_length=200)
+    # Empty keeps the provider's own default and sends no reasoning field at all.
+    reasoning: Literal["", "off", "low", "medium", "high", "max"] = ""
     template: str = Field(default='{"input":"{{prompt}}"}', max_length=30000)
     response_path: str = Field(default="output", max_length=500)
     timeout: int = Field(default=120, ge=10, le=600)
@@ -362,6 +365,12 @@ async def invoke_agent(config: AgentConfig, prompt: str, text: str = "", target:
         body = {"model": config.model.strip(), "stream": False,
                 "messages": [{"role": "system", "content": system_prompt},
                              {"role": "user", "content": prompt}]}
+        # Providers that support neither field reject the request, so only an
+        # explicit choice adds anything; the default request stays unchanged.
+        if config.reasoning == "off":
+            body["thinking"] = {"type": "disabled"}
+        elif config.reasoning:
+            body["reasoning_effort"] = config.reasoning
     else:
         try:
             template = json.loads(config.template)
@@ -376,7 +385,9 @@ async def invoke_agent(config: AgentConfig, prompt: str, text: str = "", target:
         async with client.stream("POST", url, headers=headers, json=body,
                                  timeout=config.timeout) as response:
             if response.status_code >= 300:
-                messages = {401: "认证失败，请检查 API Key", 403: "接口拒绝访问，请检查权限", 404: "接口不存在，请检查 Base URL 和模型名称", 429: "接口限流或额度不足，请稍后重试"}
+                messages = {400: "接口拒绝了请求参数，可能是当前的思考设置不被该服务支持，请改回「服务端默认」后重试",
+                            401: "认证失败，请检查 API Key", 403: "接口拒绝访问，请检查权限",
+                            404: "接口不存在，请检查 Base URL 和模型名称", 429: "接口限流或额度不足，请稍后重试"}
                 headers = {"X-Agent-Status": str(response.status_code)}
                 if response.status_code in {408, 429, 500, 502, 503, 504}:
                     headers["X-Translation-Retryable"] = "true"
@@ -466,6 +477,18 @@ def render_pdf_page(path: Path, number: int, requested_scale: float | None = Non
         return Response(image.tobytes("png"), media_type="image/png")
 
 
+def pdf_page_text(path: Path, number: int):
+    with PDF_LOCK, pymupdf.open(path) as pdf:
+        if not 1 <= number <= len(pdf):
+            raise HTTPException(404, "页面不存在")
+        return page_selection(pdf[number - 1])
+
+
+@app.get("/api/documents/{doc_id}/pages/{number}/text")
+def source_page_text(doc_id: str, number: int):
+    return pdf_page_text(doc_dir(doc_id) / "source.pdf", number)
+
+
 def save_finished_pdf(directory: Path, document: dict, target: str, report: dict):
     """Publish only complete translations, independently of internal layout caches."""
     blocks = all_blocks(document)
@@ -524,6 +547,11 @@ def layout_file(doc_id: str, revision: str):
 def translated_image(doc_id: str, revision: str, number: int,
                      scale: float | None = Query(default=None, ge=.1, le=6, allow_inf_nan=False)):
     return render_pdf_page(layout_file(doc_id, revision), number, scale)
+
+
+@app.get("/api/documents/{doc_id}/layout/{revision}/pages/{number}/text")
+def translated_page_text(doc_id: str, revision: str, number: int):
+    return pdf_page_text(layout_file(doc_id, revision), number)
 
 
 @app.get("/api/documents/{doc_id}/layout/{revision}/download")

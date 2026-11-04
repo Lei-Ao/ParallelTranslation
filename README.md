@@ -13,7 +13,7 @@
 
 <p><sub>本地 PDF 对照翻译工作台 · 接入自己的 AI · 保留页面版式</sub></p>
 
-<p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a></p>
+<p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors"><strong>Contributors</strong></a></p>
 
 </div>
 
@@ -23,7 +23,7 @@
 
 ## 功能
 
-- **对照阅读**：原文与译文并排展示，支持连续翻页、双向同步滚动、段落定位、缩放与拖动。
+- **对照阅读**：原文与译文并排展示，支持连续翻页、双向同步滚动、段落定位、缩放及词句选择复制。
 - **桌面启动**：Windows 下双击 `start.bat` 或 `start.vbs` 后驻留系统托盘，不会保留终端窗口；关闭浏览器不会停止服务，托盘菜单可打开工作台、重启、停止和退出。
 - **版式排印**：保留页面尺寸和图形，在安全区域内排印译文，参考原文的字体样式、段间距与栏结构。
 - **链接保留**：原文中的网页链接与文内跳转随译文重新定位，译文页面可直接点击；链接文字沿用原文颜色，换行链接的各段会作为一组同时高亮。
@@ -84,6 +84,7 @@ python3 -m venv .venv
 - **Base URL**：填写服务商的 API 地址。程序会追加 `/chat/completions`，也支持填写完整端点。
 - **API Key**：填写自己的密钥；无需认证的本机服务可以留空。
 - **模型名称**：按服务商实际提供的模型 ID 填写，项目不预设可用模型。
+- **思考强度**：默认沿用服务端设置，不添加思考参数；可按服务商支持情况选择关闭或调整强度。不支持该选项的接口请改回「服务端默认」。自定义接口由请求模板控制。
 - **测试连接**：发送一次真实模型请求，可能产生接口费用。
 
 界面当前预填的 Base URL 是 `https://api.apigoto.com/v1`，可按需更换。该预填地址不代表服务可用性或质量保证；集成测试使用模拟接口。
@@ -109,7 +110,7 @@ python3 -m venv .venv
 1. 在首页选择目标语言，按需填写「术语与要求」。
 2. 导入文字型 PDF。程序解析后自动翻译，首页显示进度；全文译完并完成排版后进入阅读界面。
 3. 翻译期间可暂停；失败后点击「继续翻译」，跳过已有当前语言译文。
-4. 两侧单击段落可同步定位，单击空白处取消选择，双击译文文字可编辑。也可在右上角菜单切换「段落（编辑）」视图。
+4. 两侧单击段落可同步定位，单击空白处取消段落选择；拖动选择词句后按 Ctrl+C 复制，双击可选词。编辑时，先选中译文段落，再点击其上方的「编辑译文」，也可在右上角菜单切换「段落（编辑）」视图。页面使用滚轮或滚动条滚动，不再通过鼠标拖拽平移。
 5. 在菜单中调整语言、并发、批量段数、同步滚动与阅读模式，或重新排版、下载 PDF、导出对照 Markdown。
 
 默认并发 **3** 个请求，最高 **12** 个；OpenAI 兼容接口默认每次合并同页最多 **3** 段，可选 1 / 3 / 5 段。自定义接口使用单段请求。接口临时错误最多自动重试两次，重试可能产生额外费用。
@@ -145,8 +146,8 @@ python3 -m venv .venv
 - 模型有时会把同一段译文返回成多行；排版和阅读视图会把源段落内部的软换行合并为一个段落（列表、术语表等多行结构除外），编辑框和已保存译文保持原样。
 - 独立公式、复杂表格、竖排文字或无法安全容纳的区域可能保留完整原文；表格通常只翻译表题和表注。
 - 图片内的文字不进行 OCR 或替换。翻译进度表示已生成的段落译文比例，不代表所有区域均已替换进 PDF。
-- 根据可见绘图、图片和图注识别出的图形区域，其文字标签随原图整体保留，避免流程图节点或图表标签重排串位；图注仍单独翻译。缺少可靠图形证据的纯文字图示可能无法识别。
-- 原文以渲染页面显示，支持段落交互，暂不支持原文自由选字、全文搜索或 PDF 内嵌批注。
+- 根据可见绘图、图片和图注识别图形区域。能按源行逐项对应且通过空间预检的独立标签，保持源中心轴、基线和字号翻译；复杂流程图、对应不明或含无法可靠重建的链接/上标的标签完整保留原文并提示原因，图注单独翻译。缺少可靠图形证据的纯文字图示可能无法识别。
+- 原文与排版后的译文以渲染页面显示，文字层按可见页按需加载，支持自由选择和复制 PDF 中可提取的文字。图片、扫描件或缺少有效字符映射的字形无法据此恢复文字；跨行复制可能保留 PDF 的换行，复杂公式的复制结果取决于 PDF 的文字编码。暂不支持全文搜索或 PDF 内嵌批注。
 - 中文排印会优先查找本机 Noto Serif SC、等线字体；没有可用字体时使用内置回退。不同系统的字体效果可能不同。
 - 生成内容和保留区域应人工审核，特别是公式、表格、关键数字和专业术语。
 
@@ -155,7 +156,7 @@ python3 -m venv .venv
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
-node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js
+node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js tests/test_reader_selection.js
 ```
 
 测试使用临时 PDF 与模拟接口，不消耗真实 AI 服务额度。针对本机已有译文的可选排版检查：
@@ -173,6 +174,8 @@ start.bat / start.vbs   Windows 一键启动（隐藏终端，托盘控制）
 stop.bat                停止本机服务与托盘
 tray.ps1                Windows 托盘菜单（打开/重启/停止/退出）
 pdf_text.py             首字下沉与完整单词恢复
+pdf_selection.py        阅读器文字选择层的字符几何提取
+pdf_structures.py       独立图表标签与作者网格的原位排印
 pdf_layout.py           PDF 排版、图表避让与按页缓存
 pdf_flow.py             分栏重排与公式区域移动
 pdf_figures.py          图形区域识别与图内文字保护
@@ -185,6 +188,12 @@ docs/                   实现与回归说明
 ```
 
 提交问题时请说明系统、Python 版本和复现步骤，并提供有权分享的最小 PDF 样本。请勿提交密钥或私人文档。
+
+## Contributors
+
+感谢 [XIA-2005（XIAJINGBO）](https://github.com/XIA-2005) 在 [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1) 中贡献版式与排印修复、阅读器分组高亮和回归测试。这些改动已按现有架构整合，保留图形保护、列表排版、桌面启动和文字选择功能。
+
+查看全部 [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors)。欢迎通过 Issue 或 Pull Request 参与改进。
 
 ## 开源协议
 

@@ -160,7 +160,9 @@ def original_formula_units(page, overlays, candidates, native, graphics, lanes=(
                     vector_page.clean_contents()
                 overlays.insert_pdf(vector_source, links=False, annots=False)
         block = {**members[0], "text": " ".join(member["text"] for member in members),
-                 "_members": [member["id"] for member in members], "_formula": True}
+                 "_members": [key for member in members for key in member.get("_members", [member["id"]])],
+                 "_detached_label": any(member.get("_members") == [] for member in members),
+                 "_formula": True}
         style = {"spans": owned, "size": max(8, min(12, max(span["size"] for span in owned))), "lines": []}
         result = {"overlay": snapshot, "rect": list(crop), "clip": list(crop), "scale": 1,
                   "original": True, "carried_graphics": carried}
@@ -228,7 +230,7 @@ def reflow_columns(prepared, native, graphics, source_rects, page_width, prose):
     per_lane = {}
     for item in prepared:
         block, style, result = item
-        if block.get("_cover_metadata") or style["size"] < body_size * .75:
+        if block.get("_cover_metadata") or block.get("_fixed_structure") or style["size"] < body_size * .75:
             continue
         text = block["text"]
         if not (prose(text) or heading(text) or caption(block) or block.get("_formula")
@@ -269,7 +271,10 @@ def reflow_columns(prepared, native, graphics, source_rects, page_width, prose):
                 anchor = source_rects[prior["id"]]
                 source_gap = source.y0 - anchor.y1
                 size = max(style["size"], prior_style["size"])
-                if -max(3, size * .3) <= source_gap <= max(24, size * 2.5):
+                limit = max(24, size * 2.5)
+                if prose(block["text"]) and prose(prior["text"]):
+                    limit = max(limit, size * 4, 40)
+                if -max(3, size * .3) <= source_gap <= limit:
                     # Retain measured source spacing, including heading and
                     # equation gaps, instead of imposing a uniform small gap.
                     gap, ink_gap, ink_padding = source_flow_spacing(

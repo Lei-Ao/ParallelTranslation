@@ -51,7 +51,8 @@ test('fit uses one physical scale for both panes and mixed portrait/landscape pa
   r.eval('setReaderZoom(2)');
   assert.equal(r.source.pages[0].getBoundingClientRect().width,1600);
   assert.equal(r.translation.pages[0].getBoundingClientRect().width,1600);
-  assert.ok(r.source.classList.contains('can-pan'));
+  assert.ok(r.source.scrollWidth>r.source.clientWidth);
+  assert.equal(r.source.classList.contains('can-pan'),false);
 });
 
 test('zoom retains the point under the cursor on a later page and both horizontal positions',()=>{
@@ -91,37 +92,13 @@ test('zoom bounds, reset and fit stay valid across narrow windows and new docume
   r.eval("state.doc.id='different';setReaderZoom(3)");assert.equal(r.eval('readerViewport.fit'),true);
 });
 
-test('horizontal drag follows both panes without vertical jumps or accidental editing',()=>{
+test('overflow uses scrollbars without registering mouse panning handlers',()=>{
   const r=reader();r.eval('setReaderZoom(2)');
-  r.source.scrollTop=100;r.translation.scrollTop=150;
-  r.source.scrollLeft=0;r.translation.scrollLeft=0;
-  r.eval(`let event={pointerId:1,button:0,pointerType:'mouse',clientX:300,clientY:200,
-    target:{closest:()=>true},preventDefault(){}};
-    startReaderPan(event,'source');moveReaderPan({...event,clientX:297});`);
-  assert.equal(r.source.scrollLeft,0);assert.equal(r.eval('readerViewport.pan.moved'),false);
-  r.eval('moveReaderPan({...event,clientX:160});endReaderPan(event)');
-  assert.equal(r.source.scrollLeft,140);
-  assert.ok(r.translation.scrollLeft>0);assert.equal(r.translation.scrollTop,150);
-  assert.equal(r.source.capture,null);
-  r.eval("let blocked=0;suppressPanClick({detail:1,preventDefault(){blocked++},stopImmediatePropagation(){}},'source')");
-  assert.equal(r.eval('blocked'),1);
-  r.eval("startReaderPan(event,'source');endReaderPan(event);suppressPanClick({detail:1,preventDefault(){blocked++},stopImmediatePropagation(){}},'source')");
-  assert.equal(r.eval('blocked'),1);
-});
-
-test('sync-off affects panning only; zoom still applies to both panes',()=>{
-  const r=reader();r.elements.get('#sync-scroll').checked=false;r.eval('setReaderZoom(2)');
-  r.translation.scrollLeft=0;
-  r.eval(`let e={pointerId:2,button:0,pointerType:'mouse',clientX:350,clientY:200,
-    target:{closest:()=>true},preventDefault(){}};startReaderPan(e,'source');moveReaderPan({...e,clientX:250});endReaderPan(e);`);
-  assert.equal(r.translation.scrollLeft,0);
+  assert.ok(r.source.scrollWidth>r.source.clientWidth);
+  const source=fs.readFileSync(require.resolve('../static/app.js'),'utf8');
+  assert.doesNotMatch(source,/startReaderPan|moveReaderPan|endReaderPan|suppressPanClick|setPointerCapture/);
+  r.elements.get('#sync-scroll').checked=false;
+  r.source.scrollLeft=120;r.translation.scrollLeft=0;
+  r.eval('setReaderZoom(3)');
   assert.equal(r.source.pages[0].style.width,r.translation.pages[0].style.width);
-});
-
-test('Shift selection, touch scrolling and small click motions never start a drag',()=>{
-  const r=reader();r.eval('setReaderZoom(2)');
-  for(const extra of ['shiftKey:true','pointerType:"touch"','button:2']){
-    r.eval(`startReaderPan({button:0,pointerId:4,clientX:100,clientY:200,target:{closest:()=>true},${extra}},'source')`);
-    assert.equal(r.eval('readerViewport.pan'),null);
-  }
 });

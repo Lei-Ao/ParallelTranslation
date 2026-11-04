@@ -24,13 +24,16 @@ from pdf_references import (REFERENCE_MARK, fallback_reference_regions, prepare_
 from pdf_text import normalize_drop_caps
 from pdf_lists import ListLayoutError, source_list_structure, translated_list_layout, BULLETS
 from pdf_figures import figure_regions, is_figure_caption
+from pdf_structures import anchored_lines, anchored_overlay, grid_members
 
 ET.register_namespace("", "http://www.w3.org/2000/svg")
 ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
 
 PDF_LOCK = threading.RLock()
-ENGINE_VERSION = 61
+ENGINE_VERSION = 67
 MATH_FONT = re.compile(r"math|symbol|cmmi|cmsy|cmex|msam|msbm|stmary|rsfs", re.I)
+JUSTIFY_MAX_SLACK = 1.2
+WIDE_SCRIPT = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 INSTITUTION = re.compile(r"universit|institut|laborator|department|school|academy|college|hospital|研究所|大学|学院|实验室", re.I)
 # Author lines mark affiliations with raised digits. Publishers put them right
 # after the surname ("Schoellig1,2"), after a comma ("Panerati,1,2"), after a
@@ -75,6 +78,33 @@ def is_prose(text):
 
 def narrative_fragment(text):
     return is_prose(text) or bool(re.match(r"\s*where\b", text, re.I)) or bool(re.search(r"\b(?:is the|is a|when the|denotes the)\b", text, re.I))
+
+
+def overlapping_fragment(small_text, small_rect, large_text, large_rect):
+    """True when a short extraction remainder has no box of its own.
+
+    Extractors split one paragraph into a full block plus a short remainder —
+    a line ending in inline math, a lone subscript or a formula tail — whose
+    rectangle overlaps the paragraph that owns it. Typesetting the two on their
+    own draws both translations over the same lines. Only a remainder that sits
+    mostly inside a prose block counts: a glyph-sized piece that merely touches
+    a paragraph (a display equation, a table cell, a footnote mark) keeps its
+    own place, and neither half may itself be a full paragraph.
+    """
+    if small_rect.get_area() <= 0 or large_rect.get_area() <= 0:
+        return False
+    shared = overlap(small_rect, large_rect)
+    if shared <= 1 or shared < small_rect.get_area() * .7:
+        return False
+    if min(small_rect.x1, large_rect.x1) - max(small_rect.x0, large_rect.x0) < small_rect.width * .7:
+        return False
+    if is_prose(small_text) or not is_prose(large_text):
+        return False
+    # The remainder continues running text, so it carries ordinary words even
+    # though a formula line does not.
+    return (len(re.findall(r"\b[A-Za-z][a-z]{1,}", small_text)) >= 2
+            or len(re.findall(r"[\u3400-\u9fff]", small_text)) >= 2)
+
 
 
 _LIST_LINE = re.compile(r"(?m)^\s*(?:[•·●▪▫◦‣∙⋅※■□◆◇]|\(?\d{1,2}[.)]|[A-Za-z][.)])\s+")
@@ -672,23 +702,49 @@ def anchor_overlay_rects(page, anchors):
 
 BOLD_MARKER = re.compile(r"(Q\d+[\).]|(?<!\d)\d{1,2}[\).]|(?<![A-Za-z])[A-Za-z][\).]|[•·●▪◆])\s*$")
 CAPTION_LABEL = re.compile(
-    r"^\s*(?:(?:fig(?:ure)?\.?|table|algorithm)\s*|[图表]\s*)"
-    r"(?:[A-Za-z]?\d+(?:[.\-]\d+)*|[IVXLC]+)\s*[.:：]?\s*", re.I)
+    r"^\s*(?P<kind>fig(?:ure)?\.?|table|algorithm|图|表)\s*"
+    r"(?P<number>[A-Za-z]?\d+(?:[.\-]\d+)*|[IVXLC]+)\s*[.:：]?\s*", re.I)
 
 
-def inline_bold_hints(style, text):
+def _caption_key(match):
+    kind = match["kind"].lower()
+    return ("figure" if kind.startswith("fig") or kind == "图" else
+            "table" if kind in {"table", "表"} else kind, match["number"].upper())
+
+
+def inline_bold_hints(style, text, emphasis_flag=16):
     """Locate bold run-in labels whose emphasis should survive translation.
 
     Only structural labels are returned: a leading label, a label after a
     number/bullet, or a leading caption word. Arbitrary emphasis inside a
     sentence cannot be aligned across languages and is left untouched.
     """
-    lines = style.get("lines") or []
+    spans = []
+    for line in style.get("lines") or []:
+        current = []
+        for span in line["spans"]:
+            if span["text"].strip():
+                current.append(dict(span))
+            elif current:
+                # Separate space operators still delimit caption words and
+                # sentence punctuation, even when their PDF flags differ.
+                current[-1]["text"] += span["text"]
+        if emphasis_flag == 2:
+            for span in current:
+                if MATH_FONT.search(span.get("font", "")):
+                    span["flags"] &= ~2
+        if spans and current:
+            if spans[-1]["text"].endswith("-"):
+                spans[-1]["text"] = spans[-1]["text"][:-1]
+            else:
+                spans[-1]["text"] += " "
+        spans.extend(current)
+    lines = [{"spans": spans}] if spans else []
     total = sum(len(span["text"].strip()) for line in lines for span in line["spans"] if span["text"].strip())
     bold = sum(len(span["text"].strip()) for line in lines for span in line["spans"]
-               if span["text"].strip() and span["flags"] & 16)
-    caption = CAPTION_LABEL.match(text)
-    if not total or not bold or bold > total * .55 and not caption:
+               if span["text"].strip() and span["flags"] & emphasis_flag)
+    caption = CAPTION_LABEL.match(text or "".join(span["text"] for span in spans))
+    if not total or not bold:
         return []
     hints = []
     history = ""
@@ -697,12 +753,12 @@ def inline_bold_hints(style, text):
         before = ""
         index = 0
         while index < len(spans):
-            if not spans[index]["flags"] & 16:
+            if not spans[index]["flags"] & emphasis_flag:
                 before += spans[index]["text"]
                 index += 1
                 continue
             run = []
-            while index < len(spans) and spans[index]["flags"] & 16:
+            while index < len(spans) and spans[index]["flags"] & emphasis_flag:
                 run.append(spans[index])
                 index += 1
             run_text = "".join(span["text"] for span in run).strip()
@@ -715,7 +771,7 @@ def inline_bold_hints(style, text):
                 for following in lines[line_index + 1:]:
                     continuation = [span for span in following["spans"] if span["text"].strip()]
                     end = 0
-                    while end < len(continuation) and continuation[end]["flags"] & 16:
+                    while end < len(continuation) and continuation[end]["flags"] & emphasis_flag:
                         end += 1
                     if end:
                         run_text += " " + "".join(span["text"] for span in continuation[:end]).strip()
@@ -761,7 +817,10 @@ def inline_bold_hints(style, text):
                 continue
             if kind not in {"lead_token", "caption_label"} and not terminator:
                 continue
+            if emphasis_flag == 2 and kind == "lead_token":
+                continue
             hints.append({"kind": kind, "marker": marker[1] if marker else "",
+                          "caption": _caption_key(caption) if caption else None,
                           "ordinal": ordinal, "terminator": terminator, "include": include,
                           "limit": max(16, min(120, len(run_text) * 2 + 12))})
         history += "".join(span["text"] for span in spans)
@@ -828,7 +887,7 @@ def bold_ranges(text, hints):
                 ranges.append((start, end))
         elif hint["kind"] in {"caption_label", "caption_title"}:
             label = CAPTION_LABEL.match(text)
-            if label:
+            if label and (not hint.get("caption") or _caption_key(label) == tuple(hint["caption"])):
                 if hint["kind"] == "caption_label":
                     end = len(text[:label.end()].rstrip())
                     if not hint["include"] and text[end - 1] in ".:：":
@@ -878,18 +937,20 @@ def _text_html(value, fallback):
                    for char in value)
 
 
-def _bold_html(value, start, end, ranges, fallback=()):
-    pieces, position = [], start
-    for first, last in ranges:
-        first, last = max(first, start), min(last, end)
-        if first >= last or last <= position:
-            continue
-        if first > position:
-            pieces.append(_text_html(value[position:first], fallback))
-        pieces.append("<b>" + _text_html(value[first:last], fallback) + "</b>")
-        position = last
-    if position < end:
-        pieces.append(_text_html(value[position:end], fallback))
+def _bold_html(value, start, end, ranges, fallback=(), italic=()):
+    edges = {start, end}
+    for first, last in (*ranges, *italic):
+        if first < end and last > start:
+            edges.update((max(first, start), min(last, end)))
+    edges = sorted(edges)
+    pieces = []
+    for first, last in zip(edges, edges[1:]):
+        text = _text_html(value[first:last], fallback)
+        if any(a <= first and last <= b for a, b in italic):
+            text = '<i>' + text + '</i>'
+        if any(a <= first and last <= b for a, b in ranges):
+            text = '<b>' + text + '</b>'
+        pieces.append(text)
     return "".join(pieces)
 
 
@@ -930,7 +991,7 @@ def list_marker_style(block, style, size):
                      "size": size * ratio, "weight": weight}
 
 
-def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None, links=(), paragraphs=()):
+def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None, links=(), paragraphs=(), italic=()):
     marker = lead_list_marker(value) if marker_style is not None and not paragraphs else None
     if marker is not None:
         first, last = marker.start(2), marker.end(2)
@@ -950,7 +1011,8 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
             if end > 0 and start < end:
                 shifted.append((max(0, start), end))
         contents, plain, labels, resolved = inline_math_markup(
-            suffix, assets, archive, scale, shifted, fallback, links=links)
+            suffix, assets, archive, scale, shifted, fallback, links=links,
+            italic=[(max(0, a - removed), b - removed) for a, b in italic if b > removed])
         # Resolved ranges address the suffix; map them back behind the marker.
         resolved = [dict(item, start=item["start"] + removed, end=item["end"] + removed)
                     for item in resolved]
@@ -1022,11 +1084,11 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
         cursor = start
         for position in sorted(p for p in decorations if start <= p <= end):
             if position > cursor:
-                pieces.append(_bold_html(value, cursor, position, bold, fallback))
+                pieces.append(_bold_html(value, cursor, position, bold, fallback, italic))
             pieces.extend(decorations.pop(position))
             cursor = position + (1 if position in separators else 0)
         if cursor < end:
-            pieces.append(_bold_html(value, cursor, end, bold, fallback))
+            pieces.append(_bold_html(value, cursor, end, bold, fallback, italic))
 
     for start, end, kind, payload in events:
         if start < raw_cursor:
@@ -1042,7 +1104,7 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
         else:
             # Goto anchors carry no href; the reader overlay navigates, and the
             # markup only marks the text so its rendered position can be found.
-            inner = _bold_html(value, start, end, bold, fallback)
+            inner = _bold_html(value, start, end, bold, fallback, italic)
             if payload.get("color"):
                 # Publishers style links black, blue or gray. Keep that color
                 # instead of MuPDF's default HTML link blue.
@@ -1567,32 +1629,71 @@ def layout_blocks(page, saved_page, native, target, cover_page=False):
 
     Source translations and IDs stay intact; this grouping is only for typesetting.
     Display equations and unrelated overlapping regions retain the safety checks.
+    A short remainder that sits inside a paragraph (see `overlapping_fragment`)
+    joins it as well, so the two never print on the same lines.
     """
     blocks = []
     for original in saved_page["blocks"]:
         block = original
         if block.get("drop_cap"):
             block = {**block, "_members": [block["id"]]}
-        # Equation numbers are sometimes extracted into the following paragraph.
-        # Leave those labels on the source page and typeset only the explanation.
-        if re.match(r"^\s*\(\d+\)\s*\n", block["text"]) and is_prose(block["text"]):
+        # Equation punctuation and a number can belong to the following prose
+        # extraction block. Detach that prefix without altering the saved ID or
+        # translation; its original glyphs travel with the display equation.
+        prefix = re.match(r"^\s*[,;:.，；：。]*\s*\((\d+)\)\s*\n", block['text'])
+        if prefix and is_prose(block['text'][prefix.end():]):
             rect = source_rect(page, block)
-            best = max(native, key=lambda b: overlap(rect, pymupdf.Rect(b["bbox"])), default=None)
-            lines = [line for line in best["lines"] if not re.fullmatch(r"\s*\(\d+\)\s*", "".join(s["text"] for s in line["spans"]))] if best else []
-            if lines:
-                region = pymupdf.Rect(lines[0]["bbox"])
-                for line in lines[1:]:
+            lines = _flow_lines(native, rect)
+            label_lines = [line for line in lines
+                           if re.fullmatch(r'\s*\(' + re.escape(prefix[1]) + r'\)\s*',
+                                           ''.join(s['text'] for s in line['spans']))]
+            body_text = block['text'][prefix.end():].strip()
+            needle = normalized_text(body_text.splitlines()[0])[:20]
+            first = next((line for line in lines if normalized_text(
+                ''.join(s['text'] for s in line['spans'])).startswith(needle)), None)
+            if first and label_lines and first['bbox'][1] > label_lines[0]['bbox'][1]:
+                body_lines = [line for line in lines if line['bbox'][1] >= first['bbox'][1] - .1]
+                region = pymupdf.Rect(body_lines[0]['bbox'])
+                for line in body_lines[1:]:
                     region |= pymupdf.Rect(line["bbox"])
+                retained = pymupdf.Rect(label_lines[0]['bbox'])
+                for line in lines:
+                    value = ''.join(s['text'] for s in line['spans']).strip()
+                    if line['bbox'][1] < first['bbox'][1] and re.fullmatch(r'[,;:.，；：。]+', value):
+                        retained |= pymupdf.Rect(line['bbox'])
                 displayed = region * page.rotation_matrix
                 bounds = page.rect
-                block = {**block, "text": re.sub(r"^\s*\(\d+\)\s*\n", "", block["text"]),
-                         "translation": re.sub(r"^\s*[（(]\d+[）)]\s*", "", block["translation"]),
+                translated_prefix = re.match(r'^\s*[,;:.，；：。]*\s*[（(](\d+)[）)]\s*', block.get('translation') or '')
+                if translated_prefix and translated_prefix[1] != prefix[1]:
+                    blocks.append({**block, '_structure_issue': '公式编号与原文不一致，保留完整原文，请核对译文编号'})
+                    continue
+                block = {**block, "text": body_text,
+                         "translation": block['translation'][translated_prefix.end():] if translated_prefix else block['translation'],
                          "bbox": [displayed.x0 / bounds.width, displayed.y0 / bounds.height,
-                                  displayed.x1 / bounds.width, displayed.y1 / bounds.height]}
+                                  displayed.x1 / bounds.width, displayed.y1 / bounds.height],
+                         '_equation_prefix': {'id': block['id'] + '-equation-prefix',
+                                              'text': '(' + prefix[1] + ')', '_math_fragment': True,
+                                              '_members': [], 'rect': list(retained)}}
+            else:
+                block = {**block, '_structure_issue': '无法可靠分离公式编号与说明段落，保留完整原文'}
         blocks.append(block)
     rects = [source_rect(page, b) for b in blocks]
     remaining = set(range(len(blocks)))
     result = []
+
+    def mergeable(first, second):
+        """Two overlapping blocks that cannot be typeset side by side."""
+        if (flow_caption(blocks[first]) or flow_caption(blocks[second])
+                or blocks[first].get("_structure_issue") or blocks[second].get("_structure_issue")
+                or overlap(rects[first], rects[second]) <= 1):
+            return False
+        if narrative_fragment(blocks[first]["text"]) and narrative_fragment(blocks[second]["text"]):
+            return True
+        small, large = ((first, second) if rects[first].get_area() <= rects[second].get_area()
+                        else (second, first))
+        return overlapping_fragment(blocks[small]["text"], rects[small],
+                                    blocks[large]["text"], rects[large])
+
     while remaining:
         first = min(remaining)
         component = {first}
@@ -1600,12 +1701,7 @@ def layout_blocks(page, saved_page, native, target, cover_page=False):
         remaining.remove(first)
         while frontier:
             index = frontier.pop()
-            # A prose block wrapping around an illustration has a wide union
-            # bbox that may enclose its separate caption. Inline mathematics in
-            # that prose must not turn the caption into part of the paragraph.
-            neighbors = {i for i in remaining if not flow_caption(blocks[index])
-                         and not flow_caption(blocks[i]) and narrative_fragment(blocks[index]["text"])
-                         and narrative_fragment(blocks[i]["text"]) and overlap(rects[index], rects[i]) > 1}
+            neighbors = {i for i in remaining if mergeable(index, i)}
             remaining.difference_update(neighbors)
             component.update(neighbors)
             frontier.extend(neighbors)
@@ -1997,8 +2093,144 @@ def minimum_font_scale(size):
     return min(1, max(.70, minimum / size))
 
 
+_SECTION_NUMBER = re.compile(r'^\s*([IVXLCDM]+|[A-Z]|\d+(?:\.\d+)*)(?:[.．、:：]\s*|\s+)')
+
+
+def rendered_lines(page):
+    """Count visual text lines, treating one baseline as one line."""
+    positions = sorted(line["bbox"][1] for item in page.get_text("dict")["blocks"]
+                       if item.get("type") == 0 for line in item["lines"])
+    baselines = []
+    for position in positions:
+        if not baselines or abs(position - baselines[-1]) > 1.5:
+            baselines.append(position)
+    return len(baselines)
+
+
+
+def stretched_gap(page, size):
+    """Report whether justified text widened a word gap past a readable limit.
+
+    MuPDF distributes a justified line's slack across its spaces. A CJK line
+    usually has only the spaces inserted between Han and Latin, so an
+    unbreakable run leaves one gap several characters wide. A stretched gap can
+    split the visual line into two extraction lines, so words are grouped by
+    baseline rather than by the extractor's line number. Gaps that contain an
+    inline formula image are not spaces and do not count.
+    """
+    limit = max(JUSTIFY_MAX_SLACK * size, 8)
+    images = [pymupdf.Rect(item["bbox"]) for item in page.get_image_info()]
+    rows = []
+    for word in sorted(page.get_text("words"), key=lambda item: ((item[1] + item[3]) / 2, item[0])):
+        center = (word[1] + word[3]) / 2
+        if rows and abs(center - rows[-1][0]) <= max(2, size * .45):
+            rows[-1][1].append(word)
+        else:
+            rows.append([center, [word]])
+    for _, words in rows:
+        words.sort(key=lambda item: item[0])
+        for left, right in zip(words, words[1:]):
+            if right[0] - left[2] <= limit:
+                continue
+            if any(box.x0 < right[0] and box.x1 > left[2]
+                   and box.y1 > min(left[1], right[1]) and box.y0 < max(left[3], right[3])
+                   for box in images):
+                continue
+            return True
+    return False
+
+
+
+def mixed_heading_parts(block, style):
+    """Identify a standalone heading inside a prose extraction block.
+
+    Native line geometry proves the source boundary; an explicit matching
+    translated heading line proves the target boundary. Never guess a split
+    inside a translated sentence or infer emphasis from the section number.
+    """
+    lines = style.get('lines', [])
+    if len(lines) < 2:
+        return None
+    source = block.get('text', '').strip().splitlines()
+    if len(source) < 2 or not section_heading(source[0]) or not is_prose('\n'.join(source[1:])):
+        return None
+    head_text = ''.join(s['text'] for s in lines[0]['spans']).strip()
+    if normalized_text(head_text) != normalized_text(source[0]):
+        return None
+    head = pymupdf.Rect(lines[0]['bbox'])
+    body = pymupdf.Rect(lines[1]['bbox'])
+    for line in lines[2:]:
+        body |= pymupdf.Rect(line['bbox'])
+    size = style['size']
+    centered = (abs((head.x0 + head.x1 - body.x0 - body.x1) / 2) <= max(3, size * .4, body.width * .08)
+                and head.width < body.width * .88)
+    head_flags = {s['flags'] & 18 for s in lines[0]['spans'] if s['text'].strip()}
+    body_flags = {s['flags'] & 18 for line in lines[1:] for s in line['spans'] if s['text'].strip()}
+    distinct = head_flags != body_flags or abs(_flow_size(lines[:1]) - _flow_size(lines[1:])) > size * .1
+    if not ((centered or distinct) and body.y0 - head.y1 > size * .04):
+        return None
+    translated = block.get('translation', '').strip().splitlines()
+    first = _SECTION_NUMBER.match(source[0])
+    second = _SECTION_NUMBER.match(translated[0]) if translated else None
+    if (len(translated) < 2 or not first or not second or first[1] != second[1]
+            or len(translated[0]) > 120 or not '\n'.join(translated[1:]).strip()):
+        return '已识别块内标题，但译文缺少可可靠匹配的标题换行，保留完整原文；请将标题与正文分行'
+    return [(source[0], translated[0], lines[:1], head, 'center' if centered else None),
+            ('\n'.join(source[1:]), '\n'.join(translated[1:]), lines[1:], body, None)]
+
+
+
+def mixed_heading_overlay(overlays, page, block, parts, style, obstacles, typography, horizontal_obstacles):
+    """Typeset heading and body separately, committing one atomic replacement."""
+    base = len(overlays)
+    results = []
+    for text, translation, lines, rect, alignment in parts:
+        native = {'bbox': list(rect), 'lines': lines}
+        part_style, reason = inspect_block([native], rect)
+        part = {**block, 'text': text, 'translation': translation, '_structured_part': True,
+                '_alignment_override': alignment}
+        result = (fitted_overlay(overlays, page, part, rect, part_style, obstacles, typography,
+                                 horizontal_obstacles, bold_hints=inline_bold_hints(part_style, text))
+                  if not reason else None)
+        if result is None:
+            if len(overlays) > base:
+                overlays.delete_pages(base, len(overlays) - 1)
+            style['_layout_failure_reason'] = '块内标题与正文无法分别安全排印，保留完整原文；请核对标题换行与译文长度'
+            return None
+        results.append(result)
+    region = pymupdf.Rect(results[0]['rect'])
+    for result in results[1:]:
+        region |= pymupdf.Rect(result['rect'])
+    with pymupdf.open() as combined:
+        canvas = combined.new_page(width=page.rect.width, height=page.rect.height)
+        for result in results:
+            canvas.show_pdf_page(pymupdf.Rect(result['rect']), overlays, result['overlay'],
+                                 clip=pymupdf.Rect(result['clip']))
+        overlays.insert_pdf(combined)
+    overlays.delete_pages(base, len(overlays) - 2)
+    result = {'overlay': base, 'rect': list(region), 'clip': list(region),
+              'scale': min(r['scale'] for r in results),
+              'math_labels': [label for r in results for label in r.get('math_labels', [])],
+              'structure': [{'kind': kind, 'source': list(part[3]), 'rect': r['rect']}
+                            for kind, part, r in zip(('heading', 'body'), parts, results)]}
+    for field in ('links', 'whole_links'):
+        if any(r.get(field) for r in results):
+            result[field] = [item for r in results for item in r.get(field, [])]
+    return result
+
+
+
 def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=None,
                    horizontal_obstacles=None, bold_hints=None, *, font_scale=1, allow_shrink=True):
+    if not block.get("_structured_part"):
+        mixed = mixed_heading_parts(block, style)
+        if mixed is not None:
+            style["_mixed_heading"] = True
+            if isinstance(mixed, str):
+                style["_layout_failure_reason"] = mixed
+                return None
+            return mixed_heading_overlay(overlays, page, block, mixed, style, obstacles,
+                                         typography, horizontal_obstacles)
     if "_list_structure" not in style:
         style["_list_structure"] = source_list_structure(page, style, rect)
     list_structure = style["_list_structure"]
@@ -2011,6 +2243,8 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     math_labels = []
     alignment, indent, source_leading = source_paragraph_style(
         style, rect, block["text"], page.rect.width, horizontal_obstacles, obstacles)
+    if block.get("_alignment_override"):
+        alignment, indent = block["_alignment_override"], 0
     if block.get("drop_cap"):
         indent = 0
     cover_role = cover_text_role(block, page, rect, style)
@@ -2138,14 +2372,21 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     display_weight = cover_role == "title"
     if not display_weight and style["bold"]:
         display_weight = prominent_heading(style, block["text"], horizontal_obstacles or ())
-    weight = 600 if section_heading(block["text"]) or (
-        style["bold"] and (display_weight or not is_prose(block["text"]))) else 400
-    if list_structure:
-        weight = 600 if style["bold"] else 400
-    elif is_caption:
-        caption_spans = [span for line in style.get("lines", []) for span in line["spans"]
-                         if span["text"].strip() and not MATH_FONT.search(span.get("font", ""))]
-        weight = 600 if caption_spans and all(span["flags"] & 16 for span in caption_spans) else 400
+    # Source emphasis is independent of heading/list numbering. Mixed run-in
+    # labels must never promote the regular prose that follows them.
+    prose_spans = [s for s in style.get("spans", []) if not MATH_FONT.search(s["font"])
+                   and re.search(r"[A-Za-z\u3400-\u9fff]{2,}", s["text"])]
+    whole_body_bold = bool(prose_spans) and all(s["flags"] & 16 for s in prose_spans)
+    weight = 600 if style["bold"] and (
+        display_weight or not is_prose(block["text"]) or whole_body_bold) else 400
+    if bold_hints and not whole_body_bold and not display_weight:
+        weight = 400
+    if is_caption:
+        caption_spans = [s for s in style.get("spans", []) if s["text"].strip()
+                         and not MATH_FONT.search(s.get("font", ""))]
+        weight = 600 if caption_spans and all(s["flags"] & 16 for s in caption_spans) else 400
+    whole_italic = style["italic"] and (not prose_spans or all(s["flags"] & 2 for s in prose_spans))
+    italic_hints = inline_bold_hints(style, block["text"], emphasis_flag=2) if not whole_italic else ()
 
     for variant in variants:
         paragraphs = ()
@@ -2156,11 +2397,12 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                 style["list_layout_issue"] = str(error)
                 return None
         ranges = bold_ranges(variant, bold_hints) if bold_hints else ()
+        italics = bold_ranges(variant, italic_hints) if italic_hints else ()
         try:
             contents, validation_text, math_labels, resolved_links = inline_math_markup(
                 variant, block.get("_inline_assets", []), archive, scale=font_scale, bold=ranges,
                 fallback=typography.get("fallback_characters", ""), marker_style=marker_style,
-                links=block.get("_link_hints", []), paragraphs=paragraphs)
+                links=block.get("_link_hints", []), paragraphs=paragraphs, italic=italics)
         except ListLayoutError as error:
             style["list_layout_issue"] = str(error)
             return None
@@ -2175,7 +2417,7 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
             css = typography["css"] + (f"*{{margin:0;padding:0}} body{{font-family:{typography['family']};font-size:{size}pt;"
                    f"line-height:{line_height};color:#{style['color']:06x};"
                    f"font-weight:{weight};"
-                   f"font-style:{'italic' if style['italic'] else 'normal'};}} b{{font-weight:600}}"
+                   f"font-style:{'italic' if whole_italic else 'normal'};}} b{{font-weight:600}}"
                    " a:link,a:visited,a:hover{color:inherit;text-decoration:none}")
             centered = cover_role in {"title", "authors"} or alignment == "center"
             css += f"body{{text-align:{'center' if centered else alignment};text-indent:{0 if centered else indent}pt}}"
@@ -2185,6 +2427,25 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                     box, markup, css, is_short_cjk_line(block, style, variant) and not centered,
                     minimum_scale, anchors)
                 if result:
+                    # Only a space can be stretched; pure CJK prose has none.
+                    if (alignment == "justify" and not centered and " " in printable
+                            and WIDE_SCRIPT.search(printable)
+                            and stretched_gap(overlays[result["overlay"]], size)):
+                        justified_lines = rendered_lines(overlays[result["overlay"]])
+                        relaxed_css = css.replace("text-align:justify", "text-align:left")
+                        relaxed, _ = render_box(box, markup, relaxed_css, False, minimum_scale, anchors)
+                        relaxed_lines = rendered_lines(overlays[relaxed["overlay"]]) if relaxed else 0
+                        if relaxed and relaxed_lines <= justified_lines:
+                            # Left alignment keeps the same breaks but ends the
+                            # underfull line at the column edge instead of
+                            # opening a hole between two words. Inline formulas,
+                            # links and bold runs stay in the same markup.
+                            overlays.delete_page(result["overlay"])
+                            relaxed["overlay"] -= 1
+                            relaxed["relaxed_justify"] = True
+                            result, line_count = relaxed, relaxed_lines
+                        elif relaxed:
+                            overlays.delete_page(len(overlays) - 1)
                     if line_count > 1:
                         for wider_box in short_cjk_line_boxes(
                                 rect, box, page, block, style, horizontal_obstacles,
@@ -2212,7 +2473,8 @@ def body_flow_candidate(block, style=None):
     return (is_prose(block["text"]) and not section_heading(block["text"])
             and not flow_caption(block) and not _LIST_LINE.search(block["text"])
             and not block.get("kind") and not block.get("_formula")
-            and not block.get("_cover_metadata") and not (style or {}).get("_list_structure"))
+            and not block.get("_cover_metadata") and not block.get("_fixed_structure")
+            and not (style or {}).get("_list_structure") and not (style or {}).get("_mixed_heading"))
 
 
 def finish_overlay_links(block, result):
@@ -2539,9 +2801,16 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             obstacles = [pymupdf.Rect(b["bbox"]) for b in native] + graphics
             text_obstacles = [span for item in native for line in item["lines"]
                               for span in line["spans"] if span["text"].strip()]
+            author_grid = grid_members(native)
             has_redactions = any(a.type[0] == pymupdf.PDF_ANNOT_REDACT for a in (page.annots() or []))
             prepared = []
             formula_candidates = []
+            if not has_redactions:
+                formula_candidates.extend((b["_equation_prefix"], pymupdf.Rect(b["_equation_prefix"]["rect"]))
+                                          for b in working if b.get("_equation_prefix"))
+                for b in working:
+                    if b.get("_equation_prefix"):
+                        report.setdefault("source_placements", {})[b["id"]] = b["bbox"]
             table_blocks = 0
             figure_blocks = 0
             dropped_links = 0
@@ -2581,6 +2850,22 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         report["scaled"] += len(cover[0]["_members"])
                 for block in working:
                     if block["id"] in figure_ids:
+                        # Keep complex diagrams intact. Only an independently
+                        # proven, line-matched label may replace its own glyphs.
+                        anchors = anchored_lines(native, rects[block["id"]], graphics,
+                                                 set(), is_prose, is_figure_caption)
+                        if (anchors and not has_redactions and block.get("translation")
+                                and block.get("target") == target):
+                            anchored, anchor_style, anchor_reason = anchored_overlay(
+                                overlays, page, block, anchors, native, graphics, typography, links=links_on_page)
+                            if not anchor_reason:
+                                report["replaced"] += 1
+                                if anchored:
+                                    prepared.append(({**block, "_fixed_structure": True}, anchor_style, anchored))
+                                continue
+                            report["issues"].append({"page": saved_page["number"],
+                                                     "block_id": block["id"], "kind": "preserved",
+                                                     "message": anchor_reason})
                         report["preserved"] += 1
                         figure_blocks += 1
                         continue
@@ -2609,6 +2894,20 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         report["untranslated"] += 1
                         report["issues"].append({**entry, "kind": "untranslated", "message": "尚无当前语言译文，保留原文"})
                         continue
+                    anchors = anchored_lines(native, block_rect, graphics, author_grid,
+                                             is_prose, lambda text: bool(_FLOW_CAPTION.match(text)))
+                    if anchors and not has_redactions and not block.get("drop_cap_preserve"):
+                        anchored, anchor_style, anchor_reason = anchored_overlay(
+                            overlays, page, block, anchors, native, graphics, typography, links=links_on_page)
+                        if anchor_reason:
+                            report["preserved"] += len(member_ids)
+                            report["issues"].extend({**entry, "block_id": key, "kind": "preserved",
+                                                     "message": anchor_reason} for key in member_ids)
+                        else:
+                            report["replaced"] += len(member_ids)
+                            if anchored:
+                                prepared.append(({**block, "_fixed_structure": True}, anchor_style, anchored))
+                        continue
                     if unchanged_non_text(block):
                         unchanged_rect = rects[block["id"]]
                         _, unchanged_reason = inspect_block(native, unchanged_rect)
@@ -2631,6 +2930,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         # insufficient: a rectangular replacement could still
                         # paint across the caption's independent translated text.
                         reason = "正文与独立图注形成绕排区域，当前无法安全按矩形重排，保留完整原文"
+                    if block.get("_structure_issue"):
+                        reason = block["_structure_issue"]
                     if block.get("drop_cap_preserve"):
                         reason = block["drop_cap_preserve"]
                     if block.get("drop_cap_review"):
@@ -2668,7 +2969,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         result = fitted_overlay(overlays, page, block, fit_rect, style, obstacles,
                                                 typography, text_obstacles,
                                                 bold_hints=inline_bold_hints(style, block["text"]))
-                        if result is None and body_flow_candidate(block, style) and not style.get("list_layout_issue"):
+                        if (result is None and body_flow_candidate(block, style)
+                                and not style.get("list_layout_issue") and not style.get("_layout_failure_reason")):
                             # A body block that cannot fit alone may still fit
                             # with its shorter neighbors at the original size.
                             result = {"rect": list(fit_rect), "scale": 0, "pending": True}
@@ -2676,7 +2978,7 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                             result["inline_math_runs"] = runs
                             result["carried_graphics"] = inline_math_graphics(drawings, runs)
                         if result is None:
-                            reason = style.get("list_layout_issue") or "译文超出可用空间或含无法可靠排印的字符，保留原文；请编辑后重新排版"
+                            reason = style.get("list_layout_issue") or style.get("_layout_failure_reason") or "译文超出可用空间或含无法可靠排印的字符，保留原文；请编辑后重新排版"
                     if reason and reason.startswith("公式") and not has_redactions and not is_prose(block["text"]):
                         formula_candidates.append((block, rect))
                     if reason:
@@ -2700,7 +3002,7 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 for block, _, result in formulas:
                     rects[block["id"]] = pymupdf.Rect(result["clip"])
                 for block, _, result in prepared:
-                    if section_heading(block["text"]) and not result.get("original"):
+                    if section_heading(block["text"]) and not result.get("original") and not block.get("_fixed_structure"):
                         separators = [tuple(drawing["rect"]) for drawing in drawings
                                       if heading_separator(drawing, rects[block["id"]])]
                         result.setdefault("carried_graphics", []).extend(separators)
@@ -2747,7 +3049,7 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                                          fill=False, cross_out=False)
                 heading_strokes = set()
                 for block, style, result in prepared:
-                    if result.get("original") or not section_heading(block["text"]):
+                    if result.get("original") or block.get("_fixed_structure") or not section_heading(block["text"]):
                         continue
                     source = rects.get(block["id"])
                     if source is None:
@@ -2798,6 +3100,21 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 if prepared:
                     page.apply_redactions(images=0, graphics=0, text=0)
                 for block, style, result in prepared:
+                    members = block.get("_members", [block["id"]])
+                    if block.get('_detached_label'):
+                        source_box = pymupdf.Rect(result['clip']) * pymupdf.Matrix(rotation)
+                        bounds = page.rect * pymupdf.Matrix(rotation)
+                        # Rect * rotation around the origin may be negative;
+                        # normalize relative to those displayed page bounds.
+                        source_box = [(source_box.x0 - bounds.x0) / bounds.width,
+                                      (source_box.y0 - bounds.y0) / bounds.height,
+                                      (source_box.x1 - bounds.x0) / bounds.width,
+                                      (source_box.y1 - bounds.y0) / bounds.height]
+                        for key in members:
+                            report.setdefault('source_placements', {})[key] = source_box
+                    if len(members) > 1:
+                        report.setdefault("block_groups", []).append({
+                            "page": saved_page["number"], "blocks": members})
                     if result.get("original") and result["rect"] == result["clip"]:
                         continue
                     box = pymupdf.Rect(result["rect"])
@@ -2956,11 +3273,13 @@ def build_layout(directory: Path, document: dict, target: str):
                     report[field] += details[field]
                 report["issues"].extend(details["issues"])
                 report["placements"].update(details["placements"])
+                if details.get("source_placements"):
+                    report.setdefault("source_placements", {}).update(details["source_placements"])
                 if details.get("bibliography"):
                     report.setdefault("bibliography", []).extend(details["bibliography"])
                 if details.get("flow"):
                     report.setdefault("flow", []).extend(details["flow"])
-                for field in ("original_placements", "erased_spans", "inline_math"):
+                for field in ("original_placements", "erased_spans", "inline_math", "block_groups"):
                     if details.get(field):
                         report.setdefault(field, []).extend(details[field])
                 if details.get("placed_links"):

@@ -13,7 +13,7 @@
 
 <p><sub>Local-first PDF translation workspace · bring your own AI · preserve the page layout</sub></p>
 
-<p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a></p>
+<p><a href="README.md">简体中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors"><strong>Contributors</strong></a></p>
 
 </div>
 
@@ -23,7 +23,7 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 
 ## Features
 
-- **Parallel reading**: continuous pages, bidirectional synchronized scrolling, paragraph navigation, zoom, and panning.
+- **Parallel reading**: continuous pages, bidirectional synchronized scrolling, paragraph navigation, zoom, and text selection/copying.
 - **Desktop launcher**: on Windows, `start.bat` or `start.vbs` starts the app in the system tray without leaving a terminal window open. Closing the browser does not stop the service; the tray menu can open the workbench, restart, stop, or exit.
 - **Layout-aware output**: preserve page dimensions and graphics, and typeset translations in safe regions using source typography, column geometry, and paragraph spacing.
 - **Preserved links**: web links and in-document jumps are re-anchored to the translated text and stay clickable; link text keeps the source color, and all line fragments of a wrapped link highlight together as one link.
@@ -84,6 +84,7 @@ Open **Agent 设置** (Agent settings) and select the endpoint type.
 - **Base URL**: your provider’s API URL. The app appends `/chat/completions`, unless you enter that full endpoint.
 - **API Key**: your own credential. Local endpoints that do not require authentication may leave this blank.
 - **Model**: enter the exact model ID provided by your service. No available model is assumed.
+- **Reasoning**: the default sends no additional reasoning parameters. Select an explicit setting only if your provider supports it; otherwise return to the server default. Custom endpoints control this through their request template.
 - **Test connection**: sends a real model request and may incur API charges.
 
 The current prefilled Base URL is `https://api.apigoto.com/v1`; replace it as needed. This default does not guarantee service availability or quality. Integration tests use simulated endpoints.
@@ -109,7 +110,7 @@ Only non-streaming JSON responses completed in one request are supported. SSE, p
 1. Select a target language on the home page and optionally enter terminology and translation instructions.
 2. Import a text-based PDF. The app extracts and translates its text, shows progress, and opens the reader when translation and typesetting finish.
 3. Pause when needed. Resume after failures to skip already saved translations in the current target language.
-4. Click a paragraph to locate its counterpart; click blank space to clear the selection. Double-click translated text to edit, or select the paragraph editing view from the top-right menu.
+4. Click a paragraph to locate its counterpart; click blank space to clear paragraph selection. Drag to select words or sentences and press Ctrl+C to copy; double-click to select a word. To edit, select a translated paragraph and click its “编辑译文” button, or use the paragraph editing view in the top-right menu. Use the wheel or scrollbars to scroll; mouse dragging no longer pans the page.
 5. Use the menu to change language, concurrency, batch size, synchronized scrolling, or reading mode; regenerate the layout; download the PDF; or export bilingual Markdown.
 
 The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **3 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
@@ -145,8 +146,8 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 - A model may return one paragraph as several lines; the layout and reader merge soft line breaks inside one source paragraph (line-structured lists and notation blocks keep their breaks). The edit dialog and saved translation text are not rewritten.
 - Display equations, complex tables, vertical text, or text that cannot fit safely may retain the complete original. Tables generally retain their contents while their captions and notes are translated.
 - Text inside images is not recognized or replaced. Translation progress counts saved paragraph translations, not the proportion of PDF regions successfully replaced.
-- Text labels in figure regions identified from visible drawings, images, and nearby captions stay with the original artwork to preserve node and label positions; captions are translated separately. Text-only diagrams without reliable graphic evidence may not be detected.
-- The source is displayed as rendered pages with paragraph interactions. Free text selection, full-text search, and embedded PDF annotations are not implemented in the source reader.
+- Figure regions are identified from visible drawings, images, and nearby captions. Independent labels with reliable line mappings and safe space checks are translated at their source centers, baselines, and sizes. Complex diagrams, ambiguous mappings, and labels whose links or superscripts cannot be rebuilt safely retain their complete source text with an explanation; captions are translated separately. Text-only diagrams without reliable graphic evidence may not be detected.
+- Both source and typeset translation pages have selectable text layers loaded on demand for visible pages. Selection uses text extractable from the actual PDF. Images, scans, and glyphs without valid character mappings cannot supply selectable text; copied text may retain PDF line breaks, and formula copying depends on the PDF encoding. Full-text search and embedded PDF annotations are not implemented in the reader.
 - Chinese typesetting first looks for locally installed Noto Serif SC or DengXian fonts, then uses a built-in fallback. Appearance may vary across systems.
 - Review generated content and retained regions, especially equations, tables, important numbers, and technical terminology.
 
@@ -155,7 +156,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
-node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js
+node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js tests/test_reader_selection.js
 ```
 
 Tests use temporary PDFs and simulated endpoints, without consuming real AI service credits. An optional audit of documents already translated on your machine is available:
@@ -173,6 +174,8 @@ start.bat / start.vbs   One-click Windows launch (hidden console, tray control)
 stop.bat                Stop the local server and tray
 tray.ps1                Windows tray menu (open/restart/stop/exit)
 pdf_text.py             Drop-cap recovery and complete words
+pdf_selection.py        Character geometry for selectable reader text
+pdf_structures.py       Independently anchored figure labels and author grids
 pdf_layout.py           Typesetting, obstacle handling, page caches
 pdf_figures.py          Figure regions and protection of embedded labels
 pdf_flow.py             Column reflow and equation relocation
@@ -185,6 +188,12 @@ docs/                   Implementation and regression notes
 ```
 
 When reporting a problem, include your operating system, Python version, reproduction steps, and a minimal PDF sample you are allowed to share. Do not submit credentials or private documents.
+
+## Contributors
+
+Thanks to [XIA-2005 (XIAJINGBO)](https://github.com/XIA-2005) for the layout and typography fixes, grouped reader highlights, and regression tests in [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1). The changes are integrated with the current architecture, preserving figure protection, list layout, desktop launching, and text selection.
+
+See all [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors). Issues and pull requests are welcome.
 
 ## License
 

@@ -1,7 +1,7 @@
 'use strict';
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-const DEFAULT_AGENT = {mode:'openai', base_url:'https://api.apigoto.com/v1', api_key:'', model:'', template:'{\n  "input": "{{prompt}}"\n}', response_path:'output', timeout:120};
+const DEFAULT_AGENT = {mode:'openai', base_url:'https://api.apigoto.com/v1', api_key:'', model:'', reasoning:'', template:'{\n  "input": "{{prompt}}"\n}', response_path:'output', timeout:120};
 function stored(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
 function persist(key, data) { try { localStorage.setItem(key, JSON.stringify(data)); return true; } catch { toast('浏览器存储不可用，设置仅在当前页面有效'); return false; } }
 const state = {token:'', doc:null, library:[], page:0, selected:null, running:false, stop:false, uploading:false, loading:false, activeBlocks:new Set(), concurrency:[1,2,3,4,6,8,12].includes(stored('parallel-concurrency',3))?stored('parallel-concurrency',3):3, errors:{}, view:'pdf', layout:null, layoutKey:'', layoutBusy:false, layoutError:'',
@@ -14,7 +14,7 @@ state.openMessage='';
 let toastTimer, editBlock;
 const pendingPaneScrolls=new WeakMap();
 const readingInteraction={side:'source',lane:.25,hovered:null,anchor:null,selection:new Set()};
-const readerViewport={zoom:1,fit:true,documentId:null,pan:null,suppressClick:null,imageTimer:null};
+const readerViewport={zoom:1,fit:true,documentId:null,imageTimer:null};
 const MIN_READER_ZOOM=.1, MAX_READER_ZOOM=6, PDF_CSS_SCALE=96/72;
 let layoutRequest = 0;
 const layoutUpdates=TranslationQueue.createCoalescedTask(generateLayout);
@@ -172,7 +172,67 @@ function renderCard(block,index){
   const needsStatus=working || error || !block.translation || block.target!==state.target;
   return `<article class="translation-card ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" id="card-${block.id}" tabindex="0" aria-label="第 ${index+1} 段"><div class="card-meta ${needsStatus?'':'hidden'}"><span class="state ${error?'error':''}">${label}</span></div>${text}${error?`<div class="block-error">${escapeHtml(error)}</div>`:''}<div class="card-actions"><button data-action="translate" data-id="${block.id}">${block.translation?'↻ 重新翻译':'✦ 翻译此段'}</button><button data-action="edit" data-id="${block.id}">编辑译文</button>${block.translation?`<button data-action="copy" data-id="${block.id}">复制</button>`:''}</div></article>`;
 }
-function isBlockSelected(id){return state.selected===id || (state.selected!==null && readingInteraction.selection.has(id));}
+let blockGroupCache={doc:null,layout:null,groups:new Map()};
+function blockGroup(id){
+  if(state.view!=='pdf' || !state.layout)return [id];
+  if(blockGroupCache.doc!==state.doc || blockGroupCache.layout!==state.layout){
+    const groups=new Map();
+    for(const page of state.doc?.pages || []){
+      const ids=new Set(page.blocks.map(block=>block.id));
+      let entries=(state.layout.block_groups || []).filter(group=>group.page===page.number).map(group=>group.blocks);
+      // Older reports already assign all members of one rendered block the
+      // exact same placement. Read these without migrating saved documents.
+      if(!Array.isArray(state.layout.block_groups)){
+        const boxes=new Map();
+        for(const block of page.blocks){
+          const box=state.layout.placements?.[block.id];if(!box)continue;
+          const key=JSON.stringify(box);if(!boxes.has(key))boxes.set(key,[]);
+          boxes.get(key).push(block.id);
+        }
+        entries=[...boxes.values()];
+      }
+      for(const entry of entries){
+        const members=[...new Set(entry.filter(key=>ids.has(key)).flatMap(key=>groups.get(key) || [key]))];
+        for(const key of members)groups.set(key,members);
+      }
+    }
+    blockGroupCache={doc:state.doc,layout:state.layout,groups};
+  }
+  return blockGroupCache.groups.get(id) || [id];
+}
+function isBlockSelected(id){return state.selected!==null && blockGroup(id).some(key=>state.selected===key || readingInteraction.selection.has(key));}
+function sourceBlockBounds(block){return state.view==='pdf'?(state.layout?.source_placements?.[block.id] || block.bbox):block.bbox;}
+function groupHighlightHtml(page,side){
+  const seen=new Set(),html=[];
+  for(const block of page.blocks){
+    const members=blockGroup(block.id),key=members[0];
+    if(members.length<2 || seen.has(key))continue;
+    seen.add(key);
+    const boxes=page.blocks.filter(item=>members.includes(item.id)).map(item=>
+      side==='translation'?(state.layout?.placements?.[item.id] || item.bbox):sourceBlockBounds(item));
+    const x0=Math.min(...boxes.map(box=>box[0])),y0=Math.min(...boxes.map(box=>box[1]));
+    const x1=Math.max(...boxes.map(box=>box[2])),y1=Math.max(...boxes.map(box=>box[3]));
+    html.push(`<span class="block-group-highlight" data-block-group="${escapeHtml(key)}" aria-hidden="true" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></span>`);
+  }
+  return html.join('');
+}
+function refreshGroupHighlights(){
+  // Keep the saved fragment hit areas and editing IDs. Paint one union frame
+  // per typeset group on a separate, non-interactive layer on each PDF page.
+  for(const side of ['source','translation'])for(const element of pageElements($(`#${side}-pane`))){
+    if(!element.classList?.contains('pdf-page'))continue;
+    const page=state.doc?.pages[Number(element.dataset.pageIndex)];if(!page)continue;
+    element.querySelectorAll('.block-group-highlight').forEach(frame=>frame.remove());
+    element.querySelectorAll('.block-overlay').forEach(item=>
+      item.classList.toggle('group-member',blockGroup(item.dataset.block).length>1));
+    if(side==='source')for(const item of element.querySelectorAll('.block-overlay')){
+      const block=page.blocks.find(block=>block.id===item.dataset.block);if(!block)continue;
+      const [x0,y0,x1,y1]=sourceBlockBounds(block);
+      Object.assign(item.style,{left:`${x0*100}%`,top:`${y0*100}%`,width:`${(x1-x0)*100}%`,height:`${(y1-y0)*100}%`});
+    }
+    element.insertAdjacentHTML('beforeend',groupHighlightHtml(page,side));
+  }
+}
 function pageElements(pane){return pane && pane.querySelectorAll?[...pane.querySelectorAll('.reader-page')]:[];}
 function setPaneScroll(pane,top,left=pane.scrollLeft){
   pane.scrollTop=Math.max(0,top);pane.scrollLeft=left;
@@ -233,7 +293,9 @@ function applyViewportGeometry(){
     // padding contributes the same scroll range as the translated PDF pane.
     const stack=pane.querySelector('#pdf-page');
     if(stack)stack.style.width=`${Math.max(available,...state.doc.pages.map(page=>page.width*PDF_CSS_SCALE*readerViewport.zoom))}px`;
-    pane.classList.toggle('can-pan',pane.scrollWidth>pane.clientWidth+1);
+    for(const layer of pane.querySelectorAll('.pdf-text-layer')){
+      layer.style.transform=`scale(${readerViewport.zoom*PDF_CSS_SCALE})`;
+    }
   }
   updateZoomControls();scheduleReaderImages();
 }
@@ -281,40 +343,82 @@ function readerWheel(event,side){
   const delta=Math.max(-100,Math.min(100,event.deltaY*unit));
   if(delta)setReaderZoom(readerViewport.zoom*Math.exp(-delta*.002),{side,clientX:event.clientX,clientY:event.clientY});
 }
-function startReaderPan(event,side){
-  readerViewport.suppressClick=null;
-  const pane=$(`#${side}-pane`);
-  if(event.button!==0 || event.pointerType==='touch' || event.shiftKey || event.ctrlKey || event.metaKey
-      || !event.target.closest('.pdf-page') || pane.scrollWidth<=pane.clientWidth+1)return;
-  readerViewport.pan={side,pane,pointerId:event.pointerId,x:event.clientX,y:event.clientY,
-    left:pane.scrollLeft,top:pane.scrollTop,moved:false};
+function textLayerHtml(page,image){
+  return `<div class="pdf-text-layer" data-text-url="${escapeHtml(image.replace(/\.png$/,'/text'))}" style="width:${page.width}px;height:${page.height}px" aria-label="可选择的页面文字"></div>`;
 }
-function moveReaderPan(event){
-  const pan=readerViewport.pan;if(!pan || event.pointerId!==pan.pointerId)return false;
-  const dx=event.clientX-pan.x,dy=event.clientY-pan.y;
-  if(!pan.moved && Math.hypot(dx,dy)<6)return false;
-  if(!pan.moved){pan.moved=true;pan.pane.setPointerCapture(event.pointerId);pan.pane.classList.add('reader-panning');hoverBlock(null);}
-  event.preventDefault();
-  setPaneScroll(pan.pane,pan.top-dy,pan.left-dx);
-  if($('#sync-scroll').checked){
-    if(Math.abs(dy)>1){pendingPaneScrolls.delete(pan.pane);synchronize(pan.side);}
-    else{
-      const other=$(`#${pan.side==='source'?'translation':'source'}-pane`);
-      const range=pan.pane.scrollWidth-pan.pane.clientWidth;
-      setPaneScroll(other,other.scrollTop,range>0?pan.pane.scrollLeft/range*Math.max(0,other.scrollWidth-other.clientWidth):0);
+async function loadReaderText(page){
+  const layer=page.querySelector('.pdf-text-layer');
+  if(!layer || layer.dataset.loading || layer.dataset.loaded)return;
+  if(Number(layer.dataset.retryAfter || 0)>Date.now())return;
+  layer.dataset.loading='true';
+  try{
+    const data=await api(layer.dataset.textUrl);
+    if(!layer.isConnected)return;
+    const canvas=document.createElement('canvas'),measure=canvas.getContext('2d');
+    const fragment=document.createDocumentFragment();
+    for(const line of data.lines){
+      const row=document.createElement('span');row.className='pdf-text-line';
+      for(const [text,x,y,width,height,a,b,c,d] of line){
+        const glyph=document.createElement('span');glyph.className='pdf-char';glyph.textContent=text;
+        measure.font=`${height}px sans-serif`;
+        const scale=width/Math.max(.001,measure.measureText(text).width);
+        glyph.style.cssText=`left:${x}px;top:${y}px;font-size:${height}px;transform:matrix(${a*scale},${b*scale},${c},${d},0,0)`;
+        row.append(glyph);
+      }
+      row.append(document.createElement('br'));fragment.append(row);
     }
+    layer.replaceChildren(fragment);layer.dataset.loaded='true';
+    layer.removeAttribute('title');
+  }catch(error){
+    if(layer.isConnected){layer.dataset.retryAfter=String(Date.now()+5000);layer.title='文字选择加载失败，滚动页面后重试';toast('页面文字加载失败，滚动后会重试；仍可使用段落视图复制译文。');}
+  }finally{delete layer.dataset.loading;}
+}
+function hasReaderTextSelection(side){
+  const selection=globalThis.getSelection?.();
+  const pane=$(`#${side}-pane`);
+  return Boolean(selection && !selection.isCollapsed &&
+    (pane.contains(selection.anchorNode) || pane.contains(selection.focusNode)));
+}
+function copyReaderText(event,side){
+  const selection=globalThis.getSelection?.();
+  if(!event.clipboardData || !hasReaderTextSelection(side))return;
+  const node=selection.anchorNode,element=node?.nodeType===1?node:node?.parentElement;
+  if(!element?.closest('.pdf-text-layer'))return;
+  // The transparent positioning layer must never paste as invisible rich text.
+  event.clipboardData.setData('text/plain',selection.toString());event.preventDefault();
+}
+function readerOverlayTarget(event,selector){
+  if(!event.target.closest('.pdf-text-layer'))return null;
+  const page=event.target.closest('.pdf-page');
+  return [...page.querySelectorAll(selector)].find(item=>{
+    const box=item.getBoundingClientRect();
+    return event.clientX>=box.left && event.clientX<=box.right && event.clientY>=box.top && event.clientY<=box.bottom;
+  }) || null;
+}
+function readerBlockTarget(event){
+  return event.target.closest('[data-block]') || readerOverlayTarget(event,'.block-overlay');
+}
+function selectReaderWord(event){
+  const glyph=event.target.closest('.pdf-char');if(!glyph)return;
+  const chars=[...glyph.parentElement.querySelectorAll('.pdf-char')];
+  const text=chars.map(item=>item.textContent).join('');
+  const index=chars.slice(0,chars.indexOf(glyph)).reduce((length,item)=>length+item.textContent.length,0);
+  // Absolutely positioned PDF glyphs are separate boxes to the browser's word
+  // hit-testing. Segment their logical line, then select the original text nodes.
+  const segments=typeof Intl.Segmenter==='function'?
+    [...new Intl.Segmenter(undefined,{granularity:'word'}).segment(text)].map(s=>[s.index,s.segment.length]):
+    [...text.matchAll(/[\p{L}\p{N}_]+|[^\s]/gu)].map(s=>[s.index,s[0].length]);
+  const segment=segments.find(([start,length])=>index>=start && index<start+length);
+  if(!segment)return;
+  const [start,length]=segment,end=start+length,range=document.createRange();let offset=0;
+  for(const item of chars){
+    const next=offset+item.textContent.length;
+    if(start>=offset && start<next)range.setStart(item.firstChild,start-offset);
+    if(end>offset && end<=next){range.setEnd(item.firstChild,end-offset);break;}
+    offset=next;
   }
-  pendingPaneScrolls.set(pan.pane,{top:pan.pane.scrollTop,left:pan.pane.scrollLeft});
-  readingInteraction.side=pan.side;return true;
-}
-function endReaderPan(event){
-  const pan=readerViewport.pan;if(!pan || event.pointerId!==pan.pointerId)return;
-  readerViewport.pan=null;pan.pane.classList.remove('reader-panning');
-  if(pan.moved)readerViewport.suppressClick=pan.side;
-  if(pan.pane.hasPointerCapture(event.pointerId))pan.pane.releasePointerCapture(event.pointerId);
-}
-function suppressPanClick(event,side){
-  if(readerViewport.suppressClick===side && event.detail!==0){event.preventDefault();event.stopImmediatePropagation();}
+  const selection=globalThis.getSelection();selection.removeAllRanges();selection.addRange(range);
+  event.preventDefault();
 }
 function scheduleReaderImages(){
   clearTimeout(readerViewport.imageTimer);
@@ -322,6 +426,10 @@ function scheduleReaderImages(){
     const quality=Math.min(6,Math.max(1.7,Math.ceil(readerViewport.zoom*PDF_CSS_SCALE*(window.devicePixelRatio || 1)*2)/2));
     for(const pane of pdfPanes()){
       const bounds=pane.getBoundingClientRect();
+      for(const page of pageElements(pane)){
+        const box=page.getBoundingClientRect();
+        if(box.bottom>=bounds.top && box.top<=bounds.bottom)loadReaderText(page);
+      }
       for(const img of pane.querySelectorAll('.pdf-page img')){
         const box=img.getBoundingClientRect();
         if(box.bottom<bounds.top || box.top>bounds.bottom)continue;
@@ -376,13 +484,15 @@ function renderTranslations(){
     pane.innerHTML=state.doc.pages.map((page,pageIndex)=>{
       const image=valid?`/api/documents/${state.doc.id}/layout/${state.layout.revision}/pages/${page.number}.png`:`/api/documents/${state.doc.id}/pages/${page.number}.png`;
       const pageLinks=valid?layoutLinksForPage(page.number):page.links;
-      return `<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="${image}" alt="第 ${page.number} 页${valid?'译文':'原文占位'}" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=valid?(state.layout.placements[block.id] || block.bbox):block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文，双击编辑" title="单击同步选中，双击编辑译文" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button>`;}).join('')}${linkOverlays(pageLinks)}</div>`;
+      return `<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="${image}" alt="第 ${page.number} 页${valid?'译文':'原文占位'}" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=valid?(state.layout.placements[block.id] || block.bbox):block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文" title="单击同步选中，拖动选择文字" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button><button class="block-edit" data-action="edit" data-id="${block.id}" style="left:${x0*100}%;top:${y0*100}%">编辑译文</button>`;}).join('')}${textLayerHtml(page,image)}${linkOverlays(pageLinks)}</div>`;
     }).join('');
     if(!valid){const notice=document.createElement('div');notice.className='layout-notice';notice.textContent=state.layoutError || (state.layoutBusy?'正在排版，暂显示原文…':state.running?'翻译中，每页译完后自动更新版式':'暂显示原文，请点击菜单中的重新排版');pane.prepend(notice);}
     $$('#translation-pane .pdf-page img').forEach(img=>img.addEventListener('error',()=>toast('译文页面加载失败，请点击重新排版或切换段落视图')));
+    refreshGroupHighlights();applyBlockSelection();hoverBlock(readingInteraction.hovered);
     applyViewportGeometry();restorePanePosition(pane,position,top);setPaneScroll(pane,pane.scrollTop,left);updateControls();alignReaderAfterRender();return;
   }
   pane.innerHTML=state.doc.pages.map((page,pageIndex)=>`<section class="reader-page paragraph-page" data-page-index="${pageIndex}" aria-label="第 ${page.number} 页译文"><div class="page-divider">第 ${page.number} 页</div>${page.blocks.length?page.blocks.map(renderCard).join(''):'<div class="ocr-notice"><strong>这一页没有可提取的文字</strong><br>可能是扫描件、图片页或空白页。第一版暂不包含 OCR，请先用 OCR 工具生成可搜索 PDF 后再导入。其他含文字的页面仍可正常翻译。</div>'}</section>`).join('');
+  refreshGroupHighlights();applyBlockSelection();hoverBlock(readingInteraction.hovered);
   applyViewportGeometry();restorePanePosition(pane,position,top);updateControls();alignReaderAfterRender();
 }
 function renderPage(){
@@ -391,7 +501,7 @@ function renderPage(){
   const stack=$('#pdf-page');
   stack.classList.add('pages-stack');
   stack.style.aspectRatio='';
-  stack.innerHTML=state.doc.pages.map((page,pageIndex)=>`<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="/api/documents/${state.doc.id}/pages/${page.number}.png" alt="${escapeHtml(state.doc.name)} 第 ${page.number} 页" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文" title="第 ${page.number} 页第 ${i+1} 段" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button>`;}).join('')}${linkOverlays(page.links)}</div>`).join('');
+  stack.innerHTML=state.doc.pages.map((page,pageIndex)=>`<div class="pdf-page reader-page" data-page-index="${pageIndex}" style="aspect-ratio:${page.width}/${page.height}"><img ${pageIndex===state.page?'':'loading="lazy" '}decoding="async" src="/api/documents/${state.doc.id}/pages/${page.number}.png" alt="${escapeHtml(state.doc.name)} 第 ${page.number} 页" draggable="false">${page.blocks.map((block,i)=>{const [x0,y0,x1,y1]=block.bbox;return `<button class="block-overlay ${isBlockSelected(block.id)?'selected':''}" data-block="${block.id}" aria-label="定位第 ${page.number} 页第 ${i+1} 段译文" title="第 ${page.number} 页第 ${i+1} 段" style="left:${x0*100}%;top:${y0*100}%;width:${(x1-x0)*100}%;height:${(y1-y0)*100}%"></button>`;}).join('')}${textLayerHtml(page,`/api/documents/${state.doc.id}/pages/${page.number}.png`)}${linkOverlays(page.links)}</div>`).join('');
   $$('#pdf-page img').forEach(img=>img.addEventListener('error',()=>toast('PDF 页面渲染失败，请重新打开文档')));
   renderTranslations();
   scrollToPage(state.page);
@@ -455,6 +565,7 @@ function applyBlockSelection(){
     if(selected)el.setAttribute('aria-current','true');else el.removeAttribute('aria-current');
     if(el.matches('.block-overlay'))el.setAttribute('aria-pressed',String(selected));
   });
+  $$('[data-block-group]').forEach(el=>el.classList.toggle('selected',isBlockSelected(el.dataset.blockGroup)));
 }
 function blockElement(side,id){
   return (side==='source'?$('#source-pane'):$('#translation-pane')).querySelector(`[data-block="${id}"]`);
@@ -485,6 +596,10 @@ function clearBlockSelection(){
   state.selected=null;readingInteraction.anchor=null;readingInteraction.selection.clear();applyBlockSelection();
 }
 function readerClick(event,side){
+  // A drag or native word selection must not scroll either pane or open an editor.
+  if(!event.target.closest('[data-action]') && hasReaderTextSelection(side))return;
+  const link=readerOverlayTarget(event,'.link-overlay');
+  if(link){link.click();return;}
   const jump=event.target.closest('[data-link-page]');
   if(jump){
     const index=Number(jump.dataset.linkPage),fraction=Number(jump.dataset.linkFraction)||0;
@@ -495,14 +610,15 @@ function readerClick(event,side){
     }
     return;
   }
-  const target=event.target.closest('[data-block]');
+  const target=readerBlockTarget(event);
   if(target){selectBlock(target.dataset.block,side,event.shiftKey);return;}
   clearBlockSelection();
 }
 function hoverBlock(id){
-  if(readingInteraction.hovered===id)return;
   readingInteraction.hovered=id;
-  $$('[data-block]').forEach(el=>el.classList.toggle('linked-hover',Boolean(id) && el.dataset.block===id));
+  const members=new Set(id?blockGroup(id):[]);
+  $$('[data-block]').forEach(el=>el.classList.toggle('linked-hover',members.has(el.dataset.block)));
+  $$('[data-block-group]').forEach(el=>el.classList.toggle('linked-hover',members.has(el.dataset.blockGroup)));
 }
 function syncAnchors(index){
   const sourcePane=$('#source-pane'),translationPane=$('#translation-pane');
@@ -618,7 +734,7 @@ async function runTranslation(selectedBlocks){
   }
 }
 function formAgent(){const data=Object.fromEntries(new FormData($('#settings-form')));data.timeout=Number(data.timeout);return data;}
-function modeVisibility(){const custom=$('#agent-mode').value==='custom';$('#custom-fields').classList.toggle('hidden',!custom);$('#url-help').textContent=custom?'填写完整 POST 接口地址；目前支持非流式 JSON 响应。':'自动追加 /chat/completions，也可填写完整端点。';$('#settings-form [name=model]').required=!custom;}
+function modeVisibility(){const custom=$('#agent-mode').value==='custom';$('#custom-fields').classList.toggle('hidden',!custom);$('#url-help').textContent=custom?'填写完整 POST 接口地址；目前支持非流式 JSON 响应。':'自动追加 /chat/completions，也可填写完整端点。';$('#settings-form [name=model]').required=!custom;const reasoning=$('#agent-reasoning');reasoning.disabled=custom;reasoning.title=custom?'自定义接口由请求模板控制':'';$('#reasoning-help').textContent=custom?'自定义接口模式下由请求模板决定是否思考，此处设置不生效。':'仅 OpenAI 兼容接口生效。默认不发送思考参数；各服务商支持范围不同，不支持时请改回服务端默认。';}
 function showSettings(){
   for(const [key,value]of Object.entries(state.agent)){const input=$(`#settings-form [name="${key}"]`);if(input)input.value=value;}
   setKeyVisible(false);
@@ -698,33 +814,30 @@ $('#translation-pane').onclick=async event=>{
   if(button.dataset.action==='edit')showEdit(block);
   if(button.dataset.action==='copy'){try{await navigator.clipboard.writeText(block.translation);toast('已复制译文');}catch{toast('无法访问剪贴板，请手动选择译文复制');}}
 };
-$('#translation-pane').ondblclick=event=>{
-  const item=event.target.closest('.block-overlay');
-  if(item && state.view==='pdf' && !state.running)showEdit(blocks().find(block=>block.id===item.dataset.block));
-};
 for(const side of ['source','translation']){
   const pane=$(`#${side}-pane`);
   pane.addEventListener('wheel',event=>readerWheel(event,side),{passive:false});
-  pane.addEventListener('pointerdown',event=>startReaderPan(event,side));
-  pane.addEventListener('pointerup',endReaderPan);
-  pane.addEventListener('pointercancel',endReaderPan);
-  pane.addEventListener('lostpointercapture',endReaderPan);
-  pane.addEventListener('click',event=>suppressPanClick(event,side),true);
-  pane.addEventListener('dblclick',event=>suppressPanClick(event,side),true);
+  pane.addEventListener('dblclick',selectReaderWord);
+  pane.addEventListener('copy',event=>copyReaderText(event,side));
   pane.addEventListener('scroll',scheduleReaderImages,{passive:true});
   pane.addEventListener('keydown',event=>readerKeydown(event,side));
   pane.addEventListener('pointerover',event=>{
-    if(readerViewport.pan?.moved)return;
-    const item=event.target.closest('[data-block]');
+    const item=readerBlockTarget(event);
     if(item){rememberBlockLane(item.dataset.block);hoverBlock(item.dataset.block);}
   });
   pane.addEventListener('pointermove',event=>{
-    if(moveReaderPan(event))return;
     readingInteraction.side=side;
+    const link=readerOverlayTarget(event,'.link-overlay');
+    for(const item of pane.querySelectorAll('.text-link-hover'))item.classList.remove('text-link-hover');
+    if(link)(link.closest('.link-group') || link).classList.add('text-link-hover');
     const page=event.target.closest('.pdf-page');
     if(page){const box=page.getBoundingClientRect();readingInteraction.lane=(event.clientX-box.left)/(box.width || 1);}
   });
-  pane.addEventListener('pointerout',event=>{if(!event.relatedTarget || !pane.contains(event.relatedTarget))hoverBlock(null);else if(!event.relatedTarget.closest('[data-block]'))hoverBlock(null);});
+  pane.addEventListener('pointerout',event=>{
+    if(!event.relatedTarget || !pane.contains(event.relatedTarget)){
+      hoverBlock(null);for(const item of pane.querySelectorAll('.text-link-hover'))item.classList.remove('text-link-hover');
+    }else if(!event.relatedTarget.closest('[data-block]'))hoverBlock(null);
+  });
 }
 $('#sync-scroll').onchange=()=>{if($('#sync-scroll').checked){pendingPaneScrolls.delete($(`#${readingInteraction.side}-pane`));synchronize(readingInteraction.side);}};
 $('#source-pane').addEventListener('scroll',()=>synchronize('source'),{passive:true});
@@ -733,8 +846,6 @@ let resizeFrame;
 window.addEventListener('resize',()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(()=>{
   refreshReaderViewport();
 });});
-window.addEventListener('pointerup',endReaderPan);
-window.addEventListener('blur',()=>{if(readerViewport.pan)endReaderPan({pointerId:readerViewport.pan.pointerId});});
 window.addEventListener('beforeunload',event=>{if(state.running){event.preventDefault();event.returnValue='';}});
 async function init(){try{const session=await api('/api/session');state.token=session.token;state.batchSupported=session.batch_translation===true;await refreshLibrary();updateAgentDot();}catch(error){toast(`初始化失败：${error.message}`);}}
 init();

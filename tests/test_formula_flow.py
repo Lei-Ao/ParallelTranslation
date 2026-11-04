@@ -62,6 +62,9 @@ class FormulaFlowTests(unittest.TestCase):
                     equation = next(block for block in document["pages"][0]["blocks"] if "q = 1" in block["text"])
                     denominator = next(block for block in document["pages"][0]["blocks"] if block["text"].strip() == "2")
                     self.assertEqual(report["placements"][equation["id"]], report["placements"][denominator["id"]])
+                    self.assertTrue(any(group['page'] == 1
+                                        and {equation['id'], denominator['id']} <= set(group['blocks'])
+                                        for group in report.get('block_groups', [])))
                     self.assertNotIn("q", page.get_text(clip=pymupdf.Rect(70, 230, 260, 270)))
                     self.assertTrue(report["flow"])
 
