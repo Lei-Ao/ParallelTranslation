@@ -221,9 +221,10 @@ docs/                   实现与回归说明
 
 ## Contributors
 
-感谢 XIA-J-B（敬博）贡献论文助手、引用问答、阅读笔记及配套回归。见 [贡献提交](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)。
+感谢 XIA-J-B（敬博）对项目的持续贡献。[GitHub 主页](https://github.com/XIA-J-B)
 
-感谢 [XIA-2005（XIAJINGBO）](https://github.com/XIA-2005) 在 [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1) 中贡献版式与排印修复、阅读器分组高亮和回归测试。这些改动已按现有架构整合，保留图形保护、列表排版、桌面启动和文字选择功能。
+- 版式与排印修复、阅读器分组高亮及相关回归测试。[PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
+- 全文视觉助读、引用问答、多色高亮、本地阅读笔记及配套回归测试。[贡献提交](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
 
 查看全部 [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors)。欢迎通过 Issue 或 Pull Request 参与改进。
 

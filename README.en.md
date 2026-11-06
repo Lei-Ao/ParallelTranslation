@@ -217,9 +217,10 @@ When reporting a problem, include your operating system, Python version, reprodu
 
 ## Contributors
 
-Thanks to XIA-J-B (敬博) for the paper assistant, contextual Q&A, reading notes, and their regression tests. [Contribution](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
+Thanks to XIA-J-B (敬博) for their continued contributions. [GitHub profile](https://github.com/XIA-J-B)
 
-Thanks to [XIA-2005 (XIAJINGBO)](https://github.com/XIA-2005) for the layout and typography fixes, grouped reader highlights, and regression tests in [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1). The changes are integrated with the current architecture, preserving figure protection, list layout, desktop launching, and text selection.
+- Layout and typography fixes, grouped reader highlights, and regression tests. [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
+- Full-paper visual reading, contextual Q&A, colored highlights, local reading notes, and regression tests. [Contribution](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
 
 See all [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors). Issues and pull requests are welcome.
 
