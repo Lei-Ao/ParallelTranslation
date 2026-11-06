@@ -1,0 +1,31 @@
+{
+  "source": "https://github.com/fuxiao13/paper-reading-guide",
+  "source_kind": "upstream ZIP archive",
+  "imported": "2026-11-05",
+  "commit": null,
+  "sha256": {
+    ".gitignore": "cba38ce2ffc0d0227a3263475d916f46edcce8314aeb965b0ca1ca87d2618d0c",
+    "CHANGELOG.md": "c7417387741561eb67e032ffd471d7eeb5ace85e3c82054d651a052f8b3c8f88",
+    "CONTRIBUTING.md": "42e800c1655d254d4a7afd92d2b4d07e0fe191c84f5ac576d8965448dbdcf7a8",
+    "LICENSE": "52054b6a639970f9c7cd0b4dd94afcdd385a42f92d566ae62c79b097adba0a58",
+    "README.md": "76ab055e236927775e35a9884a78c84af4ff1ea7b915d10595ca34f41af0ed60",
+    "REPO_META.md": "5b771aa644ddb2da7d8abe9cfe34bee30cf64e84e02d5054e6f3bbf7482716f2",
+    "requirements.txt": "55f830672fbdc89c8480bf02320d272fd62b34df75c2c46ddd5e771dfba932ae",
+    "SKILL.md": "3df15d4f4c41c621650a19a9e7e70b8d8f8e7d1d0cde34675c9d6b8cba0af623",
+    "agents/openai.yaml": "a840f32440c0c8f65d7381b7aacf6532e771dd8367f21ec438e79c86186be42f",
+    "examples/audio-visual-session.md": "21041e341a4ac93e0eae29f92e77ab953cc553e9fe2c79ac735bb9aa917c9ea0",
+    "examples/boundary-decline.md": "39048f0fe1af84343d5aad28d9039a87d9c281aea21ab7b1420bf146fee80a47",
+    "examples/control-dl-session.md": "10c594fcfcff4bd995ffc611632f9a7fbb49136d71e773aa449239a859a808a6",
+    "examples/README.md": "465a1315b8c0516c49d63e44108926e67b64827b00cb8c9f9834882f6f2b75f1",
+    "references/question-checklist.md": "19a89665db289036f158c5b84444c1332c648d25d0d397b678b9b3f4b9b2fed5",
+    "references/summary-template.md": "000741b63d741083190e2b7a1bbd27b6e2dcc70eb1992116394d166b4eadb07f",
+    "references/three-pass-reading.md": "d454c2f7701112fd17d1459e4a7cef2f63de7e2a06fcc49a911b92d160d9d890",
+    "references/domains/acoustic-imaging.md": "75e4e522259d22588c217156627cb9e16074cef30e86ec0de4df4497a1a429de",
+    "references/domains/audio-visual.md": "320cb2d3241b21e7361806dce4bc32668c7738298950a8534f5c4ddbe3e6a788",
+    "references/domains/control-dl.md": "2b29ae90768ceb1ed337991bd8a186560a7acedda43604b2f0fa0403001f2344",
+    "references/domains/general-dl.md": "335d465b88751dd262c2367edbbc0d05c1138b8893abd4263841cca7f87b5fcc",
+    "references/domains/_index.md": "0a8973d6859c9bfe96392ffe04223d5052f81a40897cedea7d1aa888af334b91",
+    "scripts/extract_outline.py": "22c0a66717e6113b9191fccbd6208aa67b46826e7c80c789da2fb62a373d604c",
+    "scripts/render_page.py": "3c251c50fdf3ea3ec5d2aa517ac0b8efb6b31b71f3f238e7e6bce3589fa363f9"
+  }
+}

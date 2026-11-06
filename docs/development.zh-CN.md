@@ -4,6 +4,8 @@
 
 以下说明当前实现、回归范围与保守回退机制。有限样本通过不代表任意论文都已完成适配。
 
+2026-11-06 的阅读助手整合见 [更新日志](../CHANGELOG.md)。助读使用独立的会话与笔记文件，原文和已排版译文均支持选区引用。[助读协议和数据格式](skill-reading.zh-CN.md)
+
 当前排版缓存版本为 **67**。[PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1) 的行为修复已按现有架构移植，保留图形保护、悬挂列表、正文成组预排版、桌面资源及阅读器文字选择；未采用独立开发线中删除这些模块或测试的改动。旧缓存自动失效，重新打开或重新排版即可使用，无需重新翻译；已保存译文、稳定段落 ID 和原始 PDF 保持不变。
 
 独立图表标签及多列作者卡片由 `pdf_structures.py` 按实际行几何识别。只有源行和译文可逐项对应、单行字形完整、且不碰撞相邻文字或图形时才原位替换，保留中心轴、基线和字号；未改动的标签沿用原字形。含链接或上标且无法可靠重建的已改写标签、复杂流程图及对应不明的组完整保留原文并报告原因。这是安全回退，不代表完成这些区域的翻译适配。居中的作者信息区继续使用原有整体预排版和作者编号上标处理，网格邮箱保留等宽字面。
@@ -29,7 +31,7 @@
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
-node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js tests/test_reader_selection.js
+node --test (Get-ChildItem tests/test_*.js).FullName
 python tests/audit_corpus_layout.py
 ```
 

@@ -80,3 +80,34 @@ class PdfSelectionTests(unittest.TestCase):
                              f"{doc_id}/layout/{'c' * 24}/pages/1/text", "invalid/pages/1/text"]:
                     self.assertEqual(client.get("/api/documents/" + path).status_code, 404)
             self.assertEqual(before, (directory / "document.json").read_bytes())
+
+    def test_assistant_uses_native_glyphs_and_preserves_visual_and_legacy_citation_order(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(service, "DATA", Path(folder)):
+            with pymupdf.open() as pdf:
+                page = pdf.new_page(width=640, height=480)
+                # Paint the lower paragraph first, as can happen in published PDF content streams.
+                page.insert_text((310, 260), "Lower paragraph.")
+                page.insert_text((50, 90), "Upper paragraph.")
+                page.set_rotation(90)
+                doc_id, _ = service.extract_document(pdf.tobytes(), "geometry.pdf")
+            base = f"/api/documents/{doc_id}"
+            with TestClient(service.app) as client:
+                client.headers["X-Local-Token"] = client.get("/api/session").json()["token"]
+                native = client.get(base + "/pages/1/text").json()
+                display = client.get(base + "/reading/text/1?display=true").json()
+                self.assertEqual([[g[:9] for g in line] for line in display["lines"]], native["lines"])
+                spans = client.get(base + "/reading/text/1").json()["runs"]
+                self.assertEqual([r["text"] for r in spans], ["Lower paragraph.", "Upper paragraph."])
+                self.assertEqual(text(display), "Upper paragraph.\nLower paragraph.")
+                for line in display["lines"]:
+                    for glyph in line:
+                        value, run_id, offset = glyph[0], glyph[9], glyph[10]
+                        run = next(item for item in spans if item["id"] == run_id)
+                        self.assertEqual(run["text"][offset:offset + len(value)], value)
+                for ordered in (spans, list(reversed(spans))):
+                    request = dict(page=1, text_version=display["version"], ranges=[
+                        dict(run_id=run["id"], start=0, end=len(run["text"])) for run in ordered
+                    ])
+                    quote = client.post(base + "/reading/citations", json=request)
+                    self.assertEqual(quote.status_code, 200, quote.text)
+                    self.assertEqual(quote.json()["text"], "\n".join(run["text"] for run in ordered))

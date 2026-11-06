@@ -23,8 +23,10 @@
       stylesheet.rel = 'stylesheet';
       stylesheet.href = '/static/style.css';
       document.head.append(stylesheet);
+      const assistantStyle=document.createElement('link');assistantStyle.rel='stylesheet';assistantStyle.href='/static/reading-assistant.css';document.head.append(assistantStyle);
+      for(const href of ['/static/guided-reading.css','/static/vendor/katex/katex.min.css']){const link=document.createElement('link');link.rel='stylesheet';link.href=href;document.head.append(link);}
       document.addEventListener('DOMContentLoaded', () => {
-        for (const asset of ['translation-queue.js', 'app.js']) {
+        for (const asset of ['translation-queue.js', 'app.js', 'reading-assistant.js', 'vendor/marked.js', 'vendor/purify.js', 'vendor/katex/katex.min.js', 'vendor/katex/contrib/auto-render.min.js', 'guided-reading.js', 'reading-selection.js']) {
           const script = document.createElement('script');
           script.async = false;
           script.src = '/static/' + asset;
@@ -56,7 +58,7 @@
       <div class="eyebrow"><span></span> 让理解，不止于翻译</div>
       <h1>原文与新知，<br>在页间相遇<span>。</span></h1>
       <p class="welcome-description">带上你自己的 AI，读懂每一份 PDF。<br>保留原文版面，让上下文、术语和译文彼此对应。</p>
-      <div class="import-options"><label>译为 <select id="home-target" aria-label="导入文档的目标语言"></select></label><button id="home-context" class="button subtle">术语与要求</button></div>
+      <label class="direct-import"><input id="import-direct" type="checkbox"> 导入后直接阅读（不自动翻译）</label><div class="import-options"><label>译为 <select id="home-target" aria-label="导入文档的目标语言"></select></label><button id="home-context" class="button subtle">术语与要求</button></div>
       <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="选择或拖入 PDF">
         <div class="file-icon">PDF<span>↥</span></div><h2>将 PDF 拖到这里</h2><p>或者 <span class="text-link">点击选择文件</span></p><small>支持文字型 PDF · 最大 50 MB / 300 页</small>
       </div>
@@ -65,7 +67,7 @@
         <progress id="open-meter" max="100" value="0" aria-label="已翻译百分比"></progress>
         <p id="open-status" role="status"></p>
         <small>全文翻译并排版完成后，将自动打开对照阅读。</small>
-        <button id="open-action" class="button secondary">继续翻译</button>
+        <button id="read-direct" class="button secondary">直接阅读原文</button><button id="open-action" class="button secondary">继续翻译</button>
       </div>
       <div class="welcome-features"><div><span>01</span><b>原版对照</b><p>原始页面与译文双向定位</p></div><div><span>02</span><b>你的 Agent</b><p>兼容自定义模型 API</p></div><div><span>03</span><b>连贯理解</b><p>携带前后文与专属术语</p></div></div>
       <p class="welcome-note">PDF 保存在本机；翻译时将相关文本发送至你配置的接口。</p>
@@ -75,7 +77,7 @@
         <button id="back-library" class="icon-button" aria-label="返回文档库" title="返回文档库">‹</button>
         <h1 id="document-name"></h1>
         <div class="page-navigation"><button id="previous-page" class="icon-button" aria-label="上一页">‹</button><select id="page-select" aria-label="选择页码"></select><span id="page-total"></span><button id="next-page" class="icon-button" aria-label="下一页">›</button></div>
-        <span id="reading-activity" class="hidden" role="status">翻译中</span>
+        <button id="assistant-toggle" class="button secondary" aria-expanded="false" aria-controls="reading-assistant">论文助手</button><span id="reading-activity" class="hidden" role="status">翻译中</span>
         <details id="reader-menu" class="reader-menu">
           <summary aria-label="阅读与翻译选项" title="阅读与翻译选项">•••</summary>
           <div class="reader-menu-panel">
@@ -86,7 +88,9 @@
             <small class="field-help">适当提高并发可减少等待；8/12 需要服务商允许，遇到限流请调低。顺序模式可参考完整的前文译文。</small>
             <label>每次请求 <select id="translation-batch-size"><option value="1">1 段（兼容）</option><option value="3" selected>3 段（快速）</option><option value="5">5 段</option></select></label>
             <small id="batch-help" class="field-help">合并同页段落，减少请求和重复上下文。</small>
-            <label>译文视图 <select id="translation-view"><option value="pdf">原版式 PDF</option><option value="paragraph">段落（编辑）</option></select></label>
+            <label>译文视图 <select id="translation-view"><option value="pdf">原版式 PDF</option><option value="paragraph">段落</option></select></label>
+            <label class="sync-control"><input id="translation-edit" type="checkbox"> 双击编辑译文</label>
+            <small class="field-help">默认双击选词，单击段落可用“编辑译文”按钮。勾选后双击译文段落可直接编辑。</small>
             <small class="field-help">每页译完后自动更新 PDF；阅读时可连续下滑跨页，后续页面继续翻译。</small>
             <button id="refresh-layout" class="button subtle">重新排版</button>
             <a id="download-pdf" class="button subtle hidden">下载译文 PDF</a>
@@ -111,7 +115,8 @@
           <button id="zoom-fit" class="zoom-fit" title="两侧同步适应页面宽度">适应宽度</button>
         </div></div>
       </div>
-      <div class="panes"><div id="source-pane" class="source-pane" role="region" aria-label="PDF 原文" tabindex="0"><div id="pdf-page" class="pages-stack"></div></div><div id="translation-pane" class="translation-pane" role="region" aria-label="译文" tabindex="0"></div></div>
+      <div class="reading-workspace"><div class="panes"><div id="source-pane" class="source-pane" role="region" aria-label="PDF 原文" tabindex="0"><div id="pdf-page" class="pages-stack"></div></div><div id="translation-pane" class="translation-pane" role="region" aria-label="译文" tabindex="0"></div></div>
+      <aside id="reading-assistant" class="reading-assistant hidden" aria-label="论文阅读助手"><div class="assistant-heading"><strong>论文助手</strong><button id="assistant-close" class="icon-button" aria-label="收起论文助手">×</button></div><nav id="assistant-tabs" aria-label="助手功能"><button data-assistant-tab="outline">目录</button><button data-assistant-tab="overview">概览</button><button data-assistant-tab="detail">精读</button><button data-assistant-tab="chat">问答</button></nav><p class="assistant-disclaimer">AI 功能按需调用当前模型并缓存。仅分析可提取文字，图像及缺失公式不作视觉识别。</p><p id="assistant-status" role="status" aria-live="polite"></p><div id="assistant-content"></div></aside></div>
       <button id="exit-focus" class="button focus-exit" aria-label="退出专注阅读">显示工具栏 <kbd>Esc</kbd></button>
     </section>
   </main>

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "modes": {
+    "quickread": {"file": "quickread.md", "fields": ["研究问题", "主要做法", "核心结论", "建议阅读路线"]},
+    "guided": {"file": "guided.md", "fields": ["本节在做什么", "关键内容", "与全文的联系"]},
+    "detail": {"file": "detail.md", "fields": ["方法", "证据", "局限"]},
+    "followup": {"file": "followup.md", "fields": ["回答", "依据与边界"]},
+    "citation": {"file": "citation.md", "fields": ["回答", "依据与边界"]}
+  }
+}
