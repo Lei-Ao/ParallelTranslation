@@ -39,7 +39,7 @@
 
 ### 2026-11-06 论文助手、引用问答与本地笔记
 
-整合 XIA-J-B（敬博）贡献的论文阅读功能，新增以下能力。
+整合 XIA-J-B（夏少）贡献的论文阅读功能，新增以下能力。
 
 - 文档库及导入流程支持「直接阅读」，可先浏览原文，再按需翻译。
 - 「文章速读」结合完整原文、章节目录和全部页面图分析论文，「逐节陪读」按章节讲解。
@@ -221,7 +221,7 @@ docs/                   实现与回归说明
 
 ## Contributors
 
-感谢 XIA-J-B（敬博）对项目的持续贡献。[GitHub 主页](https://github.com/XIA-J-B)
+感谢 XIA-J-B（夏少）对项目的持续贡献。[GitHub 主页](https://github.com/XIA-J-B)
 
 - 版式与排印修复、阅读器分组高亮及相关回归测试。[PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
 - 全文视觉助读、引用问答、多色高亮、本地阅读笔记及配套回归测试。[贡献提交](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)

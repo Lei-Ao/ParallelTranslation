@@ -39,7 +39,7 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 
 ### 2026-11-06 Paper assistant, contextual Q&A, and local notes
 
-Integrated the paper-reading features contributed by XIA-J-B (敬博).
+Integrated the paper-reading features contributed by XIA-J-B (夏少).
 
 - Open papers directly from the library or during import, then translate as needed.
 - Analyze the complete text, outline, and all page images with full-paper visual reading, or work through individual sections with guided reading.
@@ -217,7 +217,7 @@ When reporting a problem, include your operating system, Python version, reprodu
 
 ## Contributors
 
-Thanks to XIA-J-B (敬博) for their continued contributions. [GitHub profile](https://github.com/XIA-J-B)
+Thanks to XIA-J-B (夏少) for their continued contributions. [GitHub profile](https://github.com/XIA-J-B)
 
 - Layout and typography fixes, grouped reader highlights, and regression tests. [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
 - Full-paper visual reading, contextual Q&A, colored highlights, local reading notes, and regression tests. [Contribution](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
