@@ -33,9 +33,25 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 - **Editing and export**: edit or retranslate individual paragraphs, export bilingual Markdown, and automatically save a standalone translated PDF.
 - **Paper assistant**: open the original directly, read section by section, ask about selections in either language, and save answers with their citations as local notes.
 
-**November 6, 2026 update.** Integrated XIA-J-B’s full-paper visual reading, contextual Q&A, colored highlights, and Markdown notes. [Changelog](CHANGELOG.md)
-
 > Layout decisions use document geometry, typography, and structure. Complex regions may retain the complete original with an explanation. Successful translation of every region in every PDF is not guaranteed.
+
+## Changelog
+
+### 2026-11-06 Paper assistant, contextual Q&A, and local notes
+
+Integrated the paper-reading features contributed by XIA-J-B (敬博).
+
+- Open papers directly from the library or during import, then translate as needed.
+- Analyze the complete text, outline, and all page images with full-paper visual reading, or work through individual sections with guided reading.
+- Ask about source or translated selections, combine quotations across paragraphs and pages, inspect figure regions, follow citations, and save colored highlights.
+- Save answers as independent local notes with their questions, formulas, and sources, and export them as Markdown.
+- Switch between source, bilingual, and translation views, use responsive reading panels, and optionally enable double-click editing.
+
+Validation covered 318 Python cases, 78 JavaScript cases, and isolated browser checks, plus 146 source pages from 10 papers and 10 saved translation pages. Some character encodings and context mappings still require fallback. Real-model understanding and citation quality need further evaluation. Usage, provenance, and validation details are documented in the [changelog](CHANGELOG.md) and [Chinese reading guide](docs/skill-reading.zh-CN.md).
+
+### 2026-11-04 Layout and typography fixes
+
+Integrated PR #1 with fixes for figure labels, author grids, heading weight and italics, bold caption titles, equation labels, and grouped reader highlights. The layout cache version advanced to 67. [Development notes in Chinese](docs/development.zh-CN.md)
 
 ## Quick start
 
