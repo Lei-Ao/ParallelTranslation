@@ -12,6 +12,7 @@ import unicodedata
 import copy
 import xml.etree.ElementTree as ET
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 import pymupdf
@@ -25,12 +26,14 @@ from pdf_text import normalize_drop_caps
 from pdf_lists import ListLayoutError, source_list_structure, translated_list_layout, BULLETS
 from pdf_figures import figure_regions, is_figure_caption
 from pdf_structures import anchored_lines, anchored_overlay, grid_members
+from pdf_continuation import continuation_map
 
 ET.register_namespace("", "http://www.w3.org/2000/svg")
 ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
 
 PDF_LOCK = threading.RLock()
-ENGINE_VERSION = 67
+ENGINE_VERSION = 76
+SOURCE_SCAN_VERSION = 1
 MATH_FONT = re.compile(r"math|symbol|cmmi|cmsy|cmex|msam|msbm|stmary|rsfs", re.I)
 JUSTIFY_MAX_SLACK = 1.2
 WIDE_SCRIPT = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
@@ -69,6 +72,7 @@ def overlap(a, b):
     return max(0, min(a.x1, b.x1) - max(a.x0, b.x0)) * max(0, min(a.y1, b.y1) - max(a.y0, b.y0))
 
 
+@lru_cache(maxsize=4096)
 def is_prose(text):
     # Inline symbols and subscripts do not make an entire paragraph an equation.
     return ((len(re.findall(r"\b[A-Za-z]{2,}\b", text)) >= 8
@@ -247,7 +251,7 @@ def inline_math_runs(native, rect, combine=False):
 def _normalized_page_chars(page):
     chars, normalized, mapping = [], [], []
     line_number = 0
-    for block in page.get_text("rawdict")["blocks"]:
+    for block in page.get_text("rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"]:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
@@ -350,20 +354,37 @@ def translated_math_runs(runs, translation):
     return result
 
 
-def inline_math_assets(page, runs, translation=None):
-    """Extract only the original glyph paths, without neighboring page ink."""
-    svg = ET.fromstring(page.get_svg_image(text_as_path=True))
+def _svg_math_index(svg_root):
     ns = "{http://www.w3.org/2000/svg}"
-    href = "{http://www.w3.org/1999/xlink}href"
-    definitions = {node.get("id"): node for node in svg.iter() if node.get("id")}
+    definitions = {node.get("id"): node for node in svg_root.iter() if node.get("id")}
     uses = []
-    for node in svg.iter(ns + "use"):
+    for node in svg_root.iter(ns + "use"):
         values = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", node.get("transform", ""))
         if len(values) == 6:
             uses.append((node, float(values[4]), float(values[5])))
+    return definitions, uses
+
+
+def inline_math_assets(page, runs, translation=None, *, svg_root=None, drawings=None,
+                       definitions=None, uses=None):
+    """Extract only the original glyph paths, without neighboring page ink.
+
+    `svg_root`, `definitions`, `uses` and `drawings` may be supplied by a
+    caller that already vectorized this page; they depend only on the page,
+    not on the run.
+    """
+    svg = svg_root if svg_root is not None else ET.fromstring(page.get_svg_image(text_as_path=True))
+    ns = "{http://www.w3.org/2000/svg}"
+    href = "{http://www.w3.org/1999/xlink}href"
+    if definitions is None or uses is None:
+        parsed_definitions, parsed_uses = _svg_math_index(svg)
+        definitions = parsed_definitions if definitions is None else definitions
+        uses = parsed_uses if uses is None else uses
     assets = []
     if translation is not None:
         runs = translated_math_runs(runs, translation)
+    if drawings is None:
+        drawings = page.get_drawings()
     for run in runs:
         selected = []
         for char in run["chars"]:
@@ -385,8 +406,8 @@ def inline_math_assets(page, runs, translation=None):
             if key in definitions:
                 defs.append(copy.deepcopy(definitions[key]))
         root.extend(copy.deepcopy(node) for node in selected)
-        owned_strokes = inline_math_graphics(page.get_drawings(), [run])
-        for drawing in page.get_drawings():
+        owned_strokes = inline_math_graphics(drawings, [run])
+        for drawing in drawings:
             if tuple(drawing["rect"]) in owned_strokes:
                 color = drawing.get("color") or (0, 0, 0)
                 for _, first, last in drawing["items"]:
@@ -413,7 +434,148 @@ def inline_math_assets(page, runs, translation=None):
     return assets
 
 
-def formula_glyph_bounds(page, spans, raw_native):
+def inline_formula_cluster(page, block, rect, native, style, translation, *, svg_root,
+                           drawings, definitions, uses):
+    """Treat a 2-D inline formula as one glyph cluster, not linear text.
+
+    Extractors flatten a superscript fraction into separate pieces: the
+    numerator becomes its own math-only text block, the bar is a short vector
+    stroke, and only the base and denominator remain in the paragraph text.
+    Re-typesetting that paragraph would erase the original two-dimensional
+    formula and print ``e delta`` instead.  When a foreign math-only piece sits
+    next to one of this block's own math runs, rebuild the whole cluster from
+    its original glyph paths and match it in the translation by the linear
+    characters the block actually owns.  Returns None when there is no such
+    cluster; returns ``{"reason": ...}`` when it cannot be reproduced safely.
+    """
+    own, foreign = [], []
+    for item in native:
+        if item.get("type", 0) != 0:
+            continue
+        if overlap(rect, pymupdf.Rect(item["bbox"])) <= .5:
+            continue
+
+        def span_text(span):
+            return span.get("text") or "".join(char.get("c", "") for char in span.get("chars", []))
+
+        # A block that carries running prose owns its glyphs.  A math-only
+        # block the extractor split off (a numerator or a script) is foreign,
+        # even though inspect_block's union box contains it.  Comparing text
+        # instead would fail on line-break hyphenation and phi variants.
+        prose = any(not _inline_math_font(span.get("font", ""), span_text(span))
+                    and re.search(r"[A-Za-z]{2,}|[\u3400-\u9fff]{2,}", span_text(span))
+                    for line in item.get("lines", []) for span in line.get("spans", []))
+        for line in item.get("lines", []):
+            for span in line.get("spans", []):
+                font = span.get("font", "")
+                math = _inline_math_font(font, span_text(span))
+                for char in span.get("chars", []):
+                    value = char.get("c", "")
+                    if not value.strip() or not char.get("origin"):
+                        continue
+                    box = pymupdf.Rect(char["bbox"])
+                    if not rect.contains((box.tl + box.br) * .5):
+                        continue
+                    glyph = {**char, "font": font, "size": float(span.get("size", 0) or 0)}
+                    if prose:
+                        own.append((glyph, font))
+                    elif math:
+                        foreign.append(glyph)
+    if not foreign or not own:
+        return None
+    # Group the foreign math glyphs into connected pieces (one numerator /
+    # script), so a stray dash cannot be mistaken for the whole formula.
+    foreign_groups = []
+    for char in foreign:
+        box = pymupdf.Rect(char["bbox"])
+        placed = False
+        for group in foreign_groups:
+            other = group[-1]
+            other_box = pymupdf.Rect(other["bbox"])
+            horizontal = max(box.x0, other_box.x0) - min(box.x1, other_box.x1)
+            vertical = max(box.y0, other_box.y0) - min(box.y1, other_box.y1)
+            if horizontal <= 2 and vertical <= 2:
+                group.append(char)
+                placed = True
+                break
+        if not placed:
+            foreign_groups.append([char])
+    size = float(style.get("size", 10) or 10)
+    for near in foreign_groups:
+        core = pymupdf.Rect(near[0]["bbox"])
+        for char in near:
+            core |= pymupdf.Rect(char["bbox"])
+        # The base glyph is the block's own math character immediately to the
+        # left of the split-off piece on the same visual line.
+        base = [(char, font) for char, font in own
+                if _inline_math_font(font, char.get("c", ""))
+                and core.x0 - pymupdf.Rect(char["bbox"]).x1 <= size * 1.5
+                and pymupdf.Rect(char["bbox"]).x0 <= core.x0
+                and min(pymupdf.Rect(char["bbox"]).y1, core.y1)
+                - max(pymupdf.Rect(char["bbox"]).y0, core.y0) > 0]
+        if not base:
+            continue
+        base_char = max(base, key=lambda item: pymupdf.Rect(item[0]["bbox"]).x1)[0]
+        baseline = pymupdf.Rect(base_char["bbox"]).y1
+        start = pymupdf.Rect(base_char["bbox"]).x0
+        end = core.x1 + size * .5
+        # The base and any denominator extracted into the paragraph text belong
+        # to the same formula; collect this block's own math characters between
+        # them on the base line.
+        inside = [(char, font) for char, font in own
+                  if _inline_math_font(font, char.get("c", ""))
+                  and start - .5 <= pymupdf.Rect(char["bbox"]).x0 <= end
+                  and abs(pymupdf.Rect(char["bbox"]).y1 - baseline) <= size * .55]
+        if not inside:
+            continue
+        ordered = sorted((char for char, _ in inside),
+                         key=lambda char: pymupdf.Rect(char["bbox"]).x0)
+        cluster = pymupdf.Rect(core)
+        for char in ordered:
+            cluster |= pymupdf.Rect(char["bbox"])
+        strokes = []
+        for drawing in drawings:
+            box = pymupdf.Rect(drawing["rect"])
+            if (drawing.get("type") == "s" and drawing.get("items")
+                    and all(item[0] == "l" for item in drawing["items"])
+                    and box.height <= size * .6 and box.width > size * .5
+                    and (cluster + (-1, -1, 1, 1)).contains(box)):
+                strokes.append(box)
+        # Only a real two-dimensional structure needs the cluster path: a
+        # fraction bar, or a multi-glyph script such as a numerator.  A lone
+        # superscript letter is ordinary linear math that the run path already
+        # preserves, and treating it as a cluster would hold back whole
+        # paragraphs whose short superscripts occur more than once.
+        if not strokes and len(near) < 2:
+            continue
+        if not strokes and not any(abs(pymupdf.Rect(char["bbox"]).y1 - baseline) > size * .2
+                                   for char in near):
+            continue
+        match = normalized_inline_math("".join(char["c"] for char in ordered))
+        if not match or len(match) <= 1 or len(match) > 20:
+            continue
+        translation_norm = normalized_inline_math(translation)
+        if translation_norm.count(match) != 1:
+            return {"reason": "行内公式由多个文本块组成，无法在译文中唯一复刻，保留原文；请编辑译文后重新排版"}
+        for box in strokes:
+            cluster |= box
+        cluster = (cluster + (-.3, -.3, .3, .3)) & page.rect
+        all_chars = ordered + near
+        asset_run = {"text": "".join(char["c"] for char in all_chars),
+                     "normalized": match, "match_normalized": match,
+                     "rect": cluster, "chars": all_chars, "primary": True}
+        assets = inline_math_assets(page, [asset_run], None, svg_root=svg_root,
+                                    drawings=drawings, definitions=definitions, uses=uses)
+        if not assets:
+            return {"reason": "行内公式由多个文本块组成，无法提取原始字形，保留原文；请编辑译文后重新排版"}
+        asset = assets[0]
+        asset["match_normalized"] = match
+        return {"asset": asset, "rect": tuple(cluster)}
+    return None
+
+
+def formula_glyph_bounds(page, spans, raw_native, *, svg_root=None, drawings=None,
+                         definitions=None, uses=None):
     """Measure actual formula strokes when font frames touch adjacent prose."""
     boxes = {tuple(span["bbox"]) for span in spans}
     chars = [{**char, "size": span["size"], "font": span["font"]}
@@ -423,7 +585,8 @@ def formula_glyph_bounds(page, spans, raw_native):
     run = _inline_math_run(chars, True)
     if run is None:
         return None
-    assets = inline_math_assets(page, [run])
+    assets = inline_math_assets(page, [run], svg_root=svg_root, drawings=drawings,
+                                definitions=definitions, uses=uses)
     if not assets:
         return None
     x, y, width, height = map(float, ET.fromstring(assets[0]["svg"]).get("viewBox").split())
@@ -543,7 +706,79 @@ def _link_text_items(native, box=None):
     return items
 
 
-def block_link_hints(page_links, rect, native, raw_native=None):
+class _LinkItemIndex:
+    """Characters/spans of one page, bucketed by baseline for fast clipping."""
+
+    BAND = 32.0
+
+    def __init__(self, items):
+        self.items = items
+        self.buckets = {}
+        max_height = 1.0
+        for item in items:
+            box = item[4]
+            max_height = max(max_height, box.height)
+            self.buckets.setdefault(int(box.y0 // self.BAND), []).append(item)
+        self.max_height = max_height
+
+    def candidates(self, box):
+        start = int((box.y0 - self.max_height) // self.BAND)
+        end = int(box.y1 // self.BAND)
+        for band in range(start, end + 1):
+            yield from self.buckets.get(band, ())
+
+
+def _link_char_items(native):
+    """Extract link anchor candidates once per page.
+
+    Building a fresh character list for every block and every annotation was
+    the dominant layout cost on link-heavy pages. The boxes are kept with the
+    items so callers only filter them, never re-walk the text dictionary.
+    """
+    items = []
+    for item in native:
+        if item.get("type", 0) != 0:
+            continue
+        for line in item.get("lines", []):
+            for span in line.get("spans", []):
+                color = span.get("color", 0)
+                chars = span.get("chars")
+                if chars:
+                    for char in chars:
+                        value = char.get("c", "")
+                        if not value.strip():
+                            continue
+                        box = pymupdf.Rect(char["bbox"])
+                        items.append((round(box.y0, 1), box.x0, value, color, box))
+                else:
+                    text = span.get("text", "")
+                    if not text.strip():
+                        continue
+                    box = pymupdf.Rect(span["bbox"])
+                    items.append((round(box.y0, 1), box.x0, text, color, box))
+    items.sort(key=lambda item: (item[0], item[1]))
+    return _LinkItemIndex(items)
+
+
+def _items_in_box(items, box=None):
+    if box is None:
+        return [(y, x, text, color) for y, x, text, color, _ in items.items]
+    found = []
+    for y, x, text, color, char_box in items.candidates(box):
+        if (char_box.x1 < box.x0 or char_box.x0 > box.x1
+                or char_box.y1 < box.y0 or char_box.y0 > box.y1):
+            continue
+        if (box.x0 <= char_box.x0 and char_box.x1 <= box.x1
+                and box.y0 <= char_box.y0 and char_box.y1 <= box.y1):
+            found.append((y, x, text, color))
+        elif overlap(char_box, box) >= char_box.get_area() * .5:
+            found.append((y, x, text, color))
+        elif box.contains((char_box.tl + char_box.br) * .5):
+            found.append((y, x, text, color))
+    return found
+
+
+def block_link_hints(page_links, rect, native, raw_native=None, page_items=None):
     """Link annotations inside one block, with the source text they cover.
 
     That text becomes the search needle which re-anchors the link onto the
@@ -558,15 +793,24 @@ def block_link_hints(page_links, rect, native, raw_native=None):
     (publishers style links black, blue or gray); it lets the translation keep
     the original appearance instead of the HTML default link blue.
     """
-    source = raw_native if raw_native is not None else native
-    block_parts = _link_text_items(source, rect)
-    block_text = normalized_inline_math(" ".join(text for _, _, text, _ in block_parts))
-    hints = []
+    if not page_links:
+        # Most pages have no link annotations at all. Building a character
+        # index for every block was pure waste and dominated layout time.
+        return []
+    relevant = []
     for link in page_links:
         box = pymupdf.Rect(link["rect"])
-        if overlap(box, rect) < box.get_area() * .5:
-            continue
-        parts = _link_text_items(source, box)
+        if overlap(box, rect) >= box.get_area() * .5:
+            relevant.append((link, box))
+    if not relevant:
+        return []
+    items = page_items if page_items is not None else _link_char_items(
+        raw_native if raw_native is not None else native)
+    block_parts = _items_in_box(items, rect)
+    block_text = normalized_inline_math(" ".join(text for _, _, text, _ in block_parts))
+    hints = []
+    for link, box in relevant:
+        parts = _items_in_box(items, box)
         needle = link_needle(" ".join(text for _, _, text, _ in parts))
         if not link_needle_usable(needle):
             continue
@@ -827,12 +1071,17 @@ def inline_bold_hints(style, text, emphasis_flag=16):
     return hints
 
 
-def _marker_matches(text, marker):
-    """Find list markers only; decimals ("1.5") and equation labels ("(3).") do not count."""
+@lru_cache(maxsize=256)
+def _marker_pattern(marker):
     variants = {marker, marker.replace(")", "）"), marker.replace("(", "（"),
                 marker.replace("(", "（").replace(")", "）")}
     alternatives = "|".join(re.escape(value) for value in sorted(variants, key=len, reverse=True))
-    pattern = re.compile(r"(?<![\w])(" + alternatives + r")")
+    return re.compile(r"(?<![\w])(" + alternatives + r")")
+
+
+def _marker_matches(text, marker):
+    """Find list markers only; decimals ("1.5") and equation labels ("(3).") do not count."""
+    pattern = _marker_pattern(marker)
     matches = []
     for match in pattern.finditer(text):
         before = text[:match.start()]
@@ -1032,8 +1281,8 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
     # Match complete expressions before their individual variables. Translation
     # can change the order of clauses, so source order must not consume a prefix
     # of a longer expression or prevent a later variable from being preserved.
-    for asset in sorted(assets, key=lambda item: -len(item["normalized"])):
-        needle = asset["normalized"]
+    for asset in sorted(assets, key=lambda item: -len(item.get("match_normalized") or item["normalized"])):
+        needle = asset.get("match_normalized") or asset["normalized"]
         index = text.find(needle)
         while index >= 0:
             before = text[index - 1:index]
@@ -1232,6 +1481,11 @@ _COMPAT_FALLBACK_RANGES = ((0x00B2, 0x00B3), (0x00B9, 0x00B9), (0x1D400, 0x1D7FF
                            (0x2160, 0x2188), (0x2460, 0x24FF), (0xFB00, 0xFB4F))
 
 
+def _char_counter(value):
+    return Counter(char for char in unicodedata.normalize("NFKC", value)
+                   if not char.isspace() and char != "\u00ad")
+
+
 def printable_text(value):
     """Use compatibility equivalents only for glyphs the CJK fallback often lacks.
 
@@ -1276,19 +1530,126 @@ def span_strip(span):
                         box.x1 - min(.05, box.width * .1), box.y1 - inset)
 
 
+class _PageSpanIndex:
+    """Page spans bucketed by baseline, for cheap foreign-text checks."""
+
+    BAND = 32.0
+
+    def __init__(self, spans):
+        self.buckets = {}
+        max_height = 1.0
+        for bbox, identity in spans:
+            max_height = max(max_height, bbox[3] - bbox[1])
+            self.buckets.setdefault(int(bbox[1] // self.BAND), []).append((bbox, identity))
+        self.max_height = max_height
+
+    def candidates(self, box):
+        start = int((box.y0 - self.max_height) // self.BAND)
+        end = int(box.y1 // self.BAND)
+        for band in range(start, end + 1):
+            yield from self.buckets.get(band, ())
+
+
+def _box_hits_foreign(box, page_spans, owned):
+    """Whether a proposed redaction rectangle would touch another block's text."""
+    if page_spans is None:
+        return False
+    for bbox, identity in page_spans.candidates(box):
+        if identity in owned:
+            continue
+        if (bbox[2] <= box.x0 or bbox[0] >= box.x1
+                or bbox[3] <= box.y0 or bbox[1] >= box.y1):
+            continue
+        return True
+    return False
+
+
+def merged_line_boxes(style, page_spans=None):
+    """One redaction per source line when the line contains only this block.
+
+    PyMuPDF walks the page annotation list on every add_redact_annot call, so
+    one rectangle per extraction span was quadratic. A line union is safe only
+    if it does not touch text owned by another block; author grids, tables and
+    multi-column lines fall back to the conservative span-level merge.
+    """
+    boxes = []
+    # `style["lines"]` can contain neighbouring author/caption lines while
+    # `style["spans"]` is the filtered set owned by this block. Only spans that
+    # survive that filter may be redacted.
+    allowed = {id(span) for span in style.get("spans", [])}
+    covered = set()
+    for line in style.get("lines", []):
+        spans = [span for span in line.get("spans", [])
+                 if id(span) in allowed and (span.get("text") or "").strip()]
+        if not spans:
+            continue
+        covered.update(id(span) for span in spans)
+        strips = [span_strip(span) for span in spans]
+        strips = [box for box in strips if not box.is_empty and box.is_valid and box.get_area() > 0]
+        if not strips:
+            continue
+        union = strips[0]
+        for other in strips[1:]:
+            union = union | other
+        if page_spans is not None and _box_hits_foreign(union, page_spans, allowed):
+            boxes.extend(merged_span_boxes(spans))
+        else:
+            boxes.append(union)
+    # Combined cover/author styles can own spans outside any one line record;
+    # they still have to be erased exactly as the per-span loop did.
+    remaining = [span for span in style.get("spans", []) if id(span) not in covered]
+    if remaining:
+        boxes.extend(merged_span_boxes(remaining))
+    return boxes
+
+
+def merged_span_boxes(spans):
+    """Merge adjacent runs on one visual line into one redaction rectangle.
+
+    PyMuPDF scans its annotation list for every add_redact_annot call, so one
+    rectangle per source span was quadratic on dense pages. A run of spans in
+    one block is safe to cover as a whole; large gaps (columns, tab stops) stay
+    separate so unrelated text is never erased.
+    """
+    boxes = []
+    for span in spans:
+        if not (span.get("text") or "").strip():
+            continue
+        box = span_strip(span)
+        if box.is_empty or not box.is_valid or box.get_area() <= 0:
+            continue
+        boxes.append(box)
+    boxes.sort(key=lambda box: (round(box.y0, 1), box.x0))
+    merged = []
+    for box in boxes:
+        if merged:
+            last = merged[-1]
+            vertical = min(last.y1, box.y1) - max(last.y0, box.y0)
+            height = min(last.height, box.height)
+            if (height > 0 and vertical >= height * .5
+                    and box.x0 - last.x1 <= max(1.5, height * .3)):
+                # PyMuPDF Rect.__ior__ returns a new rectangle instead of
+                # mutating the one held by the list.
+                merged[-1] = last | box
+                continue
+        merged.append(pymupdf.Rect(box))
+    return merged
+
+
 _FLOW_CAPTION = re.compile(r"^\s*(?:fig(?:ure)?|table|algorithm)\b", re.I)
 _FLOW_LIST = re.compile(r"^\s*(?:[•·●▪◆]|\(?\d{1,2}[.)]|[A-Za-z][.)])\s+")
 
 
-def _flow_lines(native, rect):
+def _native_line_boxes(native):
+    return [(line, pymupdf.Rect(line["bbox"])) for block in native
+            if block.get("type", 0) == 0 for line in block.get("lines", [])]
+
+
+def _flow_lines(native, rect, line_boxes=None):
     lines = []
-    for block in native:
-        if block.get("type", 0) != 0:
-            continue
-        for line in block.get("lines", []):
-            box = pymupdf.Rect(line["bbox"])
-            if rect.contains((box.tl + box.br) * .5):
-                lines.append(line)
+    for line, box in (line_boxes if line_boxes is not None else _native_line_boxes(native)):
+        if rect.contains((box.tl + box.br) * .5):
+            lines.append(line)
     return sorted(lines, key=lambda line: (round(line["bbox"][1], 2), line["bbox"][0]))
 
 
@@ -1369,7 +1730,8 @@ def _flow_join(left, right):
     return left + " " + right
 
 
-def merge_continued_paragraphs(page, blocks, native, target, cover_page=False):
+def merge_continued_paragraphs(page, blocks, native, target, cover_page=False, graphics=None,
+                               line_boxes=None):
     """Flow a paragraph that extraction split into adjacent text blocks.
 
     Extractors often cut a paragraph after a line ending in inline math or a
@@ -1386,18 +1748,21 @@ def merge_continued_paragraphs(page, blocks, native, target, cover_page=False):
     if count < 2:
         return blocks
     rects = [source_rect(page, block) for block in blocks]
-    lines = [_flow_lines(native, rect) for rect in rects]
+    if line_boxes is None:
+        line_boxes = _native_line_boxes(native)
+    lines = [_flow_lines(native, rect, line_boxes) for rect in rects]
     sizes = [_flow_size(item) for item in lines]
     body_size = page_body_size(native) if cover_page else 0
-    rotation = page.rotation
-    if rotation:
-        page.set_rotation(0)
-    try:
-        graphics = [pymupdf.Rect(image["bbox"]) for image in page.get_image_info()]
-        graphics += [pymupdf.Rect(drawing["rect"]) for drawing in visible_drawings(page)]
-    finally:
+    if graphics is None:
+        rotation = page.rotation
         if rotation:
-            page.set_rotation(rotation)
+            page.set_rotation(0)
+        try:
+            graphics = [pymupdf.Rect(image["bbox"]) for image in page.get_image_info()]
+            graphics += [pymupdf.Rect(drawing["rect"]) for drawing in visible_drawings(page)]
+        finally:
+            if rotation:
+                page.set_rotation(rotation)
     parents = list(range(count))
 
     def root(index):
@@ -1468,11 +1833,8 @@ def merge_continued_paragraphs(page, blocks, native, target, cover_page=False):
         # The joined blocks' own lines share the band through font ascent and
         # descent padding; only a line belonging to neither block blocks the join.
         own = [pymupdf.Rect(rects[upper]), pymupdf.Rect(rects[lower])]
-        return not any(overlap(band, pymupdf.Rect(line["bbox"])) > .1
-                       for block in native if block.get("type", 0) == 0
-                       for line in block.get("lines", [])
-                       if not any(overlap(pymupdf.Rect(line["bbox"]), box)
-                                  >= pymupdf.Rect(line["bbox"]).get_area() * .5 for box in own))
+        return not any(overlap(band, box) > .1 for _, box in line_boxes
+                       if not any(overlap(box, own_box) >= box.get_area() * .5 for own_box in own))
 
     def heading_joinable(upper, lower):
         """Join the wrapped lines of one numbered heading split across blocks.
@@ -1624,7 +1986,7 @@ def merge_continued_paragraphs(page, blocks, native, target, cover_page=False):
     return merged
 
 
-def layout_blocks(page, saved_page, native, target, cover_page=False):
+def layout_blocks(page, saved_page, native, target, cover_page=False, graphics=None):
     """Join overlapping extraction fragments of prose with inline mathematics.
 
     Source translations and IDs stay intact; this grouping is only for typesetting.
@@ -1633,6 +1995,7 @@ def layout_blocks(page, saved_page, native, target, cover_page=False):
     joins it as well, so the two never print on the same lines.
     """
     blocks = []
+    line_boxes = _native_line_boxes(native)
     for original in saved_page["blocks"]:
         block = original
         if block.get("drop_cap"):
@@ -1643,7 +2006,7 @@ def layout_blocks(page, saved_page, native, target, cover_page=False):
         prefix = re.match(r"^\s*[,;:.，；：。]*\s*\((\d+)\)\s*\n", block['text'])
         if prefix and is_prose(block['text'][prefix.end():]):
             rect = source_rect(page, block)
-            lines = _flow_lines(native, rect)
+            lines = _flow_lines(native, rect, line_boxes)
             label_lines = [line for line in lines
                            if re.fullmatch(r'\s*\(' + re.escape(prefix[1]) + r'\)\s*',
                                            ''.join(s['text'] for s in line['spans']))]
@@ -1724,7 +2087,8 @@ def layout_blocks(page, saved_page, native, target, cover_page=False):
                            "_members": [b["id"] for b in members]})
         else:
             result.extend(members)
-    return merge_continued_paragraphs(page, result, native, target, cover_page)
+    return merge_continued_paragraphs(page, result, native, target, cover_page, graphics=graphics,
+                                      line_boxes=line_boxes)
 
 
 def inspect_block(native, rect, combine=False):
@@ -1759,13 +2123,13 @@ def inspect_block(native, rect, combine=False):
     lines = best["lines"]
     cell_rows = set()
     gap_limit = max(10, max(s["size"] for s in spans) * 1.5)
-    for line in lines:
-        a = pymupdf.Rect(line["bbox"])
+    line_boxes = [(line, pymupdf.Rect(line["bbox"])) for line in lines]
+    for line, a in line_boxes:
         # Compare adjacent fragments, not arbitrary non-adjacent words on the
         # same justified line (which previously looked like separate cells).
-        right = [pymupdf.Rect(other["bbox"]) for other in lines
-                 if abs(a.y0 - other["bbox"][1]) < 2 and other["bbox"][0] >= a.x1]
-        if right and min(b.x0 for b in right) - a.x1 > gap_limit:
+        right = [box for _, box in line_boxes
+                 if abs(a.y0 - box.y0) < 2 and box.x0 >= a.x1]
+        if right and min(box.x0 for box in right) - a.x1 > gap_limit:
             cell_rows.add(round(a.y0 / 3))
     # One split baseline is common in section numbers and figure captions.
     # Tables have multiple rows of separated cells. Inline math prose is grouped above.
@@ -1810,7 +2174,8 @@ def cover_text_role(block, page, rect, style):
     return None
 
 
-def prepare_cover_metadata(page, working, rects, native, overlays, typography, target):
+def prepare_cover_metadata(page, working, rects, native, overlays, typography, target,
+                           images=None, drawings=None):
     """Preflight the author/affiliation/contact cluster as one layout transaction."""
     body_start = re.compile(r"^\s*(?:abstract\b|keywords?\b|\d+\s+introduction\b|摘要|关键词)", re.I)
     candidates = []
@@ -1861,8 +2226,10 @@ def prepare_cover_metadata(page, working, rects, native, overlays, typography, t
                        if style["size"] >= 14), default=region.width)
     width = min(page.rect.width * .84, max(region.width, title_width))
     center = page.rect.width / 2
-    graphics = [pymupdf.Rect(image["bbox"]) for image in page.get_image_info()]
-    graphics += [d["rect"] + (-.25, -.25, .25, .25) for d in visible_drawings(page)]
+    graphics = [pymupdf.Rect(image["bbox"]) for image in
+                (page.get_image_info() if images is None else images)]
+    graphics += [d["rect"] + (-.25, -.25, .25, .25) for d in
+                 (visible_drawings(page) if drawings is None else drawings)]
     below_graphics = [item.y0 - 2 for item in graphics if item.y0 >= region.y1 - .5
                       and min(item.x1, center + width / 2) - max(item.x0, center - width / 2) > 1]
     bottom = min([bottom] + below_graphics)
@@ -2221,7 +2588,8 @@ def mixed_heading_overlay(overlays, page, block, parts, style, obstacles, typogr
 
 
 def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=None,
-                   horizontal_obstacles=None, bold_hints=None, *, font_scale=1, allow_shrink=True):
+                   horizontal_obstacles=None, bold_hints=None, *, font_scale=1, allow_shrink=True,
+                   raw_native=None, fill_bottom=False):
     if not block.get("_structured_part"):
         mixed = mixed_heading_parts(block, style)
         if mixed is not None:
@@ -2232,7 +2600,8 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
             return mixed_heading_overlay(overlays, page, block, mixed, style, obstacles,
                                          typography, horizontal_obstacles)
     if "_list_structure" not in style:
-        style["_list_structure"] = source_list_structure(page, style, rect)
+        style["_list_structure"] = source_list_structure(
+            page, style, rect, raw_native() if callable(raw_native) else raw_native)
     list_structure = style["_list_structure"]
     if block.get("translation"):
         block = {**block, "translation": block["translation"] if list_structure else soft_translation(block)}
@@ -2241,8 +2610,15 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     if typography["archive"] is not None:
         archive.add(typography["archive"])
     math_labels = []
-    alignment, indent, source_leading = source_paragraph_style(
-        style, rect, block["text"], page.rect.width, horizontal_obstacles, obstacles)
+    style_key = ("_source_style", block["text"], round(rect.x0, 2), round(rect.x1, 2),
+                 id(horizontal_obstacles), len(horizontal_obstacles or ()),
+                 id(obstacles), len(obstacles or ()))
+    cached_style = style.get(style_key)
+    if cached_style is None:
+        cached_style = source_paragraph_style(
+            style, rect, block["text"], page.rect.width, horizontal_obstacles, obstacles)
+        style[style_key] = cached_style
+    alignment, indent, source_leading = cached_style
     if block.get("_alignment_override"):
         alignment, indent = block["_alignment_override"], 0
     if block.get("drop_cap"):
@@ -2309,35 +2685,46 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     if cover_role == "authors":
         line_heights = [1.18, 1.08] if not typography.get("compact_fallback") else [1.12, 1.04]
 
-    def render_box(box, markup, css, count_lines, minimum_scale, anchors=()):
-        scratch = overlays.new_page(width=page.rect.width, height=page.rect.height)
+    def render_box(box, markup, css, count_lines, minimum_scale, anchors=(), expected=None,
+                   target=None):
+        target = target if target is not None else overlays
+        scratch = target.new_page(width=page.rect.width, height=page.rect.height)
         spare, scale = scratch.insert_htmlbox(box, markup, css=css,
                                               archive=archive, scale_low=minimum_scale)
         if spare < 0:
-            overlays.delete_page(-1)
+            target.delete_page(-1)
             return None, 0
-        normalize = lambda value: Counter(c for c in unicodedata.normalize("NFKC", value)
-                                           if not c.isspace() and c != "\u00ad")
-        if normalize(validation_text) - normalize(scratch.get_text()):
-            overlays.delete_page(-1)
-            return None, 0
+        # One dict extraction gives the same text, line baselines and block
+        # boxes that three separate get_text calls used to rebuild.
+        rendered = scratch.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)
+        text_blocks = [item for item in rendered["blocks"] if item.get("type") == 0]
+        rendered_text = "\n".join(
+            "".join(span["text"] for span in line["spans"]) for item in text_blocks
+            for line in item["lines"])
+        if (expected if expected is not None else _char_counter(validation_text)) - _char_counter(rendered_text):
+            # Dict-derived text can differ from get_text() only in rare
+            # extraction edge cases; fall back to the exact legacy check
+            # before rejecting an otherwise valid box.
+            if (expected if expected is not None else _char_counter(validation_text)) - _char_counter(scratch.get_text()):
+                target.delete_page(-1)
+                return None, 0
         line_count = 0
         if count_lines:
-            positions = sorted(line["bbox"][1] for item in scratch.get_text("dict")["blocks"]
-                               if item.get("type") == 0 for line in item["lines"])
+            positions = sorted(line["bbox"][1] for item in text_blocks for line in item["lines"])
             baselines = []
             for position in positions:
                 if not baselines or abs(position - baselines[-1]) > 1.5:
                     baselines.append(position)
             line_count = len(baselines)
-        ink = [item for item in scratch.get_text("blocks") if item[6] == 0 and item[4].strip()]
-        images = scratch.get_image_info()
+        ink = [item["bbox"] for item in text_blocks
+               if "".join(span["text"] for line in item["lines"] for span in line["spans"]).strip()]
+        images = scratch.get_image_info() if math_labels else []
         ink.extend(image["bbox"] for image in images)
         if list_structure and any(item[0] < box.x0 - 1 or item[2] > box.x1 + 1 for item in ink):
-            overlays.delete_page(-1)
+            target.delete_page(-1)
             return None, 0
         if not ink:
-            overlays.delete_page(-1)
+            target.delete_page(-1)
             return None, 0
         crop = pymupdf.Rect(box)
         crop.y0 = max(box.y0, min(item[1] for item in ink) - .3)
@@ -2355,8 +2742,10 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
         if visible is not None:
             for item in images:
                 visible |= pymupdf.Rect(item["bbox"])
-        result = {"overlay": len(overlays) - 1, "rect": list(crop),
+        result = {"overlay": len(target) - 1, "rect": list(crop),
                   "clip": list(crop), "scale": scale, "math_labels": math_labels[:],
+                  "ink_top": min(item[1] for item in ink),
+                  "ink_bottom": max(item[3] for item in ink),
                   "ink_insets": [visible.y0 - crop.y0, crop.y1 - visible.y1]
                   if visible is not None else None}
         if anchors:
@@ -2371,12 +2760,22 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
     # bold run-in label cannot make the entire paragraph heavy.
     display_weight = cover_role == "title"
     if not display_weight and style["bold"]:
-        display_weight = prominent_heading(style, block["text"], horizontal_obstacles or ())
+        prominent_key = ("_prominent", block["text"], id(horizontal_obstacles),
+                         len(horizontal_obstacles or ()))
+        display_weight = style.get(prominent_key)
+        if display_weight is None:
+            display_weight = prominent_heading(style, block["text"], horizontal_obstacles or ())
+            style[prominent_key] = display_weight
     # Source emphasis is independent of heading/list numbering. Mixed run-in
     # labels must never promote the regular prose that follows them.
-    prose_spans = [s for s in style.get("spans", []) if not MATH_FONT.search(s["font"])
-                   and re.search(r"[A-Za-z\u3400-\u9fff]{2,}", s["text"])]
-    whole_body_bold = bool(prose_spans) and all(s["flags"] & 16 for s in prose_spans)
+    emphasis = style.get("_emphasis")
+    if not emphasis or emphasis[0] != block["text"]:
+        prose_spans = [s for s in style.get("spans", []) if not MATH_FONT.search(s["font"])
+                       and re.search(r"[A-Za-z\u3400-\u9fff]{2,}", s["text"])]
+        whole_body_bold = bool(prose_spans) and all(s["flags"] & 16 for s in prose_spans)
+        emphasis = (block["text"], prose_spans, whole_body_bold)
+        style["_emphasis"] = emphasis
+    _, prose_spans, whole_body_bold = emphasis
     weight = 600 if style["bold"] and (
         display_weight or not is_prose(block["text"]) or whole_body_bold) else 400
     if bold_hints and not whole_body_bold and not display_weight:
@@ -2386,7 +2785,14 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                          and not MATH_FONT.search(s.get("font", ""))]
         weight = 600 if caption_spans and all(s["flags"] & 16 for s in caption_spans) else 400
     whole_italic = style["italic"] and (not prose_spans or all(s["flags"] & 2 for s in prose_spans))
-    italic_hints = inline_bold_hints(style, block["text"], emphasis_flag=2) if not whole_italic else ()
+    if whole_italic:
+        italic_hints = ()
+    else:
+        italic_cache = style.get("_italic_hints")
+        if not italic_cache or italic_cache[0] != block["text"]:
+            italic_cache = (block["text"], inline_bold_hints(style, block["text"], emphasis_flag=2))
+            style["_italic_hints"] = italic_cache
+        italic_hints = italic_cache[1]
 
     for variant in variants:
         paragraphs = ()
@@ -2410,22 +2816,109 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                     "page": item.get("page"), "to": item.get("to"), "source": item.get("source"),
                     "ordinal": item["ordinal"]} for item in resolved_links]
         markup = "<div>" + contents + "</div>"
+        expected = _char_counter(validation_text)
+        centered = cover_role in {"title", "authors"} or alignment == "center"
+
+        def css_for(line_height):
+            value = typography["css"] + (
+                f"*{{margin:0;padding:0}} body{{font-family:{typography['family']};font-size:{size}pt;"
+                f"line-height:{line_height};color:#{style['color']:06x};"
+                f"font-weight:{weight};"
+                f"font-style:{'italic' if whole_italic else 'normal'};}} b{{font-weight:600}}"
+                " a:link,a:visited,a:hover{color:inherit;text-decoration:none}")
+            return value + (f"body{{text-align:{'center' if centered else alignment};"
+                            f"text-indent:{0 if centered else indent}pt}}")
+
+        def render_stretched(box, base_leading, minimum_scale, anchors, expected,
+                             desired_ink_top=None):
+            """Render the paragraph with enough leading to reach ``box.y1``.
+
+            The line count is fixed by the column width, so a modest leading
+            increase fills the space a shorter translation leaves without
+            changing wording or font size.  Capped at 1.25x to stay readable.
+            """
+            target = box.y1
+            desired = desired_ink_top if desired_ink_top is not None else box.y0 + .3
+            best = None
+            with pymupdf.open() as measure:
+                leading = base_leading
+                for _ in range(5):
+                    leading = min(round(leading * 1.05, 3), round(base_leading * 1.25, 3))
+                    if leading <= base_leading + .001:
+                        break
+                    probe = pymupdf.Rect(box.x0, box.y0, box.x1, box.y1)
+                    candidate, _ = render_box(probe, markup, css_for(leading), False,
+                                              minimum_scale, anchors, expected=expected,
+                                              target=measure)
+                    if not candidate:
+                        continue
+                    # Larger leading adds half its growth above the first line.
+                    # Correct the box top once from the measured ink so the
+                    # paragraph's source gap above it stays unchanged.
+                    inset = (candidate.get("ink_insets") or [0])[0]
+                    ink_top = candidate.get("ink_top", candidate["rect"][1] + inset)
+                    excess = ink_top - desired
+                    if abs(excess) > .1:
+                        probe = pymupdf.Rect(box.x0, box.y0 - excess, box.x1, box.y1)
+                        corrected, _ = render_box(probe, markup, css_for(leading), False,
+                                                  minimum_scale, anchors, expected=expected,
+                                                  target=measure)
+                        if corrected:
+                            candidate = corrected
+                    bottom = candidate["rect"][3]
+                    if bottom > target + 1.5:
+                        continue
+                    if best is None or bottom > best[1]:
+                        best = (leading, bottom, probe)
+                    if bottom >= target - .5:
+                        break
+            if best is None:
+                return None
+            # One more correction on the chosen leading removes the residual
+            # crop rounding left by the measurement pass.
+            probe = best[2]
+            with pymupdf.open() as measure:
+                settled, _ = render_box(probe, markup, css_for(best[0]), False,
+                                        minimum_scale, anchors, expected=expected,
+                                        target=measure)
+                if settled:
+                    inset = (settled.get("ink_insets") or [0])[0]
+                    ink_top = settled.get("ink_top", settled["rect"][1] + inset)
+                    excess = ink_top - desired
+                    if abs(excess) > .1:
+                        probe = pymupdf.Rect(probe.x0, probe.y0 - excess,
+                                             probe.x1, probe.y1)
+            stretched, _ = render_box(probe, markup, css_for(best[0]), False,
+                                      minimum_scale, anchors, expected=expected)
+            return stretched
+
+        def stretch_to_source_bottom(result, line_height, minimum_scale, anchors, expected):
+            target = rect.y1
+            if result["rect"][3] >= target - size * .5:
+                return result
+            box = pymupdf.Rect(expanded.x0, expanded.y0, expanded.x1, target)
+            inset = (result.get("ink_insets") or [0])[0]
+            desired = result.get("ink_top", result["rect"][1] + inset)
+            stretched = render_stretched(box, line_height, minimum_scale, anchors, expected,
+                                         desired_ink_top=desired)
+            if not stretched or stretched["rect"][3] <= result["rect"][3] + .5:
+                if stretched:
+                    overlays.delete_page(stretched["overlay"])
+                return result
+            # Keep the superseded page: other prepared results hold overlay
+            # indices after this one, so deleting it would shift them.
+            return stretched
+
         # Try every safe box/leading at the original font size before shrinking.
         # A tight source glyph frame should not force the whole paragraph small.
-        for minimum_scale, line_height in [(scale, leading) for scale in (1, scale_low)
+        for minimum_scale, line_height in [(scale, leading) for scale in dict.fromkeys((1, scale_low))
                                           for leading in line_heights]:
-            css = typography["css"] + (f"*{{margin:0;padding:0}} body{{font-family:{typography['family']};font-size:{size}pt;"
-                   f"line-height:{line_height};color:#{style['color']:06x};"
-                   f"font-weight:{weight};"
-                   f"font-style:{'italic' if whole_italic else 'normal'};}} b{{font-weight:600}}"
-                   " a:link,a:visited,a:hover{color:inherit;text-decoration:none}")
-            centered = cover_role in {"title", "authors"} or alignment == "center"
-            css += f"body{{text-align:{'center' if centered else alignment};text-indent:{0 if centered else indent}pt}}"
+            css = css_for(line_height)
             boxes = [expanded, rect] if cover_role in {"title", "authors"} else [rect, expanded]
             for box in boxes:
                 result, line_count = render_box(
                     box, markup, css, is_short_cjk_line(block, style, variant) and not centered,
-                    minimum_scale, anchors)
+                    minimum_scale, anchors, expected=expected)
                 if result:
                     # Only a space can be stretched; pure CJK prose has none.
                     if (alignment == "justify" and not centered and " " in printable
@@ -2433,7 +2926,7 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                             and stretched_gap(overlays[result["overlay"]], size)):
                         justified_lines = rendered_lines(overlays[result["overlay"]])
                         relaxed_css = css.replace("text-align:justify", "text-align:left")
-                        relaxed, _ = render_box(box, markup, relaxed_css, False, minimum_scale, anchors)
+                        relaxed, _ = render_box(box, markup, relaxed_css, False, minimum_scale, anchors, expected=expected)
                         relaxed_lines = rendered_lines(overlays[relaxed["overlay"]]) if relaxed else 0
                         if relaxed and relaxed_lines <= justified_lines:
                             # Left alignment keeps the same breaks but ends the
@@ -2450,11 +2943,24 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                         for wider_box in short_cjk_line_boxes(
                                 rect, box, page, block, style, horizontal_obstacles,
                                 variant, size, centered):
-                            wider_result, wider_lines = render_box(wider_box, markup, css, True, minimum_scale, anchors)
+                            wider_result, wider_lines = render_box(wider_box, markup, css, True, minimum_scale, anchors,
+                                                                   expected=expected)
                             if wider_result and wider_lines == 1:
                                 return wider_result
                             if wider_result:
                                 overlays.delete_page(wider_result["overlay"])
+                    if fill_bottom and not centered:
+                        result = stretch_to_source_bottom(
+                            result, line_height, minimum_scale, anchors, expected)
+                        # reflow_columns may still move this block up to follow
+                        # its shorter neighbour; the final pass re-renders it
+                        # down to the source fragment's last line.
+                        inset = (result.get("ink_insets") or [0])[0]
+                        relative_top = result.get("ink_top", result["rect"][1] + inset) - result["rect"][1]
+                        result["_fill_render"] = (
+                            lambda box, lead=line_height, ms=minimum_scale, rel=relative_top:
+                            render_stretched(box, lead, ms, anchors, expected,
+                                             desired_ink_top=box.y0 + rel))
                     return result
     if typography["archive"] is not None and not typography.get("compact_fallback"):
         # Tight regions can use closer leading while retaining the same font.
@@ -2462,12 +2968,12 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
         # prose to a heavier sans face just because one glyph failed.
         result = fitted_overlay(overlays, page, block, rect, style, obstacles,
                                 {**typography, "compact_fallback": True}, horizontal_obstacles,
-                                bold_hints=bold_hints, font_scale=font_scale, allow_shrink=allow_shrink)
+                                bold_hints=bold_hints, font_scale=font_scale, allow_shrink=allow_shrink,
+                                raw_native=raw_native, fill_bottom=fill_bottom)
         if result:
             result["leading_fallback"] = True
         return result
     return None
-
 
 def body_flow_candidate(block, style=None):
     return (is_prose(block["text"]) and not section_heading(block["text"])
@@ -2492,7 +2998,8 @@ def finish_overlay_links(block, result):
     return sum(1 for hint in hints if hint["kind"] == "uri" and ("uri", hint.get("uri") or None) not in kept)
 
 
-def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typography):
+def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typography, raw_native=None,
+                  fill_ids=None):
     """Preflight adjacent same-size prose together before accepting local shrinkage.
 
     Source geometry and fixed content bound each transaction. Nothing is erased
@@ -2509,6 +3016,8 @@ def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typo
     runs = []
     for indexes in per_lane.values():
         indexes.sort(key=lambda i: source_rects[prepared[i][0]["id"]].y0)
+        flow_candidate = {index: body_flow_candidate(prepared[index][0], prepared[index][1])
+                          for index in indexes}
         run = []
         for index in indexes:
             block, style, _ = prepared[index]
@@ -2516,12 +3025,12 @@ def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typo
                 prior, prior_style, _ = prepared[run[-1]]
                 box, before = source_rects[block["id"]], source_rects[prior["id"]]
                 size = max(style["size"], prior_style["size"])
-                if (not body_flow_candidate(block, style) or abs(style["size"] - prior_style["size"]) > .1
+                if (not flow_candidate[index] or abs(style["size"] - prior_style["size"]) > .1
                         or (style["bold"], style["italic"]) != (prior_style["bold"], prior_style["italic"])
                         or not -max(3, size * .3) <= box.y0 - before.y1 <= max(24, size * 2.5)):
                     runs.append(run)
                     run = []
-            if body_flow_candidate(block, style):
+            if flow_candidate[index]:
                 run.append(index)
         if run:
             runs.append(run)
@@ -2531,6 +3040,10 @@ def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typo
             continue
         members = set(indexes)
         owned = {id(span) for i in indexes for span in prepared[i][1]["spans"]}
+        run_foreign = [span for item in native for line in item["lines"]
+                       for span in line["spans"] if id(span) not in owned]
+        run_bold = {index: inline_bold_hints(prepared[index][1], prepared[index][0]["text"])
+                    for index in indexes}
         fixed = [pymupdf.Rect(span["bbox"]) for item in native for line in item["lines"]
                  for span in line["spans"] if span["text"].strip() and id(span) not in owned]
         carried = {tuple(box) for i in indexes for box in prepared[i][2].get("carried_graphics", [])}
@@ -2545,10 +3058,11 @@ def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typo
         floor = max(minimum_font_scale(prepared[i][1]["size"]) for i in indexes)
         factors = list(dict.fromkeys([1] + [1 - step * .02 for step in range(1, 16)
                                                     if 1 - step * .02 >= floor] + [floor]))
+        compact_typography = {**typography, "compact_fallback": True}
         for factor, compact in [(factor, compact) for factor in factors for compact in (False, True)]:
             start = len(overlays)
             staged, moves = [], []
-            run_typography = {**typography, "compact_fallback": True} if compact else typography
+            run_typography = compact_typography if compact else typography
             for index in indexes:
                 block, style, old = prepared[index]
                 source = source_rects[block["id"]]
@@ -2557,9 +3071,10 @@ def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typo
                 if box.height <= 0:
                     break
                 result = fitted_overlay(overlays, page, block, box, style, fixed, run_typography,
-                                        [s for item in native for line in item["lines"] for s in line["spans"]
-                                         if id(s) not in owned], inline_bold_hints(style, block["text"]),
-                                        font_scale=factor, allow_shrink=False)
+                                        run_foreign, run_bold[index],
+                                        font_scale=factor, allow_shrink=False, raw_native=raw_native,
+                                        fill_bottom=bool(fill_ids and any(
+                                            key in fill_ids for key in block.get("_members", [block["id"]]))))
                 if result is None:
                     break
                 if staged:
@@ -2594,9 +3109,11 @@ def fit_body_runs(overlays, page, prepared, native, graphics, source_rects, typo
 TABLE_CAPTION = re.compile(r"^\s*(?:TABLE|Table)\s+[IVXLC\d]+(?:$|\s|[.:])|^\s*表\s*[IVXLC\d]+", re.I)
 
 
-def _table_text(page):
+def _table_text(page, native=None):
     lines, captions = [], []
-    for block in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"]:
+    source = native if native is not None else page.get_text(
+        "dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"]
+    for block in source:
         if block.get("type") != 0:
             continue
         text = "\n".join("".join(span["text"] for span in line["spans"]).strip() for line in block["lines"]).strip()
@@ -2667,7 +3184,7 @@ def _same_region(first, second):
     return intersection > 0 and intersection / min(first.get_area(), second.get_area()) > .8
 
 
-def table_regions(page):
+def table_regions(page, native=None):
     """Locate tables from a Table caption and consistent multi-cell rows.
 
     Borderless tables are extracted as independent cell lines, so a caption
@@ -2675,7 +3192,7 @@ def table_regions(page):
     Returned boxes exclude captions; captions and notes outside the grid stay
     translatable.
     """
-    lines, captions = _table_text(page)
+    lines, captions = _table_text(page, native)
     if not lines or not captions:
         return []
     gutter = _table_gutter(page, lines)
@@ -2733,7 +3250,7 @@ def table_regions(page):
 
 
 def typeset(source: Path, document: dict, target: str, page_numbers=None, typography=None,
-            page_links=None, reference_fallbacks=None):
+            page_links=None, reference_fallbacks=None, continuation_hints=None):
     """Typeset translated blocks onto the original pages.
 
     `page_links` maps each original page index to its link annotations in
@@ -2761,7 +3278,29 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             source_page_number = page_numbers[number] if page_numbers is not None else number
             rotation = page.rotation
             native = [b for b in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"] if b["type"] == 0]
-            raw_native = page.get_text("rawdict")["blocks"]
+            rawdict_cache = []
+
+            def raw_native_blocks():
+                # Raw characters are only needed for links, inline math and
+                # formula measurement. Images are never consumed here.
+                if not rawdict_cache:
+                    rawdict_cache.append(page.get_text(
+                        "rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"])
+                return rawdict_cache[0]
+
+            math_cache = {}
+
+            def math_page_assets():
+                if not math_cache:
+                    svg_root = ET.fromstring(page.get_svg_image(text_as_path=True))
+                    definitions, uses = _svg_math_index(svg_root)
+                    math_cache.update(svg_root=svg_root, definitions=definitions, uses=uses,
+                                      drawings=page.get_drawings())
+                return math_cache
+
+            page_spans = _PageSpanIndex([
+                (tuple(span["bbox"]), id(span)) for item in native for line in item.get("lines", [])
+                for span in line.get("spans", []) if (span.get("text") or "").strip()])
             # Diagram labels can share an extraction block despite belonging to
             # different nodes. Keep the whole illustration's text on the source
             # page, before paragraph grouping or formula relocation can touch it.
@@ -2769,7 +3308,10 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             # and reader links use displayed coordinates.
             page.set_rotation(0)
             drawings = visible_drawings(page)
-            figures = figure_regions(page, native, drawings=drawings)
+            page_images = page.get_image_info()
+            image_rects = [pymupdf.Rect(image["bbox"]) for image in page_images]
+            graphics = image_rects + [drawing["rect"] for drawing in drawings]
+            figures = figure_regions(page, native, drawings=drawings, images=page_images)
             page.set_rotation(rotation)
             figure_ids = set()
             for block in saved_page["blocks"]:
@@ -2782,7 +3324,7 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                     figure_ids.add(block["id"])
             working = layout_blocks(page, {**saved_page, "blocks": [
                 block for block in saved_page["blocks"] if block["id"] not in figure_ids]},
-                native, target, cover_page=source_page_number == 0)
+                native, target, cover_page=source_page_number == 0, graphics=graphics)
             working.extend(block for block in saved_page["blocks"] if block["id"] in figure_ids)
             rects = {b["id"]: source_rect(page, b) for b in working}
             caption_rects = [rects[b["id"]] for b in working
@@ -2793,11 +3335,13 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 links_on_page = page_link_targets(page)
             else:
                 links_on_page = list(page_links.get(source_page_number, ()))
+            link_items = _link_char_items(raw_native_blocks()) if links_on_page else None
             page.set_rotation(0)
             source_ink = page.get_bboxlog()
-            graphics = [pymupdf.Rect(image["bbox"]) for image in page.get_image_info()]
-            graphics += [drawing["rect"] for drawing in drawings]
-            table_boxes = table_regions(page)
+            fill_ops = [pymupdf.Rect(coords) for kind, coords, *_ in source_ink if kind == "fill-text"]
+            ink_ops = fill_ops + [pymupdf.Rect(coords) for kind, coords, *_ in source_ink
+                                  if kind == "stroke-text"]
+            table_boxes = table_regions(page, native)
             obstacles = [pymupdf.Rect(b["bbox"]) for b in native] + graphics
             text_obstacles = [span for item in native for line in item["lines"]
                               for span in line["spans"] if span["text"].strip()]
@@ -2841,7 +3385,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 if source_page_number == 0 and not has_redactions:
                     cover, cover_members, cover_reason = prepare_cover_metadata(
                         page, [block for block in working if block["id"] not in figure_ids],
-                        rects, native, overlays, typography, target)
+                        rects, native, overlays, typography, target,
+                        images=page_images, drawings=drawings)
                 cover_ids = {b["id"] for b in cover_members}
                 if cover:
                     prepared.append(cover)
@@ -2857,7 +3402,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         if (anchors and not has_redactions and block.get("translation")
                                 and block.get("target") == target):
                             anchored, anchor_style, anchor_reason = anchored_overlay(
-                                overlays, page, block, anchors, native, graphics, typography, links=links_on_page)
+                                overlays, page, block, anchors, native, graphics, typography,
+                                links=links_on_page, operations=fill_ops)
                             if not anchor_reason:
                                 report["replaced"] += 1
                                 if anchored:
@@ -2898,7 +3444,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                                              is_prose, lambda text: bool(_FLOW_CAPTION.match(text)))
                     if anchors and not has_redactions and not block.get("drop_cap_preserve"):
                         anchored, anchor_style, anchor_reason = anchored_overlay(
-                            overlays, page, block, anchors, native, graphics, typography, links=links_on_page)
+                            overlays, page, block, anchors, native, graphics, typography,
+                            links=links_on_page, operations=fill_ops)
                         if anchor_reason:
                             report["preserved"] += len(member_ids)
                             report["issues"].extend({**entry, "block_id": key, "kind": "preserved",
@@ -2943,33 +3490,54 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         reason = "文字区域超出页面，保留原文"
                     # Do not remove any source characters belonging to neighboring blocks.
                     own_spans = {id(span) for span in style["spans"]} if style else set()
-                    foreign = [span for item in native if overlap(rect, pymupdf.Rect(item["bbox"])) > .1
+                    foreign = [(span, pymupdf.Rect(span["bbox"]))
+                               for item in native if overlap(rect, pymupdf.Rect(item["bbox"])) > .1
                                for line in item["lines"] for span in line["spans"]
                                if id(span) not in own_spans and span["text"].strip()]
                     strips = [span_strip(span) for span in style["spans"]] if style else []
-                    if style and any(overlap(strip, pymupdf.Rect(span["bbox"])) > .1 for strip in strips for span in foreign):
+                    if style and any(overlap(strip, box) > .1 for strip in strips for _, box in foreign):
                         reason = "文字区域相互重叠，保留原文"
                     result = None
                     if not reason:
                         fit_rect = pymupdf.Rect(rect)
-                        for neighbor in foreign:
-                            box = pymupdf.Rect(neighbor["bbox"])
+                        for neighbor, box in foreign:
                             if (box.y0 < rect.y0 < box.y1 and box.y1 - rect.y0 < 3
                                     and min(box.x1, rect.x1) - max(box.x0, rect.x0) > 1):
                                 fit_rect.y0 = max(fit_rect.y0, box.y1 + .6)
                         runs = []
+                        cluster_rect = None
                         if should_preserve_inline_symbols(block):
-                            runs = inline_math_runs(raw_native, rect, combine="_members" in block)
-                            if runs:
-                                block = {**block, "_inline_assets": inline_math_assets(page, runs, block["translation"])}
-                        hints = block_link_hints(links_on_page, rect, native, raw_native)
+                            runs = inline_math_runs(raw_native_blocks(), rect, combine="_members" in block)
+                            assets = (inline_math_assets(page, runs, block["translation"],
+                                                         **math_page_assets()) if runs else [])
+                            cluster = inline_formula_cluster(
+                                page, block, rect, raw_native_blocks(), style, block["translation"],
+                                **math_page_assets())
+                            if cluster:
+                                if cluster.get("asset"):
+                                    assets.append(cluster["asset"])
+                                    cluster_rect = cluster["rect"]
+                                else:
+                                    reason = cluster.get("reason") or (
+                                        "行内公式由多个文本块组成，无法完整复刻，保留原文")
+                            if assets:
+                                block = {**block, "_inline_assets": assets}
+                        hints = block_link_hints(links_on_page, rect, native,
+                                                 raw_native_blocks() if links_on_page else None,
+                                                 page_items=link_items)
                         if hints:
                             block = {**block, "_link_hints": hints}
                         block = {**block, "_source_page": source_page_number}
-                        result = fitted_overlay(overlays, page, block, fit_rect, style, obstacles,
-                                                typography, text_obstacles,
-                                                bold_hints=inline_bold_hints(style, block["text"]))
-                        if (result is None and body_flow_candidate(block, style)
+                        fill_bottom = bool(continuation_hints and any(
+                            (continuation_hints.get(key) or {}).get("continues")
+                            for key in member_ids))
+                        result = None if reason else fitted_overlay(
+                            overlays, page, block, fit_rect, style, obstacles,
+                            typography, text_obstacles,
+                            bold_hints=inline_bold_hints(style, block["text"]),
+                            raw_native=raw_native_blocks,
+                            fill_bottom=fill_bottom)
+                        if (result is None and not reason and body_flow_candidate(block, style)
                                 and not style.get("list_layout_issue") and not style.get("_layout_failure_reason")):
                             # A body block that cannot fit alone may still fit
                             # with its shorter neighbors at the original size.
@@ -2977,7 +3545,9 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         if result and runs:
                             result["inline_math_runs"] = runs
                             result["carried_graphics"] = inline_math_graphics(drawings, runs)
-                        if result is None:
+                        if result and cluster_rect:
+                            result["formula_cluster_rects"] = [cluster_rect]
+                        if result is None and not reason:
                             reason = style.get("list_layout_issue") or style.get("_layout_failure_reason") or "译文超出可用空间或含无法可靠排印的字符，保留原文；请编辑后重新排版"
                     if reason and reason.startswith("公式") and not has_redactions and not is_prose(block["text"]):
                         formula_candidates.append((block, rect))
@@ -2987,7 +3557,7 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         continue
                     # Redact only the original span boxes. Background graphics stay untouched.
                     prepared.append((block, style, result))
-                    measured = text_ink_bounds(source_ink, rect)
+                    measured = text_ink_bounds(source_ink, rect, text_ops=ink_ops)
                     if measured is not None:
                         style["ink_bounds"] = list(measured)
                     if result["scale"] < .99:
@@ -2997,18 +3567,25 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 owned_spans = [span for _, style, _ in prepared for span in style["spans"]]
                 formulas = original_formula_units(page, overlays, formula_candidates, native, graphics,
                                                   lanes, occupied_spans=owned_spans,
-                                                  glyph_bounds=lambda spans: formula_glyph_bounds(page, spans, raw_native))
+                                                  glyph_bounds=lambda spans: formula_glyph_bounds(page, spans, raw_native_blocks(),
+                                                                   **math_page_assets()),
+                                                  images=image_rects)
                 prepared.extend(formulas)
                 for block, _, result in formulas:
                     rects[block["id"]] = pymupdf.Rect(result["clip"])
+                separator_map = {}
                 for block, _, result in prepared:
                     if section_heading(block["text"]) and not result.get("original") and not block.get("_fixed_structure"):
                         separators = [tuple(drawing["rect"]) for drawing in drawings
                                       if heading_separator(drawing, rects[block["id"]])]
+                        separator_map[block["id"]] = separators
                         result.setdefault("carried_graphics", []).extend(separators)
                 previous_scaled = sum(len(block.get("_members", [block["id"]]))
                                       for block, _, result in prepared if result["scale"] < .99)
-                adjustments = fit_body_runs(overlays, page, prepared, native, graphics, rects, typography)
+                adjustments = fit_body_runs(overlays, page, prepared, native, graphics, rects, typography,
+                                            raw_native=raw_native_blocks,
+                                            fill_ids={key for key, value in (continuation_hints or {}).items()
+                                                      if value.get("continues")})
                 for block, _, result in prepared:
                     if result.get("pending"):
                         member_ids = block.get("_members", [block["id"]])
@@ -3036,6 +3613,30 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                     adjustments.append({**item, "previous_bottom": prior[1]["rect"][3], "gap": gap,
                                         "source_ink_gap": ink_gap, "ink_padding": padding})
                 report.setdefault("flow", []).extend({"page": saved_page["number"], **item} for item in adjustments)
+                # A page-bottom continuation fragment may have been pulled up
+                # to follow its shorter neighbour, leaving the unused space at
+                # the page bottom.  Re-render it down to the source fragment's
+                # last line; the block is the last in its column, so this can
+                # never cover other text.
+                for block, style, result in prepared:
+                    fill = result.get("_fill_render")
+                    if not fill or result.get("original") or result.get("scale", 1) < .99:
+                        continue
+                    final_rect = pymupdf.Rect(result["rect"])
+                    source = rects.get(block["id"])
+                    if source is None or final_rect.y1 >= source.y1 - 2:
+                        continue
+                    if source.y1 - final_rect.y1 < max(3.0, style.get("size", 10) * .5):
+                        continue
+                    stretched = fill(pymupdf.Rect(final_rect.x0, final_rect.y0,
+                                                  final_rect.x1, source.y1))
+                    if not stretched or stretched["rect"][3] <= final_rect.y1 + .5:
+                        if stretched:
+                            overlays.delete_page(stretched["overlay"])
+                        continue
+                    # The superseded page stays in the scratch document; other
+                    # results' overlay indices must not shift.
+                    result.update(stretched)
                 moved_formulas = [item for item in formulas if item[2]["rect"] != item[2]["clip"]]
                 for _, _, result in moved_formulas:
                     page.add_redact_annot(pymupdf.Rect(result["clip"]), fill=False, cross_out=False)
@@ -3044,6 +3645,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                 inline_strokes = {box for _, _, result in prepared
                                   if result.get("inline_math_runs")
                                   for box in result.get("carried_graphics", [])}
+                inline_strokes |= {box for _, _, result in prepared
+                                   for box in result.get("formula_cluster_rects", [])}
                 for box in inline_strokes:
                     page.add_redact_annot(pymupdf.Rect(box) + (-.25, -.25, .25, .25),
                                          fill=False, cross_out=False)
@@ -3054,9 +3657,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                     source = rects.get(block["id"])
                     if source is None:
                         continue
-                    for drawing in drawings:
-                        if heading_separator(drawing, source):
-                            heading_strokes.add(tuple(pymupdf.Rect(drawing["rect"])))
+                    for box in separator_map.get(block["id"], ()):
+                        heading_strokes.add(tuple(box))
                 for box in heading_strokes:
                     page.add_redact_annot(pymupdf.Rect(box) + (-.5, -.5, .5, .5),
                                           fill=False, cross_out=False)
@@ -3093,9 +3695,9 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                         if result["rect"] != result["clip"]:
                             erased.extend(list(span["bbox"]) for span in style["spans"])
                         continue
-                    for span in style["spans"]:
-                        page.add_redact_annot(span_strip(span), fill=False, cross_out=False)
-                        erased.append(list(span["bbox"]))
+                    erased.extend(list(span["bbox"]) for span in style["spans"])
+                    for box in merged_line_boxes(style, page_spans):
+                        page.add_redact_annot(box, fill=False, cross_out=False)
                 report.setdefault("erased_spans", []).append({"page": saved_page["number"], "boxes": erased})
                 if prepared:
                     page.apply_redactions(images=0, graphics=0, text=0)
@@ -3210,10 +3812,51 @@ def _reader_link(page_obj, raw_rect, entry, fraction=None, source_page=None, gro
     return link
 
 
+_PAGE_REPORT_CACHE = {}
+_PAGE_REPORT_CACHE_MAX = 256
+
+
+def _cached_page_report(path: Path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _PAGE_REPORT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        details = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if len(_PAGE_REPORT_CACHE) >= _PAGE_REPORT_CACHE_MAX:
+        _PAGE_REPORT_CACHE.clear()
+    _PAGE_REPORT_CACHE[key] = details
+    return details
+
+
+def _remember_page_report(path: Path, details: dict):
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    if len(_PAGE_REPORT_CACHE) >= _PAGE_REPORT_CACHE_MAX:
+        _PAGE_REPORT_CACHE.clear()
+    _PAGE_REPORT_CACHE[(str(path), stat.st_mtime_ns, stat.st_size)] = details
+
+
+def _write_json_atomic(path: Path, value):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
 def build_layout(directory: Path, document: dict, target: str):
     source = directory / "source.pdf"
-    signature = json.dumps({"version": ENGINE_VERSION, "font": font_signature(), "source_size": source.stat().st_size,
-                            "source_mtime": source.stat().st_mtime_ns,
+    font_key = font_signature()
+    source_stat = source.stat()
+    signature = json.dumps({"version": ENGINE_VERSION, "font": font_key, "source_size": source_stat.st_size,
+                            "source_mtime": source_stat.st_mtime_ns,
                             "target": target, "pages": document["pages"]}, ensure_ascii=False, sort_keys=True)
     revision = hashlib.sha256(signature.encode()).hexdigest()[:24]
     cache = directory / "layout"
@@ -3233,40 +3876,70 @@ def build_layout(directory: Path, document: dict, target: str):
         # the full document's targets even though only one page is selected.
         source_links = None
         reference_fallbacks = None
+        scan_path = cache / "source-scan.json"
         try:
-            with pymupdf.open(source) as scanned:
-                try:
-                    names = scanned.resolve_names()
-                except Exception:
-                    names = {}
-                source_links = {}
-                for index, page in enumerate(scanned):
-                    # page_link_targets derotates PyMuPDF's displayed link
-                    # rectangles itself; resetting the rotation first would
-                    # lose the transform on rotated source pages.
-                    source_links[index] = page_link_targets(page, names)
-                reference_fallbacks = reference_fallback_pages(scanned)
-        except Exception:
+            cached_scan = json.loads(scan_path.read_text(encoding="utf-8"))
+            if (cached_scan.get("version") == SOURCE_SCAN_VERSION
+                    and cached_scan.get("size") == source_stat.st_size
+                    and cached_scan.get("mtime") == source_stat.st_mtime_ns):
+                source_links = {int(key): value for key, value in cached_scan["links"].items()}
+                reference_fallbacks = {int(key): [pymupdf.Rect(box) for box in value]
+                                       for key, value in cached_scan["fallbacks"].items()}
+        except (OSError, ValueError, KeyError, TypeError):
             source_links = None
             reference_fallbacks = None
+        if source_links is None:
+            try:
+                with pymupdf.open(source) as scanned:
+                    try:
+                        names = scanned.resolve_names()
+                    except Exception:
+                        names = {}
+                    source_links = {}
+                    for index, page in enumerate(scanned):
+                        # page_link_targets derotates PyMuPDF's displayed link
+                        # rectangles itself; resetting the rotation first would
+                        # lose the transform on rotated source pages.
+                        source_links[index] = page_link_targets(page, names)
+                    reference_fallbacks = reference_fallback_pages(scanned)
+                scan_temp = cache / "source-scan.tmp"
+                scan_temp.write_text(json.dumps({
+                    "version": SOURCE_SCAN_VERSION, "size": source_stat.st_size,
+                    "mtime": source_stat.st_mtime_ns, "links": source_links,
+                    "fallbacks": {key: [list(box) for box in value]
+                                  for key, value in reference_fallbacks.items()},
+                }, ensure_ascii=False), encoding="utf-8")
+                scan_temp.replace(scan_path)
+            except Exception:
+                source_links = None
+                reference_fallbacks = None
+        hints = continuation_map(document)
         with pymupdf.open() as combined:
             for index, saved_page in enumerate(document["pages"]):
-                page_signature = json.dumps({"version": ENGINE_VERSION, "font": font_signature(), "source_size": source.stat().st_size,
-                                             "source_mtime": source.stat().st_mtime_ns, "index": index,
-                                             "target": target, "page": saved_page}, ensure_ascii=False, sort_keys=True)
+                page_ids = {block["id"] for block in saved_page["blocks"]}
+                page_continuations = {key: value for key, value in hints.items() if key in page_ids}
+                page_signature = json.dumps({"version": ENGINE_VERSION, "font": font_key, "source_size": source_stat.st_size,
+                                             "source_mtime": source_stat.st_mtime_ns, "index": index,
+                                             "target": target, "page": saved_page,
+                                             "continuation": page_continuations,
+                                             }, ensure_ascii=False, sort_keys=True)
                 key = hashlib.sha256(page_signature.encode()).hexdigest()[:24]
                 page_pdf = page_cache / (key + ".pdf")
                 page_report = page_cache / (key + ".json")
-                if page_pdf.is_file() and page_report.is_file():
-                    details = json.loads(page_report.read_text(encoding="utf-8"))
-                else:
-                    page_raw, details = typeset(source, {"pages": [saved_page]}, target, page_numbers=[index],
+                details = _cached_page_report(page_report) if page_pdf.is_file() else None
+                if details is None:
+                    page_document = {"pages": [saved_page]}
+                    if "drop_cap_schema" in document:
+                        page_document["drop_cap_schema"] = document["drop_cap_schema"]
+                    page_raw, details = typeset(source, page_document, target, page_numbers=[index],
                                                 typography=typography, page_links=source_links,
-                                                reference_fallbacks=reference_fallbacks)
+                                                reference_fallbacks=reference_fallbacks,
+                                                continuation_hints=page_continuations)
                     page_temp = page_cache / (key + ".tmp")
                     page_temp.write_bytes(page_raw)
                     page_temp.replace(page_pdf)
-                    page_report.write_text(json.dumps(details, ensure_ascii=False), encoding="utf-8")
+                    _write_json_atomic(page_report, details)
+                    _remember_page_report(page_report, details)
                 with pymupdf.open(page_pdf) as cached:
                     combined.insert_pdf(cached, links=False, annots=True)
                 for field in ("replaced", "untranslated", "preserved", "scaled"):
@@ -3300,14 +3973,19 @@ def build_layout(directory: Path, document: dict, target: str):
                     named_targets = {}
                 reader_links = []
                 placed_sources = {}
+                placed_by_page = {}
+                erased_by_page = {}
                 for entry in report.get("placed_links", []):
+                    placed_by_page.setdefault(entry["page"], []).append(entry)
                     source = entry.get("source_rect")
                     if source:
                         placed_sources.setdefault(entry["page"], set()).add(
                             (entry["kind"], tuple(round(float(value), 1) for value in source)))
+                for item in report.get("erased_spans", []):
+                    erased_by_page.setdefault(item["page"], []).extend(item["boxes"])
                 for index, page in enumerate(original):
                     number = index + 1
-                    for entry in (item for item in report.get("placed_links", []) if item["page"] == number):
+                    for entry in placed_by_page.get(number, ()):
                         box = pymupdf.Rect(entry["rect"])
                         if box.is_empty or box.get_area() <= 0:
                             continue
@@ -3327,8 +4005,7 @@ def build_layout(directory: Path, document: dict, target: str):
                                     if entry["kind"] == "goto" else 0.0)
                         reader_links.append(_reader_link(combined[index], box, entry, fraction,
                                                          source_page=number, group=entry.get("group")))
-                    erased = [pymupdf.Rect(box) for item in report.get("erased_spans", [])
-                              if item["page"] == number for box in item["boxes"]]
+                    erased = [pymupdf.Rect(box) for box in erased_by_page.get(number, ())]
                     for link in page.get_links():
                         raw = pymupdf.Rect(link.get("from") or (0, 0, 0, 0)) * page.derotation_matrix
                         if raw.is_empty or not raw.is_valid or raw.get_area() <= 0:
@@ -3387,5 +4064,5 @@ def build_layout(directory: Path, document: dict, target: str):
         temporary = cache / (revision + ".tmp")
         temporary.write_bytes(raw)
         temporary.replace(pdf_path)
-        report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        _write_json_atomic(report_path, report)
         return report

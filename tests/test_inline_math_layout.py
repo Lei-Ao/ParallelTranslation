@@ -129,11 +129,96 @@ class InlineMathLayoutTests(unittest.TestCase):
             self.assertIn("x0", listed.get_text())
             self.assertTrue(any(link["uri"] == "https://example.org/method" for link in numbered.get("links", [])))
 
+    def test_page_bottom_continuation_uses_spare_leading(self):
+        translation = ("基于模型的控制器与学习型控制器在轨迹跟踪任务上的比较需要谨慎设计实验协议以保证公平，"
+                       "同时需要保证数据访问、初始条件和优化方式一致。")
+        with pymupdf.open() as source, pymupdf.open() as overlays:
+            page = source.new_page(width=400, height=400)
+            block = {"id": "cont", "text": "A paragraph cut by a column break continues below",
+                     "translation": translation}
+            style = {"size": 10, "lines": [], "bold": False, "italic": False, "color": 0}
+            typography = {"css": "", "family": "serif", "archive": None}
+            rect = pymupdf.Rect(40, 100, 300, 200)
+            plain = layout.fitted_overlay(overlays, page, block, rect, dict(style), [], dict(typography))
+            self.assertIsNotNone(plain)
+            filled = layout.fitted_overlay(overlays, page, block, rect, dict(style), [],
+                                           dict(typography), fill_bottom=True)
+            self.assertIsNotNone(filled)
+            self.assertGreater(filled["rect"][3], plain["rect"][3] + 5)
+            self.assertLessEqual(filled["rect"][3], rect.y1 + 1.5)
+
     def test_zero_descender_font_redaction_intersects_actual_ascender(self):
         strip = layout.span_strip({"bbox": (50, 70, 64, 80), "origin": (50, 80),
                                    "size": 10, "ascender": .464, "descender": 0})
         self.assertGreater(strip.y0, 75.36)
         self.assertLess(strip.y1, 80)
+
+    def split_fraction_fixture(self):
+        """A superscript fraction extracted as three pieces, as real PDFs do."""
+        pdf = pymupdf.open()
+        page = pdf.new_page(width=420, height=300)
+        page.insert_text((40, 100), "with ", fontsize=10, fontname="tiro")
+        page.insert_text((72, 100), "e", fontsize=10, fontname="symb")
+        page.insert_text((81, 95), "-x", fontsize=5, fontname="symb")
+        page.insert_text((83, 103), "d", fontsize=5, fontname="symb")
+        page.insert_text((86, 103), " allowing tuning", fontsize=10, fontname="tiro")
+        page.draw_line((80, 98), (91, 98), color=(0, 0, 0), width=.4)
+        raw = [item for item in page.get_text(
+            "rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"]
+            if item["type"] == 0]
+        return pdf, page, raw
+
+    def test_split_superscript_fraction_is_rebuilt_as_one_cluster(self):
+        pdf, page, raw = self.split_fraction_fixture()
+        with pdf:
+            block = {"id": "math", "text": "with e d allowing tuning",
+                     "translation": "其中 e d 可以调节。"}
+            root = ET.fromstring(page.get_svg_image(text_as_path=True))
+            definitions, uses = layout._svg_math_index(root)
+            result = layout.inline_formula_cluster(
+                page, block, pymupdf.Rect(40, 89.5, 180, 110), raw, {"size": 10},
+                block["translation"], svg_root=root, drawings=layout.visible_drawings(page),
+                definitions=definitions, uses=uses)
+            self.assertIsNotNone(result)
+            self.assertNotIn("reason", result)
+            asset = result["asset"]
+            self.assertEqual(asset["match_normalized"], "ed")
+            glyphs = [node.get("data-text") for node in ET.fromstring(asset["svg"]).iter(
+                "{http://www.w3.org/2000/svg}use")]
+            self.assertEqual(sorted(glyphs), sorted(["e", "d", "-", "x"]))
+            # The fraction bar travels with the glyphs as a path.
+            self.assertGreaterEqual(len(list(ET.fromstring(asset["svg"]).iter(
+                "{http://www.w3.org/2000/svg}path"))), 1)
+
+    def test_cluster_without_unique_translation_match_is_preserved(self):
+        pdf, page, raw = self.split_fraction_fixture()
+        with pdf:
+            block = {"id": "math", "text": "with e d allowing tuning",
+                     "translation": "其中 e d 与 e d 重复。"}
+            root = ET.fromstring(page.get_svg_image(text_as_path=True))
+            definitions, uses = layout._svg_math_index(root)
+            result = layout.inline_formula_cluster(
+                page, block, pymupdf.Rect(40, 89.5, 180, 110), raw, {"size": 10},
+                block["translation"], svg_root=root, drawings=layout.visible_drawings(page),
+                definitions=definitions, uses=uses)
+            self.assertIn("reason", result)
+
+    def test_cluster_asset_replaces_linear_text_in_markup(self):
+        pdf, page, raw = self.split_fraction_fixture()
+        with pdf:
+            block = {"id": "math", "text": "with e d allowing tuning",
+                     "translation": "其中 e d 可以调节。"}
+            root = ET.fromstring(page.get_svg_image(text_as_path=True))
+            definitions, uses = layout._svg_math_index(root)
+            result = layout.inline_formula_cluster(
+                page, block, pymupdf.Rect(40, 89.5, 180, 110), raw, {"size": 10},
+                block["translation"], svg_root=root, drawings=layout.visible_drawings(page),
+                definitions=definitions, uses=uses)
+            markup, plain, labels, _ = layout.inline_math_markup(
+                block["translation"], [result["asset"]], pymupdf.Archive())
+            self.assertEqual(markup.count("<img"), 1)
+            self.assertEqual(labels, ["e d"])
+            self.assertNotIn("e d", plain)
 
     def test_cover_roles_use_geometry_and_typography_instead_of_block_ids(self):
         with pymupdf.open() as pdf:

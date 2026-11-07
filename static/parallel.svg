@@ -1,5 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
-  <rect x="1" y="1" width="30" height="30" rx="7" fill="#217965"/>
-  <path d="M8 7h5l2 2v16H8zM18 7h5l2 2v16h-7z" fill="#fff"/>
-  <path d="M13 7v2h2zM23 7v2h2z" fill="#a9d7c4"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="页间 Parallel logo">
+  <title>页间 Parallel — 对照翻译</title>
+  <rect x="36" y="36" width="952" height="952" rx="224" fill="#187A67"/>
+  <g fill="#F7F6EE">
+    <path d="M188 290 Q188 249 229 245 C331 231 425 247 500 284 V755 C429 716 319 711 227 760 Q188 780 188 733 Z"/>
+    <path d="M524 284 C599 247 693 231 795 245 Q836 249 836 290 V733 Q836 780 797 760 C705 711 595 716 524 755 Z"/>
+  </g>
+  <path d="M392 490 Q392 479 404 479 H610 V438 L708 512 L610 586 V545 H404 Q392 545 392 533 Z" fill="#187A67"/>
 </svg>

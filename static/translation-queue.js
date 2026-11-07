@@ -2,16 +2,26 @@
 // A bounded queue: pause/error stops new work; every in-flight result is drained.
 (function(root){
   async function run({items, concurrency=3, shouldStop=()=>false, translate,
-    onStart=()=>{}, onSuccess=()=>{}, onError=()=>{}, onSettled=()=>{}}){
-    let next=0, completed=0, failed=0;
+    onStart=()=>{}, onSuccess=()=>{}, onError=()=>{}, onSettled=()=>{},
+    maxConsecutiveFailures=3}){
+    let next=0, completed=0, failed=0, consecutive=0, halted=false;
     const limit=Math.min(items.length,Math.max(1,Math.min(12,Math.floor(Number(concurrency)) || 3)));
+    const fatal=error=>Boolean(error && (error.fatal || error.status===401 || error.status===403));
     async function worker(){
-      while(next<items.length && !failed && !shouldStop()){
+      while(next<items.length && !halted && !shouldStop()){
         const item=items[next++];
         onStart(item);
-        try{const result=await translate(item);onSuccess(item,result);completed++;}
-        catch(error){failed++;onError(item,error);}
-        finally{onSettled(item);}
+        try{
+          const result=await translate(item);
+          onSuccess(item,result);completed++;consecutive=0;
+        }catch(error){
+          failed++;consecutive++;
+          // One malformed paragraph must not stop independent work. A burst of
+          // failures or an authentication error is systemic, so stop scheduling
+          // new groups while already-started requests are still drained.
+          if(fatal(error) || consecutive>=maxConsecutiveFailures)halted=true;
+          onError(item,error);
+        }finally{onSettled(item);}
       }
     }
     await Promise.all(Array.from({length:limit},worker));
@@ -31,7 +41,7 @@
       if(!ids.size){pending.delete(number);onComplete(number);}
     }};
   }
-  function groupByPage(pages,items,size=3,maxCharacters=6000,longBlockCharacters=1500){
+  function groupByPage(pages,items,size=5,maxCharacters=12000,longBlockCharacters=4000){
     const selected=new Set(items.map(item=>item.id)),groups=[];
     for(const page of pages){
       let group=[],characters=0;
@@ -68,26 +78,66 @@
         if(!error.retryable || attempt>=delays.length)throw error;
         if(shouldStop())throw paused();
         onRetry(error,attempt+1,delays.length);
-        await wait(delays[attempt]);
+        // A provider rate limit states how long to wait; ignore that hint and
+        // retrying after one second only burns the remaining attempts.
+        const retryAfter=Number(error.retryAfter);
+        const delay=Number.isFinite(retryAfter) && retryAfter>0 ? Math.min(60000,retryAfter*1000) : delays[attempt];
+        await wait(delay);
       }
     }
   }
-  async function translateGroup({blocks,canBatch=()=>true,translateBatch,translateOne,onBlock,onFallback=()=>{},shouldStop=()=>false}){
+  function acceptedBatch(result,blocks){
+    if(!Array.isArray(result?.blocks))return null;
+    const wanted=new Set(blocks.map(block=>block.id)),accepted=new Map();
+    let duplicate=false;
+    const ambiguous=new Set();
+    for(const item of result.blocks){
+      if(!item || !wanted.has(item.id)){duplicate=true;continue;}
+      if(ambiguous.has(item.id) || accepted.has(item.id)){
+        accepted.delete(item.id);ambiguous.add(item.id);duplicate=true;continue;
+      }
+      if(typeof item.translation!=='string' || !item.translation.trim()){duplicate=true;continue;}
+      accepted.set(item.id,item);
+    }
+    if(!accepted.size)return null;
+    // A duplicate or unknown id means the response cannot be trusted as a
+    // complete mapping, but individually valid paragraphs are still usable.
+    return {accepted,duplicate};
+  }
+  async function translateGroup({blocks,canBatch=()=>true,translateBatch,translateOne,onBlock,onFallback=()=>{},onBatchAccepted=()=>{},shouldStop=()=>false}){
     if(shouldStop())throw paused();
+    let remaining=blocks;
     if(blocks.length>1 && canBatch()){
+      let fellBack=false;
       try{
         const result=await translateBatch(blocks);
-        // Validate the whole group before accepting any result or changing progress.
-        if(!Array.isArray(result?.blocks) || result.blocks.length!==blocks.length ||
-          new Set(result.blocks.map(b=>b?.id)).size!==blocks.length ||
-          blocks.some(block=>!result.blocks.some(b=>b?.id===block.id && typeof b.translation==='string' && b.translation.trim())))
-          throw Object.assign(new Error('合并译文格式不完整'),{fallback:'single'});
-        for(const block of blocks)onBlock(result.blocks.find(b=>b.id===block.id));
-        return;
-      }catch(error){if(error.fallback!=='single')throw error;onFallback();}
+        const parsed=acceptedBatch(result,blocks);
+        if(!parsed)throw Object.assign(new Error('合并译文格式不完整'),{fallback:'single'});
+        for(const block of blocks){const item=parsed.accepted.get(block.id);if(item)onBlock(item);}
+        remaining=blocks.filter(block=>!parsed.accepted.has(block.id));
+        onBatchAccepted();
+      }catch(error){
+        if(error.fallback!=='single')throw error;
+        onFallback();fellBack=true;remaining=blocks;
+      }
+      if(!fellBack && remaining.length>1 && canBatch()){
+        // The model often omits exactly one paragraph from an otherwise valid
+        // JSON object. Ask once for only the missing ones before paying for
+        // individual requests.
+        try{
+          const retry=acceptedBatch(await translateBatch(remaining),remaining);
+          if(retry){
+            for(const block of remaining){const item=retry.accepted.get(block.id);if(item)onBlock(item);}
+            remaining=remaining.filter(block=>!retry.accepted.has(block.id));
+          }
+        }catch(error){
+          if(error.fallback!=='single')throw error;
+          onFallback();
+        }
+      }
     }
     // Save each successful single result immediately, including partial fallback success.
-    for(const block of blocks){
+    for(const block of remaining){
       if(shouldStop())throw paused();
       const result=await translateOne(block);
       if(result?.id!==block.id || typeof result.translation!=='string' || !result.translation.trim())throw new Error('单段译文格式不完整');

@@ -4,6 +4,7 @@
   <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>页间 Parallel · PDF 对照翻译</title>
   <link rel="icon" type="image/x-icon" href="/static/parallel.ico">
+  <link rel="icon" type="image/svg+xml" href="/static/parallel.svg">
   <style>
     #launch-notice{display:none}
     html.needs-server body{margin:0;background:#f4f7f1;color:#293e32;font:16px/1.8 'Segoe UI','Microsoft YaHei',sans-serif}
@@ -45,7 +46,7 @@
     <a href="http://127.0.0.1:8765/">打开本地工作台 →</a>
   </section>
   <aside class="sidebar">
-    <a class="brand" href="/" aria-label="页间首页"><span class="brand-icon">Ⅱ</span><span>页间 <b>Parallel</b></span></a>
+    <a class="brand" href="/" aria-label="页间首页"><img class="brand-icon" src="/static/parallel.svg" alt=""><span>页间 <b>Parallel</b></span></a>
     <div class="workspace-label">你的阅读工作台</div>
     <button id="upload-side" class="new-document"><span>＋</span> 导入 PDF <kbd>本地</kbd></button>
     <div class="section-label">文档库 <span id="library-count">0</span></div>
@@ -86,11 +87,11 @@
             <label class="sync-control"><input id="sync-scroll" type="checkbox" checked> 同步滚动</label>
             <label>并发请求 <select id="translation-concurrency"><option value="1">1 个</option><option value="2">2 个</option><option value="3" selected>3 个（推荐）</option><option value="4">4 个</option><option value="6">6 个</option><option value="8">8 个</option><option value="12">12 个</option></select></label>
             <small class="field-help">适当提高并发可减少等待；8/12 需要服务商允许，遇到限流请调低。顺序模式可参考完整的前文译文。</small>
-            <label>每次请求 <select id="translation-batch-size"><option value="1">1 段（兼容）</option><option value="3" selected>3 段（快速）</option><option value="5">5 段</option></select></label>
+            <label>每次请求 <select id="translation-batch-size"><option value="1">1 段（兼容）</option><option value="3">3 段（快速）</option><option value="5" selected>5 段</option></select></label>
             <small id="batch-help" class="field-help">合并同页段落，减少请求和重复上下文。</small>
             <label>译文视图 <select id="translation-view"><option value="pdf">原版式 PDF</option><option value="paragraph">段落</option></select></label>
-            <label class="sync-control"><input id="translation-edit" type="checkbox"> 编辑译文</label>
-            <small class="field-help">开启后可通过段落按钮或双击译文编辑。</small>
+            <label class="sync-control"><input id="translation-edit" type="checkbox"> 开启译文编辑</label>
+            <small class="field-help">默认关闭，可选中文字进行解释、引用和高亮。开启后可双击译文段落编辑。</small>
             <small class="field-help">每页译完后自动更新 PDF；阅读时可连续下滑跨页，后续页面继续翻译。</small>
             <button id="refresh-layout" class="button subtle">重新排版</button>
             <a id="download-pdf" class="button subtle hidden">下载译文 PDF</a>

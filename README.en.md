@@ -37,6 +37,12 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 
 ## Changelog
 
+### 2026-11-07 Paragraph continuations, inline formulas and annotations
+
+Xia Shao contributed support for paragraphs split across columns or adjacent pages and for inline fractions. An English continuation can use the preceding fragment as translation context. A blank or image-only page breaks the association. When a formula cannot be reconstructed reliably, the layout report explains why the original paragraph was retained. [PR #2](https://github.com/Lei-Ao/ParallelTranslation/pull/2)
+
+The annotations view links back to highlights and quotations. Batch translation keeps valid results and retries only missing paragraphs. Layout cache version 76 rebuilds from saved translations. [Full changelog](CHANGELOG.md)
+
 ### 2026-11-06 Paper assistant, contextual Q&A, and local notes
 
 Integrated the paper-reading features contributed by XIA-J-B (夏少).
@@ -129,10 +135,10 @@ Only non-streaming JSON responses completed in one request are supported. SSE, p
 1. Select a target language on the home page and optionally enter terminology and translation instructions.
 2. Import a text-based PDF. The app extracts and translates its text, shows progress, and opens the reader when translation and typesetting finish.
 3. Pause when needed. Resume after failures to skip already saved translations in the current target language.
-4. Click a paragraph to locate its counterpart. Drag to select text and press Ctrl+C to copy. Double-click selects a word by default. To edit, select a translated paragraph and click “编辑译文”, enable double-click editing in the menu, or use the paragraph view.
+4. Click a paragraph to locate its counterpart. Drag to select text and press Ctrl+C to copy. Double-click selects a word by default. To edit a translation, enable translation editing in the menu and double-click the translated paragraph.
 5. Use the menu to change language, concurrency, batch size, synchronized scrolling, or reading mode; regenerate the layout; download the PDF; or export bilingual Markdown.
 
-The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **3 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
+The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **5 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
 
 Pausing stops new requests while letting in-flight requests finish and save their results. Keep the page open during translation. After a refresh, reopen a document from the library to resume saved progress.
 

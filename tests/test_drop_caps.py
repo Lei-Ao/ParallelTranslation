@@ -139,7 +139,7 @@ class DropCapTests(unittest.TestCase):
         self.assertEqual(document["pages"][0]["blocks"][0]["translation"], expected[0]["blocks"][0]["translation"])
         self.assertTrue(all(b.get("drop_cap_preserve") for b in document["pages"][0]["blocks"]))
         document["pages"][0]["blocks"][0]["translation"] = "2. 已核对概述"
-        normalize_drop_caps(document, pdf)
+        normalize_drop_caps(document, pdf, force=True)
         self.assertEqual(document["pages"][0]["blocks"][0]["translation"], "2. 已核对概述")
         self.assertTrue(document["pages"][0]["blocks"][1]["text"].startswith("DYNAMIC "))
         self.assertFalse(any(b.get("drop_cap_preserve") for b in document["pages"][0]["blocks"]))

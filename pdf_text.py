@@ -89,13 +89,15 @@ def _drop_caps(page, native):
                        or overlap(pymupdf.Rect(first["bbox"]), box) > .1 for box in graphics)]
 
 
-def normalize_drop_caps(document, pdf):
+def normalize_drop_caps(document, pdf, *, force=False):
     """Restore whole words without renumbering body paragraphs or discarding translations.
 
     Original affected records are retained for recovery. A glyph-only record has
     no independent paragraph meaning; its former ID remains an explicit alias.
+    The schema marks that the source has been analysed; an unresolved drop cap
+    is tracked separately so opening the document does not rescan every page.
     """
-    if document.get("drop_cap_schema") == DROP_CAP_SCHEMA:
+    if document.get("drop_cap_schema") == DROP_CAP_SCHEMA and not force:
         return False
     changed = False
     for saved_page, page in zip(document["pages"], pdf):
@@ -174,5 +176,9 @@ def normalize_drop_caps(document, pdf):
     if changed and "total_blocks" in document:
         document["total_blocks"] = sum(len(page["blocks"]) for page in document["pages"])
     pending = any(b.get("drop_cap_preserve") for p in document["pages"] for b in p["blocks"])
-    document["drop_cap_schema"] = 0 if pending else DROP_CAP_SCHEMA
+    document["drop_cap_schema"] = DROP_CAP_SCHEMA
+    if pending:
+        document["drop_cap_review_pending"] = True
+    else:
+        document.pop("drop_cap_review_pending", None)
     return True

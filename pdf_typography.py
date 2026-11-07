@@ -1,12 +1,19 @@
 """Local, embedded book typography; subset before instancing variable fonts."""
+import hashlib
 import io
+import json
 import math
 import os
 import re
+import shutil
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
 import pymupdf
+
+FONT_CACHE_VERSION = 2
+FONT_CACHE_LIMIT = 48
 
 
 def space_cjk_latin(text):
@@ -45,7 +52,7 @@ def font_signature():
     return [(path, Path(path).stat().st_size, Path(path).stat().st_mtime_ns) for path in source[:2]]
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def subset_fonts(characters, regular, bold):
     from fontTools import subset
     from fontTools.ttLib import TTFont
@@ -78,7 +85,7 @@ def subset_fonts(characters, regular, bold):
     return tuple(results)
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=12)
 def oblique_font(data):
     """Embed real slanted outlines when the CJK family has no italic master.
 
@@ -119,6 +126,45 @@ def oblique_font(data):
         return output.getvalue()
 
 
+def _font_cache_root():
+    return Path(tempfile.gettempdir()) / "parallel-translation-font-cache"
+
+
+def _read_font_cache(key):
+    folder = _font_cache_root() / key
+    try:
+        data = (
+            (folder / "regular.ttf").read_bytes(),
+            (folder / "semibold.ttf").read_bytes(),
+            (folder / "italic.ttf").read_bytes(),
+            (folder / "semibold-italic.ttf").read_bytes(),
+            json.loads((folder / "meta.json").read_text(encoding="utf-8"))["fallback"],
+        )
+        return data if all(data[:4]) else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_font_cache(key, regular, semibold, italic, semibold_italic, fallback):
+    root = _font_cache_root()
+    folder = root / key
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        for name, data in (("regular.ttf", regular), ("semibold.ttf", semibold),
+                           ("italic.ttf", italic), ("semibold-italic.ttf", semibold_italic)):
+            temp = folder / (name + ".tmp")
+            temp.write_bytes(data)
+            temp.replace(folder / name)
+        (folder / "meta.json").write_text(json.dumps({"fallback": fallback}), encoding="utf-8")
+        entries = [entry for entry in root.iterdir() if entry.is_dir()]
+        if len(entries) > FONT_CACHE_LIMIT:
+            entries.sort(key=lambda entry: entry.stat().st_mtime_ns)
+            for entry in entries[:-FONT_CACHE_LIMIT]:
+                shutil.rmtree(entry, ignore_errors=True)
+    except OSError:
+        pass
+
+
 def font_resources(text):
     source = font_source()
     if source is None:
@@ -127,19 +173,29 @@ def font_resources(text):
     import unicodedata
     characters = "".join(sorted(set(text + unicodedata.normalize("NFKC", text)
                                     + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,:;()[]-")))
+    key = hashlib.sha256(
+        f"{FONT_CACHE_VERSION}|{font_signature()}|{characters}".encode("utf-8")).hexdigest()[:40]
+    cached = _read_font_cache(key)
     try:
-        regular, semibold = subset_fonts(characters, source[0], source[1])
-        from fontTools.ttLib import TTFont
-        with TTFont(io.BytesIO(regular)) as embedded:
-            supported = embedded.getBestCmap()
-            fallback_characters = "".join(char for char in characters if not char.isspace() and ord(char) not in supported)
+        if cached is not None:
+            regular, semibold, italic, semibold_italic, fallback_characters = cached
+        else:
+            regular, semibold = subset_fonts(characters, source[0], source[1])
+            from fontTools.ttLib import TTFont
+            with TTFont(io.BytesIO(regular)) as embedded:
+                supported = embedded.getBestCmap()
+                fallback_characters = "".join(char for char in characters
+                                              if not char.isspace() and ord(char) not in supported)
+            italic = oblique_font(regular)
+            semibold_italic = oblique_font(semibold)
+            _write_font_cache(key, regular, semibold, italic, semibold_italic, fallback_characters)
     except (ImportError, OSError, ValueError, KeyError):
         return {"css": "", "family": "serif", "archive": None, "label": "内置宋体回退"}
     archive = pymupdf.Archive()
     archive.add((regular, "parallel-regular.ttf"))
     archive.add((semibold, "parallel-semibold.ttf"))
-    archive.add((oblique_font(regular), "parallel-italic.ttf"))
-    archive.add((oblique_font(semibold), "parallel-semibold-italic.ttf"))
+    archive.add((italic, "parallel-italic.ttf"))
+    archive.add((semibold_italic, "parallel-semibold-italic.ttf"))
     css = ("@font-face{font-family:ParallelBook;src:url(parallel-regular.ttf);font-weight:400;}"
            "@font-face{font-family:ParallelBook;src:url(parallel-semibold.ttf);font-weight:600;}"
            "@font-face{font-family:ParallelBook;src:url(parallel-italic.ttf);font-weight:400;font-style:italic;}"

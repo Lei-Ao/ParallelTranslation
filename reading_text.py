@@ -29,6 +29,7 @@ class CitationRequest(BaseModel):
     text_version: str = Field(max_length=80)
     ranges: list[TextRange] = Field(min_length=1, max_length=300)
     view: Literal['source', 'translation', 'paragraph'] = 'source'
+    translated: bool = True
     revision: str | None = Field(default=None, pattern=r'^[a-f0-9]{24}$')
     block_id: str | None = Field(default=None, max_length=80)
 
@@ -114,7 +115,8 @@ def resolve_citation(service, doc_id, request):
                       for b in p['blocks'] if b['id'] == request.block_id), None)
         if not block:
             raise HTTPException(422, '引用段落不存在')
-        text = block.get('translation') or block['text']
+        translated = bool(request.translated) and bool(block.get('translation'))
+        text = block['translation'] if translated else block['text']
         if request.text_version != digest(text):
             raise HTTPException(409, '段落内容已改变，请重新选择')
         if len(request.ranges) != 1:
@@ -125,7 +127,7 @@ def resolve_citation(service, doc_id, request):
         if item.end - item.start > 16000:
             raise HTTPException(422, '引用过长，请分批选择')
         source = dict(doc_id=doc_id, page=request.page, view='paragraph', block_id=block['id'],
-                      translated=bool(block.get('translation')), text_version=request.text_version,
+                      translated=translated, text_version=request.text_version,
                       ranges=[item.model_dump()], text=text[item.start:item.end])
         return dict(id='quote-' + digest(source)[:20], text=text[item.start:item.end], source=source, block_ids=[block['id']],
                     request=request.model_dump())

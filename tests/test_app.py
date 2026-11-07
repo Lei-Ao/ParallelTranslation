@@ -74,8 +74,11 @@ class TranslationTests(unittest.TestCase):
             payload = json.loads(request.content)
             self.assertFalse(payload["stream"])
             self.assertEqual(payload["model"], "my-agent")
+            system = payload["messages"][0]["content"]
             prompt = payload["messages"][1]["content"]
-            self.assertIn("agent = 智能体", prompt)
+            # Keep source material in the user message.
+            self.assertIn("agent = 智能体", system)
+            self.assertNotIn("Reading with context", system)
             self.assertIn("Reading with context", prompt)
             self.assertIn("A second paragraph", prompt)
             return httpx.Response(200, json={"choices": [{"message": {"content": "智能体结合上下文翻译文档。"}, "finish_reason": "stop"}]})
@@ -226,19 +229,24 @@ class TranslationTests(unittest.TestCase):
         for block in service.all_blocks(service.load_doc(doc["id"])):
             self.assertEqual(block["translation"], "译文 " + block["id"])
 
-    def test_invalid_batch_does_not_overwrite_existing_translation(self):
+    def test_invalid_batch_saves_valid_items_and_leaves_rest_for_retry(self):
         doc = self.upload()
         ids = [b["id"] for b in service.all_blocks(doc)]
         self.client.patch(f"/api/documents/{doc['id']}/blocks/{ids[0]}", json={"translation": "已校对"})
-        payloads = [{"blocks": [{"id": ids[0], "translation": "部分结果"}]},
-                    {"blocks": [{"id": ids[0], "translation": "重复"}] * 3},
-                    {"blocks": [{"id": block_id, "translation": ""} for block_id in ids]}]
-        for output in payloads:
+        payloads = [({"blocks": [{"id": [], "translation": "无效编号"},
+                                {"id": ids[0], "translation": "部分结果"}]}, 200),
+                    ({"blocks": [{"id": ids[0], "translation": "重复"}] * 3}, 502),
+                    ({"blocks": [{"id": block_id, "translation": ""} for block_id in ids]}, 502)]
+        for output, status in payloads:
             with self.mock_agent(lambda req: httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(output)}}]})):
                 response = self.client.post(f"/api/documents/{doc['id']}/blocks/translate-batch", json={"agent": self.agent, "block_ids": ids})
-            self.assertEqual(response.status_code, 502)
-            self.assertEqual(response.headers.get("X-Translation-Fallback"), "single")
-            self.assertEqual(service.all_blocks(service.load_doc(doc["id"]))[0]["translation"], "已校对")
+            self.assertEqual(response.status_code, status)
+            if status == 200:
+                self.assertEqual(response.json()["missing"], ids[1:])
+                self.assertEqual(service.all_blocks(service.load_doc(doc["id"]))[0]["translation"], "部分结果")
+            else:
+                self.assertEqual(response.headers.get("X-Translation-Fallback"), "single")
+                self.assertEqual(service.all_blocks(service.load_doc(doc["id"]))[0]["translation"], "部分结果")
 
     def test_agent_errors_distinguish_transient_from_authentication_failures(self):
         for status in [401, 403, 404, 408, 429, 500, 502, 503, 504]:

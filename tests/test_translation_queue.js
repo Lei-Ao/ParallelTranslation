@@ -28,14 +28,26 @@ test('pause stops new requests and drains in-flight work before resolving',async
   c.pending.get(1).resolve('one');
   assert.deepEqual(await job,{completed:2,failed:0,paused:true});
 });
-test('failure stops scheduling but retains successful concurrent results',async()=>{
+test('one failure does not stop independent work',async()=>{
   const c=controlled(),errors=[];
   const job=run({items:[0,1,2,3,4],concurrency:3,...c.options,onError:(item,error)=>errors.push([item,error.message])});
   c.pending.get(1).reject(new Error('rate limit'));await tick();
-  assert.deepEqual(c.started,[0,1,2]);
-  c.pending.get(0).resolve('zero');c.pending.get(2).resolve('two');
-  assert.deepEqual(await job,{completed:2,failed:1,paused:false});
-  assert.deepEqual(errors,[[1,'rate limit']]);assert.equal(c.saved.length,2);
+  assert.deepEqual(c.started,[0,1,2,3]);
+  c.pending.get(0).resolve('zero');c.pending.get(2).resolve('two');await tick();
+  assert.ok(c.started.includes(4));
+  c.pending.get(3).resolve('three');c.pending.get(4).resolve('four');
+  assert.deepEqual(await job,{completed:4,failed:1,paused:false});
+  assert.deepEqual(errors,[[1,'rate limit']]);assert.equal(c.saved.length,4);
+});
+test('repeated failures stop scheduling new work',async()=>{
+  const c=controlled(),errors=[];
+  const job=run({items:[0,1,2,3,4,5],concurrency:2,...c.options,
+    onError:(item,error)=>errors.push(item)});
+  c.pending.get(0).reject(new Error('auth'));c.pending.get(1).reject(new Error('auth'));await tick();
+  c.pending.get(2).reject(new Error('auth'));await tick();
+  c.pending.get(3).reject(new Error('auth'));await tick();
+  assert.deepEqual(await job,{completed:0,failed:4,paused:false});
+  assert.equal(c.started.length,4);
 });
 test('sequential mode receives prior results before the next request starts',async()=>{
   const saved=[];
@@ -85,7 +97,7 @@ test('very long paragraphs run alone so short paragraphs are not held back',()=>
     {id:'b',text:'b'.repeat(10)},
     {id:'c',text:'c'.repeat(10)}]}];
   const pending=pages[0].blocks;
-  assert.deepEqual(groupByPage(pages,pending,5,6000).map(g=>g.blocks.map(b=>b.id)),
+  assert.deepEqual(groupByPage(pages,pending,5,6000,1500).map(g=>g.blocks.map(b=>b.id)),
     [['a'],['long'],['b','c']]);
 });
 test('concurrency can reach twelve requests at once',async()=>{
@@ -126,10 +138,16 @@ test('batch format failure falls back to singles and saves each result immediate
     onFallback:()=>fallback++,onBlock:block=>saved.push(block.id)});
   assert.deepEqual(saved,['a','b']);assert.equal(fallback,1);
 });
-test('invalid duplicate or missing batch IDs are rejected before accepting results',async()=>{
-  for(const output of [[{id:'a',translation:'甲'}],[{id:'a',translation:'甲'},{id:'a',translation:'甲'}]]){
+test('valid batch items are kept and missing or duplicated ones are retried alone',async()=>{
+  {
     const saved=[];
-    await translateGroup({blocks:[{id:'a'},{id:'b'}],translateBatch:async()=>({blocks:output}),
+    await translateGroup({blocks:[{id:'a'},{id:'b'}],translateBatch:async()=>({blocks:[{id:'a',translation:'甲'}]}),
+      translateOne:async b=>({...b,translation:'单段'}),onBlock:b=>saved.push(b.translation)});
+    assert.deepEqual(saved,['甲','单段']);
+  }
+  {
+    const saved=[];
+    await translateGroup({blocks:[{id:'a'},{id:'b'}],translateBatch:async()=>({blocks:[{id:'a',translation:'甲'},{id:'a',translation:'甲'}]}),
       translateOne:async b=>({...b,translation:'单段'}),onBlock:b=>saved.push(b.translation)});
     assert.deepEqual(saved,['单段','单段']);
   }
