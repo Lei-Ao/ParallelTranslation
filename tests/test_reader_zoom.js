@@ -55,6 +55,16 @@ test('fit uses one physical scale for both panes and mixed portrait/landscape pa
   assert.equal(r.source.classList.contains('can-pan'),false);
 });
 
+test('single-pane reading fits the visible pane and restores dual-pane scale',()=>{
+  const r=reader();r.translation.clientWidth=0;r.source.clientWidth=1000;
+  r.eval('applyViewportGeometry()');
+  assert.equal(r.source.pages[1].getBoundingClientRect().width,964);
+  r.source.clientWidth=0;r.translation.clientWidth=700;r.eval('applyViewportGeometry()');
+  assert.equal(r.translation.pages[1].getBoundingClientRect().width,664);
+  r.source.clientWidth=500;r.translation.clientWidth=520;r.eval('applyViewportGeometry()');
+  assert.equal(r.source.pages[1].getBoundingClientRect().width,464);
+});
+
 test('zoom retains the point under the cursor on a later page and both horizontal positions',()=>{
   const r=reader();r.eval('setReaderZoom(1)');
   r.source.scrollTop=1200;r.translation.scrollTop=1230;

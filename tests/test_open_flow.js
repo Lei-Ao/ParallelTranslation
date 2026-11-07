@@ -39,6 +39,20 @@ function workspace({saved=false,empty=false}={}){
 async function finishBlock(r,index,id){
   r.requests[index].resolve({id,translation:'译文',target:'简体中文'});await tick();
 }
+
+test('direct read opens an untranslated document without a model request',async()=>{
+  const r=workspace(),job=r.eval("openDocument('demo',true)");
+  r.requests[0].resolve(r.eval('state.doc'));await job;
+  assert.deepEqual(r.opened,[undefined]);
+  assert.equal(r.requests.length,1);
+  assert.equal(r.eval('state.pendingOpen'),false);
+});
+
+test('direct read also opens image-only documents without translation',async()=>{
+  const r=workspace({empty:true}),job=r.eval("openDocument('demo',true)");
+  r.requests[0].resolve(r.eval('state.doc'));await job;
+  assert.equal(r.opened.length,1);assert.equal(r.requests.length,1);
+});
 test('import stays in the library through translation and opens only after final layout',async()=>{
   const r=workspace();
   const job=r.eval('uploadFile({size:100})');

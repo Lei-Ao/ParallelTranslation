@@ -65,21 +65,6 @@ class TranslationTests(unittest.TestCase):
         self.assertTrue(0 <= y0 < y1 <= 1)
         self.assertGreater(x0, .8)
 
-    def test_reader_question_only_sends_the_cited_text_and_keeps_document(self):
-        doc = self.upload(90)
-        excerpt = "第 1 页\nReading with context"
-        question = "这里的 context 是什么意思？"
-        def handler(request):
-            message = json.loads(request.content)["messages"][1]
-            self.assertEqual(json.loads(message["content"]), {
-                "引用原文": excerpt, "问题": question, "回答语言": "简体中文"})
-            return httpx.Response(200, json={"choices": [{"message": {"content": "上下文"}}]})
-        with self.mock_agent(handler):
-            response = self.client.post("/api/reader/ask", json={
-                "agent": self.agent, "excerpts": excerpt, "question": question})
-        self.assertEqual(response.json(), {"answer": "上下文"})
-        self.assertEqual(self.client.get(f"/api/documents/{doc['id']}").json(), doc)
-
     def test_openai_translation_context_and_save(self):
         doc = self.upload()
         block_id = doc["pages"][0]["blocks"][1]["id"]

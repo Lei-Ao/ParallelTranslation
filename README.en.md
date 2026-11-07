@@ -31,8 +31,27 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 - **Contextual translation**: surrounding paragraphs, completed translations, target language, terminology, and custom instructions.
 - **Concurrency and recovery**: configurable parallel requests and same-page batches, pause/resume, bounded retries, and reuse of saved translations.
 - **Editing and export**: edit or retranslate individual paragraphs, export bilingual Markdown, and automatically save a standalone translated PDF.
+- **Paper assistant**: open the original directly, read section by section, ask about selections in either language, and save answers with their citations as local notes.
 
 > Layout decisions use document geometry, typography, and structure. Complex regions may retain the complete original with an explanation. Successful translation of every region in every PDF is not guaranteed.
+
+## Changelog
+
+### 2026-11-06 Paper assistant, contextual Q&A, and local notes
+
+Integrated the paper-reading features contributed by XIA-J-B (夏少).
+
+- Open papers directly from the library or during import, then translate as needed.
+- Analyze the complete text, outline, and all page images with full-paper visual reading, or work through individual sections with guided reading.
+- Ask about source or translated selections, combine quotations across paragraphs and pages, inspect figure regions, follow citations, and save colored highlights.
+- Save answers as independent local notes with their questions, formulas, and sources, and export them as Markdown.
+- Switch between source, bilingual, and translation views, use responsive reading panels, and optionally enable double-click editing.
+
+Validation covered 318 Python cases, 78 JavaScript cases, and isolated browser checks, plus 146 source pages from 10 papers and 10 saved translation pages. Some character encodings and context mappings still require fallback. Real-model understanding and citation quality need further evaluation. Usage, provenance, and validation details are documented in the [changelog](CHANGELOG.md) and [Chinese reading guide](docs/skill-reading.zh-CN.md).
+
+### 2026-11-04 Layout and typography fixes
+
+Integrated PR #1 with fixes for figure labels, author grids, heading weight and italics, bold caption titles, equation labels, and grouped reader highlights. The layout cache version advanced to 67. [Development notes in Chinese](docs/development.zh-CN.md)
 
 ## Quick start
 
@@ -110,12 +129,18 @@ Only non-streaming JSON responses completed in one request are supported. SSE, p
 1. Select a target language on the home page and optionally enter terminology and translation instructions.
 2. Import a text-based PDF. The app extracts and translates its text, shows progress, and opens the reader when translation and typesetting finish.
 3. Pause when needed. Resume after failures to skip already saved translations in the current target language.
-4. Click a paragraph to locate its counterpart; click blank space to clear paragraph selection. Drag to select words or sentences and press Ctrl+C to copy; double-click to select a word. To edit, select a translated paragraph and click its “编辑译文” button, or use the paragraph editing view in the top-right menu. Use the wheel or scrollbars to scroll; mouse dragging no longer pans the page.
+4. Click a paragraph to locate its counterpart. Drag to select text and press Ctrl+C to copy. Double-click selects a word by default. To edit, select a translated paragraph and click “编辑译文”, enable double-click editing in the menu, or use the paragraph view.
 5. Use the menu to change language, concurrency, batch size, synchronized scrolling, or reading mode; regenerate the layout; download the PDF; or export bilingual Markdown.
 
 The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **3 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
 
 Pausing stops new requests while letting in-flight requests finish and save their results. Keep the page open during translation. After a refresh, reopen a document from the library to resume saved progress.
+
+### Direct reading and the paper assistant
+
+Choose **导入后直接阅读** before importing, or click **直接阅读** in the library to open a paper immediately. In the reader, open **论文助手**. Choose **文章速读** for a full-paper analysis, **逐节陪读** to work through a section, or select text in either pane to ask about it. Answers link back to their sources. Save an answer as a note to keep it after clearing the conversation or export it as Markdown.
+
+Opening the panel or browsing the outline is local. Starting an AI task uses your configured endpoint and may incur charges. Full-paper reading sends all extracted text, the outline, and an image of every page. It requires a model with image input, tool calls, and sufficient capacity. Restart the service and refresh the reader after updating. [Reading guide in Chinese](docs/skill-reading.zh-CN.md)
 
 ## Storage and privacy
 
@@ -124,7 +149,8 @@ Pausing stops new requests while letting in-flight requests finish and save thei
 | Source PDFs, extracted text, translations, and layout caches | `.data/<document ID>/` |
 | Completed standalone translated PDFs | `output/pdf/` under the project root |
 | Agent configuration, API key, language, and terminology settings | The current browser’s localStorage |
-| Content sent to the AI service | The current paragraph, bounded text context, terminology, and instructions |
+| Reading sessions and notes | `reading.json` and `reading-notes.json` in the document directory. Highlights are stored in the current browser. |
+| Content sent to the AI service | Translation uses paragraphs, bounded context, terminology, and instructions. Reading can also send source text, page or region images, questions, and relevant conversation history. |
 
 - PDF binaries are not sent to the configured translation endpoint, but relevant text is sent to that service.
 - Credentials in browser storage are **not encrypted**. A masked input only hides their display. Use the saved-key removal control to remove a credential.
@@ -138,7 +164,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 ## Scope and limitations
 
 - PDFs must have **1–300 pages** and be no larger than **50 MB**.
-- Scans require OCR beforehand; automatic OCR is not included.
+- Translating scans and selecting text require an OCR text layer. Visual reading can use images of scanned pages.
 - Columns, rotation, headings, author information, inline symbols, drop caps, and references use general layout rules. Complex documents can still have extraction or typesetting errors.
 - A cover title extracted as several text blocks is merged into one title group and typeset with the source title's size and weight. Author affiliation markers stay superscripted regardless of whether they follow the surname directly, a comma, a space, or a footnote symbol. Rotated covers and titles that do not start on the first page still follow the conservative per-block path.
 - A bibliography that cannot be rebuilt into complete entries (multi-page lists, unquoted book titles, non-contiguous numbering) is retained as a whole and explained in the layout report, so one entry is never mixed between languages or overwritten by an expanded translation. The heading itself is still translated. Continuation pages without recognizable numbering are treated as ordinary text.
@@ -156,7 +182,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
-node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js tests/test_reader_selection.js
+node --test (Get-ChildItem tests/test_*.js).FullName
 ```
 
 Tests use temporary PDFs and simulated endpoints, without consuming real AI service credits. An optional audit of documents already translated on your machine is available:
@@ -191,7 +217,10 @@ When reporting a problem, include your operating system, Python version, reprodu
 
 ## Contributors
 
-Thanks to [XIA-2005 (XIAJINGBO)](https://github.com/XIA-2005) for the layout and typography fixes, grouped reader highlights, and regression tests in [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1). The changes are integrated with the current architecture, preserving figure protection, list layout, desktop launching, and text selection.
+Thanks to XIA-J-B (夏少) for their continued contributions. [GitHub profile](https://github.com/XIA-J-B)
+
+- Layout and typography fixes, grouped reader highlights, and regression tests. [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
+- Full-paper visual reading, contextual Q&A, colored highlights, local reading notes, and regression tests. [Contribution](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
 
 See all [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors). Issues and pull requests are welcome.
 
