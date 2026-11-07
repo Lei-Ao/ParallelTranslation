@@ -48,7 +48,7 @@ async function generateLayout(){
     if(request===layoutRequest){state.layoutBusy=false;updateLayoutControls();if(state.view==='pdf' && state.doc?.id===id && !state.pendingOpen)renderTranslations();}
   }
 }
-function showEdit(block){editBlock=block;$('#edit-source').textContent=block.text;$('#edit-text').value=block.translation;$('#edit-dialog').showModal();}
+function showEdit(block){if(!$('#enable-edit').checked)return;editBlock=block;$('#edit-source').textContent=block.text;$('#edit-text').value=block.translation;$('#edit-dialog').showModal();}
 const escapeHtml = (str) => String(str).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const URL_TEXT=/https?:\/\/[^\s<>"'，。；：！？）】」』《【〕]+/g;
 const URL_TRAILING=/[.,;:!?)\]}'"。、；，！？）：」』）》]+$/;
@@ -507,6 +507,7 @@ function renderPage(){
   scrollToPage(state.page);
 }
 function showLibrary(){
+  globalThis.resetReadingAssistant?.();
   document.body.classList.remove('reading','reading-focus');$('#reader').classList.add('hidden');$('#welcome').classList.remove('hidden');$('#breadcrumb-title').textContent='对照翻译';$('#reader-menu').open=false;
 }
 function updateOpenProgress(count,total){

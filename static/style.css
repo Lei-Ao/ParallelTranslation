@@ -106,7 +106,26 @@ body.reading .translation-pane.pdf-mode{padding:16px 18px 44px;background:#e9ede
 .pdf-page .link-overlay,.pdf-page .link-group{z-index:3}
 .pdf-page .link-overlay.text-link-hover,.pdf-page .link-group.text-link-hover .link-overlay{background:#21796524;box-shadow:inset 0 0 0 1px #21796559}
 .pdf-page .block-edit{display:none;position:absolute;z-index:5;transform:translateY(-100%);font-size:11px;line-height:1.5;padding:3px 7px;border:1px solid #b8d1c1;border-radius:4px;background:#f4faf5;color:var(--teal);user-select:none}
-.pdf-page .block-overlay.selected + .block-edit{display:block}
+body:has(#enable-edit:checked) .pdf-page .block-overlay.selected + .block-edit{display:block}
+body:not(:has(#enable-edit:checked)) .card-actions [data-action="edit"]{display:none}
+body.selecting-source .pdf-page :is(.block-overlay,.block-group-highlight){background:transparent;border-color:transparent;box-shadow:none}
+.pdf-char::highlight(reader-marks){background:#f7d85b99;color:transparent}
+#excerpt-tools{position:fixed;z-index:8;display:flex;background:#242424;color:white;border-radius:8px;padding:4px;box-shadow:0 3px 14px #0003}
+#excerpt-tools button{padding:6px 9px;font-size:13px;border-radius:5px}
+#excerpt-tools button:hover,#excerpt-tools button:focus-visible{background:#474747}
+#reader{position:relative}
+#reading-assistant{position:absolute;top:48px;bottom:0;right:0;width:min(43%,440px);background:white;z-index:6;display:flex;flex-direction:column;border-left:1px solid var(--line);box-shadow:-4px 0 20px #0001}
+#reading-assistant header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
+#reading-assistant header button,#reading-excerpts button{font-size:18px}
+#reading-answers{flex:1;min-height:0;overflow:auto;padding:0 16px}
+#reading-assistant blockquote{margin:8px 0;padding:6px 10px;border-left:2px solid #b4c5b7;background:#f6f8f5;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+#reading-answers p{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.7}
+#reading-question{margin:10px;padding:8px;border:1px solid var(--line);border-radius:10px;text-align:right}
+#reading-question textarea{width:100%;border:0;resize:none}
+#reading-excerpts{max-height:22vh;overflow:auto;text-align:left}
+#reading-excerpts blockquote{position:relative;padding-right:28px}
+#reading-excerpts button{position:absolute;right:2px;top:2px}
+@media(max-width:760px){#reading-assistant{width:100%;top:50%}}
 body.reading-focus .reader-viewbar{display:none}
 @media(max-width:1100px){.zoom-hint{display:none}}
 @media(max-width:760px){.reader-viewbar{display:flex;justify-content:flex-end}.viewbar-source{display:none}.viewbar-translation{border:0;width:100%;padding:5px 10px}.viewbar-translation>span::before{content:"原文 / "}}
