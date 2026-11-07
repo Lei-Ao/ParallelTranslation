@@ -231,6 +231,7 @@ docs/                   实现与回归说明
 
 - 版式与排印修复、阅读器分组高亮及相关回归测试。[PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
 - 全文视觉助读、引用问答、多色高亮、本地阅读笔记及配套回归测试。[贡献提交](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
+- 跨页与跨栏段落续写识别、行内分式完整性修复、排版性能优化，以及阅读器批注汇总。[PR #2](https://github.com/Lei-Ao/ParallelTranslation/pull/2)
 
 查看全部 [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors)。欢迎通过 Issue 或 Pull Request 参与改进。
 

@@ -227,6 +227,7 @@ Thanks to XIA-J-B (夏少) for their continued contributions. [GitHub profile](h
 
 - Layout and typography fixes, grouped reader highlights, and regression tests. [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
 - Full-paper visual reading, contextual Q&A, colored highlights, local reading notes, and regression tests. [Contribution](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
+- Detection of paragraphs continuing across pages or columns, fixes for incomplete inline fractions, faster typesetting, and an annotations view in the reader. [PR #2](https://github.com/Lei-Ao/ParallelTranslation/pull/2)
 
 See all [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors). Issues and pull requests are welcome.
 
