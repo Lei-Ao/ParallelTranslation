@@ -6,11 +6,9 @@ if(typeof window!=='undefined'){
   const panes=[document.querySelector('#source-pane'),document.querySelector('#translation-pane')];
   const float=document.createElement('div');float.id='quote-toolbar';float.className='hidden';
   float.setAttribute('role','toolbar');float.setAttribute('aria-label','选中文字操作');
-  float.innerHTML='<div class="quote-actions"><button data-quote="translate">翻译</button><button data-quote="explain">解释</button><button data-quote="add">引用</button><button data-quote="highlight">高亮</button><button data-quote="remove-highlight" class="hidden">取消高亮</button></div>'+
+  float.innerHTML='<div class="quote-actions"><button data-quote="explain">解释</button><button data-quote="add">引用</button><button data-quote="highlight">高亮</button><button data-quote="remove-highlight" class="hidden">取消高亮</button></div>'+
     '<div class="highlight-colors" role="group" aria-label="高亮颜色">'+Object.entries(colors).map(([key,color])=>`<button data-highlight-color="${key}" style="--highlight-color:${color.value}" aria-label="${color.label}高亮" title="${color.label}高亮" aria-pressed="${key===selectedColor}"></button>`).join('')+'</div>';
   document.body.append(float);
-  const palette=float.querySelector('.highlight-colors'),highlightButton=float.querySelector('[data-quote=highlight]');
-  for(const event of ['pointerenter','focus'])highlightButton.addEventListener(event,()=>palette.classList.remove('hidden'));
   function refresh(){
     if(!state.doc)return;
     if(documentId!==state.doc.id){
@@ -20,12 +18,12 @@ if(typeof window!=='undefined'){
     }
     paintHighlights();
   }
-  function hide(){float.classList.add('hidden');palette.classList.add('hidden');selectionRequests=[];activeHighlights=[];float.querySelector('[data-quote=remove-highlight]').classList.add('hidden');}
+  function hide(){float.classList.add('hidden');selectionRequests=[];activeHighlights=[];float.querySelector('[data-quote=remove-highlight]').classList.add('hidden');}
   function positionToolbar(rect){
     float.classList.remove('hidden');float.style.left=Math.max(8,Math.min(innerWidth-float.offsetWidth-8,rect.left))+'px';float.style.top=Math.max(8,Math.min(innerHeight-float.offsetHeight-8,rect.top-float.offsetHeight-5))+'px';
   }
   function markColor(color){selectedColor=color;float.querySelectorAll('[data-highlight-color]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.highlightColor===color)));}
-  function saveHighlights(next){if(documentId!==state.doc?.id || !persist('parallel-highlights-'+documentId,next))return false;highlights=next;paintHighlights();return true;}
+  function saveHighlights(next){if(documentId!==state.doc?.id || !persist('parallel-highlights-'+documentId,next))return false;highlights=next;paintHighlights();document.dispatchEvent(new CustomEvent('parallel:highlights-changed',{detail:{docId:documentId}}));return true;}
   function highlightAt(event){
     for(const painted of paintedHighlights.slice().reverse()){
       if(painted.pane.contains(event.target) && [...painted.region.getClientRects()].some(rect=>event.clientX>=rect.left && event.clientX<=rect.right && event.clientY>=rect.top && event.clientY<=rect.bottom))return painted;
@@ -52,7 +50,7 @@ if(typeof window!=='undefined'){
       if(getSelection()?.toString() && e.target.closest('.pdf-char,.translation-text,.source-preview')){e.stopImmediatePropagation();e.preventDefault();return;}
       const painted=highlightAt(e);if(!painted)return;
       e.stopImmediatePropagation();e.preventDefault();hide();activeHighlights=[painted.quote.id];selectionRequests=[structuredClone(painted.quote.request)];
-      palette.classList.remove('hidden');markColor(Object.hasOwn(colors,painted.quote.color)?painted.quote.color:'yellow');float.querySelector('[data-quote=remove-highlight]').classList.remove('hidden');positionToolbar(painted.region.getBoundingClientRect());
+      markColor(Object.hasOwn(colors,painted.quote.color)?painted.quote.color:'yellow');float.querySelector('[data-quote=remove-highlight]').classList.remove('hidden');positionToolbar(painted.region.getBoundingClientRect());
     },true);
   }
   document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});
@@ -70,17 +68,65 @@ if(typeof window!=='undefined'){
   function paragraphPart(content,range){
     const part=range.cloneRange();if(!content.contains(range.startContainer))part.setStart(content,0);if(!content.contains(range.endContainer))part.setEnd(content,content.childNodes.length);
     const before=document.createRange();before.selectNodeContents(content);before.setEnd(part.startContainer,part.startOffset);
-    const block=blocks().find(b=>b.id===content.closest('[data-block]').dataset.block),raw=block.translation || block.text,map=characterMap(content,raw);
+    const block=blocks().find(b=>b.id===content.closest('[data-block]').dataset.block);
+    const translated=content.classList.contains('translation-text') && Boolean(block.translation);
+    const raw=translated ? block.translation : block.text,map=characterMap(content,raw);
     const start=Array.from(before.toString()).length,end=start+Array.from(part.toString()).length;
     if(!map || end<=start)return null;
-    return {page:Number(content.closest('.reader-page').dataset.pageIndex)+1,view:'paragraph',block_id:block.id,raw,
+    return {page:Number(content.closest('.reader-page').dataset.pageIndex)+1,view:'paragraph',block_id:block.id,translated,raw,
       ranges:[{run_id:block.id,start:map[start],end:map[end-1]+1}]};
   }
+  function selectedGlyph(glyph,range){
+    const node=glyph.firstChild;if(!node)return null;
+    const start=range.startContainer===node?Array.from(node.textContent.slice(0,range.startOffset)).length:0;
+    const end=range.endContainer===node?Array.from(node.textContent.slice(0,range.endOffset)).length:Array.from(node.textContent).length;
+    return end>start?{node,start,end}:null;
+  }
+  function clearSelectionVisual(){document.querySelectorAll('.pdf-selection-rect').forEach(el=>el.remove());}
+  // The text layer is one transparent span per glyph. Native ::selection paints
+  // one translucent box per glyph, so overlapping glyph boxes show seams and
+  // darker patches. Draw one merged band per visual line instead, which keeps
+  // per-glyph citation ranges and copy behavior but looks like a run text layer.
+  function paintSelectionVisual(pane,range){
+    const bounds=pane.getBoundingClientRect();
+    for(const page of pane.querySelectorAll('.pdf-page')){
+      const pageBox=page.getBoundingClientRect();
+      if(pageBox.bottom<bounds.top || pageBox.top>bounds.bottom)continue;
+      const layer=page.querySelector('.pdf-text-layer');
+      if(!layer || !range.intersectsNode(layer))continue;
+      const layerBox=layer.getBoundingClientRect();
+      if(!(layerBox.width>0 && layerBox.height>0))continue;
+      for(const line of layer.querySelectorAll('.pdf-text-line')){
+        if(!range.intersectsNode(line))continue;
+        let left=Infinity,top=Infinity,right=-Infinity,bottom=-Infinity;
+        for(const glyph of line.querySelectorAll('.pdf-char')){
+          if(!range.intersectsNode(glyph) || !selectedGlyph(glyph,range))continue;
+          const box=glyph.getBoundingClientRect();
+          if(!(box.width>0 && box.height>0))continue;
+          left=Math.min(left,box.left);top=Math.min(top,box.top);
+          right=Math.max(right,box.right);bottom=Math.max(bottom,box.bottom);
+        }
+        if(!(right>left && bottom>top))continue;
+        const el=document.createElement('div');el.className='pdf-selection-rect';
+        Object.assign(el.style,{left:(left-layerBox.left)/layerBox.width*100+'%',
+          top:(top-layerBox.top)/layerBox.height*100+'%',
+          width:(right-left)/layerBox.width*100+'%',
+          height:(bottom-top)/layerBox.height*100+'%'});
+        layer.append(el);
+      }
+    }
+  }
   function updateSelection(){
+    clearSelectionVisual();
     const selection=getSelection();if(activeHighlights.length && (!selection || selection.isCollapsed))return;
     const pane=panes.find(p=>p.contains(selection?.anchorNode)&&p.contains(selection?.focusNode));hide();
-    if(!selection?.rangeCount||selection.isCollapsed||!pane||(pane===panes[1]&&state.editTranslation))return;
+    if(!selection?.rangeCount||selection.isCollapsed||!pane)return;
     const range=selection.getRangeAt(0);
+    // Draw the merged selection even when this pane cannot produce a citation,
+    // so copying a page without a usable text mapping still has feedback.
+    paintSelectionVisual(pane,range);
+    if(pane===panes[1]&&state.editTranslation)return;
+    let mappable=true;
     for(const layer of pane.querySelectorAll('.pdf-text-layer')){
       if(!range.intersectsNode(layer))continue;
       const ranges=[];
@@ -88,22 +134,25 @@ if(typeof window!=='undefined'){
         if(!range.intersectsNode(line))continue;
         for(const glyph of line.querySelectorAll('.pdf-char')){
           if(!range.intersectsNode(glyph))continue;
-          const node=glyph.firstChild;
-          const start=range.startContainer===node?Array.from(node.textContent.slice(0,range.startOffset)).length:0;
-          const end=range.endContainer===node?Array.from(node.textContent.slice(0,range.endOffset)).length:Array.from(node.textContent).length;
-          if(end<=start)continue;
+          const part=selectedGlyph(glyph,range);if(!part)continue;
           // Never cite a different or partially recoverable string in place of the selection.
-          if(!glyph.dataset.run){if(node.textContent.trim()){hide();return;}continue;}
+          if(!glyph.dataset.run){
+            if(part.node.textContent.trim()){mappable=false;break;}
+            continue;
+          }
           const offset=Number(glyph.dataset.start),last=ranges.at(-1);
           if(last?.run_id===glyph.dataset.run){
-            if(last.end!==offset+start){hide();return;}
-            last.end=offset+end;
-          }else ranges.push({run_id:glyph.dataset.run,start:offset+start,end:offset+end});
+            if(last.end!==offset+part.start){mappable=false;break;}
+            last.end=offset+part.end;
+          }else ranges.push({run_id:glyph.dataset.run,start:offset+part.start,end:offset+part.end});
         }
+        if(!mappable)break;
       }
+      if(!mappable)break;
       if(ranges.length)selectionRequests.push({page:Number(layer.dataset.page),text_version:layer.dataset.version,
         view:layer.dataset.view,revision:layer.dataset.revision || null,ranges});
     }
+    if(!mappable){hide();return;}
     for(const content of pane.querySelectorAll('.translation-text,.source-preview')){if(range.intersectsNode(content)){const part=paragraphPart(content,range);if(part)selectionRequests.push(part);}}
     if(!selectionRequests.length)return;
     const rect=range.getBoundingClientRect(),bounds=pane.getBoundingClientRect();if(rect.bottom<bounds.top || rect.top>bounds.bottom)return;
@@ -127,7 +176,7 @@ if(typeof window!=='undefined'){
       if(action==='highlight'){
         const next=[...highlights.filter(h=>!quotes.some(q=>q.id===h.id)),...quotes.map(q=>({...q,color:highlightColor}))];
         if(saveHighlights(next))toast('已高亮，点击高亮文字可调整颜色或取消');
-      }else globalThis.PaperAssistant?.addCitations(quotes,action);getSelection()?.removeAllRanges();
+      }else globalThis.PaperAssistant?.addCitations(quotes,action==='explain');getSelection()?.removeAllRanges();
     }catch(error){toast(error.message);}
   });
   function textRange(content,start,end){
@@ -142,8 +191,9 @@ if(typeof window!=='undefined'){
   }
   function paragraphRange(source){
     const block=blocks().find(b=>b.id===source.block_id);if(!block)return null;
-    const content=document.getElementById('card-'+block.id)?.querySelector('.translation-text,.source-preview');if(!content)return null;
-    const raw=block.translation || block.text,map=characterMap(content,raw),item=source.ranges[0];if(!map || !item)return null;
+    const translated=source.translated !== false;
+    const content=document.getElementById('card-'+block.id)?.querySelector(translated?'.translation-text':'.source-preview');if(!content)return null;
+    const raw=translated ? (block.translation || block.text) : block.text,map=characterMap(content,raw),item=source.ranges[0];if(!map || !item)return null;
     if(Array.from(raw).slice(item.start,item.end).join('')!==source.text)return null;
     const start=map.findIndex(i=>i>=item.start),last=map.findLastIndex(i=>i<item.end);if(start<0 || last<start)return null;
     return textRange(content,start,last+1);
@@ -167,6 +217,16 @@ if(typeof window!=='undefined'){
     if(globalThis.CSS?.highlights && globalThis.Highlight){for(const [color,ranges] of Object.entries(paragraphRanges))CSS.highlights.set(color==='yellow'?'reader-saved':'reader-saved-'+color,new Highlight(...ranges));}
     if(activeHighlights.length)positionActiveHighlight();
   }
-  globalThis.OriginalTextSelection={refresh:schedule,paragraphRange};
+  function currentHighlights(){
+    if(documentId!==state.doc?.id){
+      documentId=state.doc?.id;
+      highlights=stored('parallel-highlights-'+documentId,[]);
+      if(!Array.isArray(highlights))highlights=[];
+    }
+    return highlights.map(highlight=>({...highlight}));
+  }
+  globalThis.OriginalTextSelection={refresh:schedule,paragraphRange,
+    highlights:currentHighlights,
+    removeHighlight:id=>{currentHighlights();return saveHighlights(highlights.filter(highlight=>highlight.id!==id));}};
   schedule();
 }

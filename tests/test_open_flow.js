@@ -83,7 +83,16 @@ test('pause drains work, stays on the progress card and resumes only remaining b
 });
 test('translation failure retains progress and never opens the reader',async()=>{
   const r=workspace(),job=r.eval('prepareDocument()');
-  r.requests[0].reject(new Error('rate limit'));await tick();r.requests[1].resolve([]);await job;
+  // The first paragraph fails, the second still completes. The isolated
+  // failure is retried once alone; when that also fails the progress card
+  // keeps the completed work and does not open the reader.
+  r.requests[0].reject(new Error('rate limit'));await tick();
+  assert.match(r.requests[1].path,/blocks\/b\/translate$/);
+  r.requests[1].resolve({id:'b',translation:'译文',target:'简体中文'});await tick();
+  r.requests[2].resolve([]);await tick();
+  assert.match(r.requests[3].path,/blocks\/a\/translate$/);
+  r.requests[3].reject(new Error('rate limit'));await tick();
+  r.requests[4].resolve([]);await job;
   assert.equal(r.opened.length,0);assert.match(r.element('#open-status').textContent,/翻译失败：rate limit/);
   assert.equal(r.eval('state.preparing || state.running'),false);
 });
@@ -94,7 +103,7 @@ test('batch fallback updates progress per single result and opens after completi
   r.requests[0].reject(Object.assign(new Error('合并译文格式不完整'),{fallback:'single'}));await tick();
   assert.match(r.requests[1].path,/blocks\/a\/translate$/);
   await finishBlock(r,1,'a');assert.equal(r.element('#open-percent').textContent,'50%');
-  assert.equal(r.eval('state.batchSize'),1);assert.equal(r.opened.length,0);
+  assert.equal(r.eval('state.batchSize'),3);assert.equal(r.opened.length,0);
   await finishBlock(r,2,'b');r.requests[3].resolve([]);await tick();
   r.requests[4].resolve({revision:'ready',issues:[]});await job;
   assert.deepEqual(r.opened,[true]);

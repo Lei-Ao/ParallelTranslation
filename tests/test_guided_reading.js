@@ -31,6 +31,13 @@ test('answer references preserve all unique structured, legacy, quote and image 
  assert.deepEqual(model.sourceIds(turn),['a','image','quote','b','old']);
  assert.deepEqual(model.sourceIds({answer:'Legacy text'}),[]);
 });
+test('annotation count merges highlights, staged quotes and sent citations without duplicates',()=>{
+ const data={messages:[{citations:[{id:'sent-a'}]},{citations:[{id:'sent-a'},{id:'sent-b'}]}]};
+ const highlights=[{id:'highlight-a'},{id:'sent-a'}];
+ const staged=[{id:'staged-a'},{id:'highlight-a'}];
+ assert.equal(model.annotationCount(data,staged,highlights),4);
+ assert.equal(model.annotationCount(null,[],[]),0);
+});
 test('multimodal notes retain visual, context and issue references',()=>{
  const turn={visual_sources:['page','zoom'],context_sources:['before','after'],structured:{sections:[],issues:[{source_ids:['zoom','other']}]}};
  assert.deepEqual(model.sourceIds(turn),['page','zoom','before','after','other']);

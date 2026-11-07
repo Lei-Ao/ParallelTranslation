@@ -38,15 +38,17 @@ test('copying PDF text puts plain text on the clipboard without transparent posi
   assert.equal(values.has('text/html'),false);assert.equal(prevented,true);
 });
 
-test('text hits locate the paragraph underneath after scaling or translation movement',()=>{
+test('reader clicks select overlays but never the text underneath',()=>{
   const r=reader();
-  const first={getBoundingClientRect:()=>({left:50,right:140,top:80,bottom:130})};
-  const second={getBoundingClientRect:()=>({left:170,right:290,top:100,bottom:160})};
-  const page={querySelectorAll:()=>[first,second]};
-  r.context.event={clientX:200,clientY:120,target:{closest:selector=>selector==='.pdf-text-layer'?{}:selector==='.pdf-page'?page:null}};
-  assert.equal(r.eval('readerBlockTarget(event)'),second);
-  r.context.event.clientX=150;
-  assert.equal(r.eval('readerBlockTarget(event)'),null);
+  r.eval("var selected=0,cleared=0;selectBlock=()=>selected++;clearBlockSelection=()=>cleared++;");
+  r.context.event={target:{closest:selector=>selector==='[data-block]'?{dataset:{block:'b'}}:null}};
+  r.eval("readerClick(event,'source')");
+  assert.equal(r.eval('selected'),1);
+  assert.equal(r.eval('cleared'),0);
+  r.context.event={target:{closest:selector=>selector==='.pdf-char'?{}:null}};
+  r.eval("readerClick(event,'translation')");
+  assert.equal(r.eval('selected'),1);
+  assert.equal(r.eval('cleared'),1);
 });
 
 test('English and CJK word selection uses logical text nodes rather than separate glyph boxes',()=>{

@@ -129,6 +129,8 @@ def _caption_regions(groups, text, size, bounds):
             return ([line["rect"] for line in item["lines"]]
                     if display_barrier(item) else _barrier_rects(item))
 
+        barriers = [barrier for item in text if item is not caption
+                    for barrier in barrier_rects(item)]
         candidates = []
         for index, group in enumerate(groups):
             region = group["rect"]
@@ -141,8 +143,7 @@ def _caption_regions(groups, text, size, bounds):
                 continue
             corridor = pymupdf.Rect(max(box.x0, region.x0), min(box.y1, region.y1),
                                      min(box.x1, region.x1), max(box.y0, region.y0))
-            if any(_overlap(barrier, corridor) > .1
-                   for item in text if item is not caption for barrier in barrier_rects(item)):
+            if any(_overlap(barrier, corridor) > .1 for barrier in barriers):
                 continue
             if any(_paragraph(item, region) for item in text if not item["caption"]
                    and region.contains((item["rect"].tl + item["rect"].br) * .5)):
@@ -230,7 +231,7 @@ def _caption_regions(groups, text, size, bounds):
     return result
 
 
-def figure_regions(page, native, drawings=None):
+def figure_regions(page, native, drawings=None, images=None):
     """Return conservative artwork boxes, keeping caption blocks translatable.
 
     Captions attach to the nearest visible artwork, on either side.  Without
@@ -264,7 +265,7 @@ def figure_regions(page, native, drawings=None):
             primitives.append({"rect": rect, "image": image})
             seen.add(key)
 
-    for image in page.get_image_info():
+    for image in (page.get_image_info() if images is None else images):
         add(image["bbox"], True)
     for drawing in visible_drawings(page) if drawings is None else drawings:
         if drawing.get("rect") is not None:

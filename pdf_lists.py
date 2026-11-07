@@ -24,7 +24,7 @@ def marker_key(value):
     return str(int(value)) if value.isdecimal() else value
 
 
-def source_list_structure(page, style, rect):
+def source_list_structure(page, style, rect, raw_native=None):
     """Measure marker and body axes from actual characters on visual baselines."""
     if not any(MARKER.match("".join(s["text"] for s in line["spans"]))
                for line in style.get("lines", [])):
@@ -32,7 +32,9 @@ def source_list_structure(page, style, rect):
     size = style["size"]
     owned = {tuple(round(v, 2) for v in s["bbox"]) for s in style.get("spans", [])}
     rows = []
-    for block in page.get_text("rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"]:
+    source = raw_native if raw_native is not None else page.get_text(
+        "rawdict", flags=pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"]
+    for block in source:
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 if (tuple(round(v, 2) for v in span["bbox"]) not in owned

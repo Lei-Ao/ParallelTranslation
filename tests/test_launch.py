@@ -14,12 +14,12 @@ def response(body, content_type="application/json"):
 
 
 class LauncherTests(unittest.TestCase):
-    def test_ready_requires_backend_and_reader_assets(self):
+    def test_ready_requires_backend_and_both_assets(self):
         opener = MagicMock()
-        opener.open.side_effect = [response(b'{"token":"test"}'), response(b"body{}", "text/css"), response(b"queue();", "text/javascript"), response(b"init();", "text/javascript"), response(b"assistant();", "text/javascript")]
+        opener.open.side_effect = [response(b'{"token":"test"}'), response(b"body{}", "text/css"), response(b"queue();", "text/javascript"), response(b"init();", "text/javascript")]
         with patch.object(launch.urllib.request, "build_opener", return_value=opener):
             self.assertTrue(launch.server_ready())
-        self.assertEqual(opener.open.call_count, 5)
+        self.assertEqual(opener.open.call_count, 4)
 
     def test_missing_queue_does_not_open_broken_page(self):
         opener = MagicMock()

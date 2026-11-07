@@ -23,7 +23,7 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 
 ## Features
 
-- **Parallel reading**: continuous pages, bidirectional synchronized scrolling, paragraph navigation, zoom, and text selection/copying.
+- **Parallel reading**: continuous pages, bidirectional synchronized scrolling, paragraph navigation, zoom, and word/phrase selection copying.
 - **Desktop launcher**: on Windows, `start.bat` or `start.vbs` starts the app in the system tray without leaving a terminal window open. Closing the browser does not stop the service; the tray menu can open the workbench, restart, stop, or exit.
 - **Layout-aware output**: preserve page dimensions and graphics, and typeset translations in safe regions using source typography, column geometry, and paragraph spacing.
 - **Preserved links**: web links and in-document jumps are re-anchored to the translated text and stay clickable; link text keeps the source color, and all line fragments of a wrapped link highlight together as one link.
@@ -31,27 +31,53 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 - **Contextual translation**: surrounding paragraphs, completed translations, target language, terminology, and custom instructions.
 - **Concurrency and recovery**: configurable parallel requests and same-page batches, pause/resume, bounded retries, and reuse of saved translations.
 - **Editing and export**: edit or retranslate individual paragraphs, export bilingual Markdown, and automatically save a standalone translated PDF.
-- **Paper assistant**: open the original directly, read section by section, ask about selections in either language, and save answers with their citations as local notes.
+- **Full-paper visual reading**: open papers directly, browse the outline, and use full-paper analysis or section-by-section guided reading with the complete source text and all page images.
+- **Citation Q&A**: select source or translated text to explain, quote, or highlight, including multiple selections and cross-page citations, with figure and formula region inspection.
+- **Local notes**: save complete answers with questions, formulas, citations, and visual sources, then review or export them as Markdown.
 
 > Layout decisions use document geometry, typography, and structure. Complex regions may retain the complete original with an explanation. Successful translation of every region in every PDF is not guaranteed.
 
 ## Changelog
 
-### 2026-11-06 Paper assistant, contextual Q&A, and local notes
+### 2026-11-07 Page-spanning paragraphs, formula integrity, and performance
 
-Integrated the paper-reading features contributed by XIA-J-B (夏少).
+- **Paragraphs split across pages or columns:** paragraphs cut at a page or column boundary are detected automatically. The translated fragment at the page bottom is stretched within the source fragment's height to remove large gaps. The translation prompt asks the model to continue the previous fragment without repeating words already translated, and forbids inventing an ellipsis when the source has none, retrying once when needed.
+- **Inline two-dimensional formulas:** when a fraction or superscript is split across extraction blocks, the whole formula is reproduced from its original glyphs (for example `e^{−‖x‖/δ}`). If it cannot be reproduced reliably, the complete source paragraph is kept and the reason is reported instead of printing a damaged formula such as `e δ`.
+- **Layout performance:** duplicate full-page extraction and preflight work were removed from the layout pipeline. On the 14-page / 339-block sample, cold layout dropped from 6.14s to 4.82s with a warm font cache, one-block edits from 0.74s to 0.48s, and a single-page `typeset` from 0.34s to 0.22s. The layout report is field-for-field identical; the cache version is 75.
+- **Reading and annotations:** source, translation, and paragraph views all support selecting text for citations. Colored highlights, cross-page quotations, an annotation summary, and local notes were added, while direct reading, full-paper visual reading, and section-by-section guided reading are preserved.
+- **Branding and engineering:** the application, tray, and browser-tab icon now share a green book with a translation arrow. New modules and regression tests cover page-spanning paragraphs, figure labels, hanging lists, and the character selection layer.
+- **Validation:** 333 Python and 80 JavaScript cases pass, together with an Edge browser smoke test. Two real samples were re-typeset with no missing Chinese characters, text collisions, font changes, bold-body errors, symbol errors, or link errors. The page-bottom leading fill makes the first-line gap of seven continuation paragraphs 0.2–0.6 pt smaller than the source reference; the corpus audit reports this as `spacing_errors`, which is an intentional leading adjustment to reclaim blank space, not a collision. Passing these samples does not mean every complex region in every paper has been adapted.
 
-- Open papers directly from the library or during import, then translate as needed.
-- Analyze the complete text, outline, and all page images with full-paper visual reading, or work through individual sections with guided reading.
-- Ask about source or translated selections, combine quotations across paragraphs and pages, inspect figure regions, follow citations, and save colored highlights.
-- Save answers as independent local notes with their questions, formulas, and sources, and export them as Markdown.
-- Switch between source, bilingual, and translation views, use responsive reading panels, and optionally enable double-click editing.
+### 2026-11-06 Multimodal reading, contextual citations and local notes
 
-Validation covered 318 Python cases, 78 JavaScript cases, and isolated browser checks, plus 146 source pages from 10 papers and 10 saved translation pages. Some character encodings and context mappings still require fallback. Real-model understanding and citation quality need further evaluation. Usage, provenance, and validation details are documented in the [changelog](CHANGELOG.md) and [Chinese reading guide](docs/skill-reading.zh-CN.md).
+- Analyze the complete original text, outline and all page images together using one multimodal model, with page-preparation progress and up to four rounds of targeted inspection.
+- Add a dedicated citation workflow that reads complete paragraphs, nearby context and cross-referenced definitions, with original and translated PDF version mapping.
+- Save complete answers and source snapshots as independent local notes, with Markdown export, individual answer deletion and conversation clearing.
+- Standardize article-style responses and math formatting. Preserve LaTeX escapes through Markdown parsing to fix red formula-rendering errors.
+- Support direct reading, original/translation view switching, multi-selection citations, local highlights and responsive reading panels.
 
-### 2026-11-04 Layout and typography fixes
+Validation covers 277 Python tests, 73 JavaScript tests and browser regressions, plus isolated copies of three stored documents from two real papers totaling 36 pages. Real samples mainly use two columns. Synthetic tests cover single-column pages, scanned pages, varying sizes and all four rotations. Model-flow tests use simulated responses. Real multimodal understanding and adherence to the new output rules still require evaluation. See the detailed reading documentation. [Reading guide in Chinese](docs/skill-reading.zh-CN.md)
 
-Integrated PR #1 with fixes for figure labels, author grids, heading weight and italics, bold caption titles, equation labels, and grouped reader highlights. The layout cache version advanced to 67. [Development notes in Chinese](docs/development.zh-CN.md)
+### 2026-11-06 Translation and layout speed
+
+Batched translation now defaults to 5 blocks / 12,000 characters, keeps valid partial results, and no longer aborts the whole run for one failed paragraph. Parsed documents are cached in memory, untranslated documents skip typesetting, and merged redactions, page-image caching and a disk font cache remove repeated work. A follow-up pass removed duplicate page extraction and preflight work from the layout engine. On the 14-page / 339-block sample, cold layout dropped from 24.36s to 6.80s with an empty font cache (4.82s when warm), one-block edits from 1.88s to 0.48s, and grouped requests from 119 to 74. The layout report is field-for-field identical, so the cache version stays 68; see the [development notes in Chinese](docs/development.zh-CN.md).
+
+### 2026-11 Layout and typography fixes
+
+This repository improves on the upstream project [Lei-Ao/ParallelTranslation](https://github.com/Lei-Ao/ParallelTranslation); the improved version lives at [XIA-2005/ParallelTranslation](https://github.com/XIA-2005/ParallelTranslation). Compared with the original, this round fixes the following layout issues:
+
+1. **Misplaced figure labels**: standalone tick and legend labels near graphics are separated from the prose flow and typeset at their original axis, font size, and baseline instead of displacing body text.
+2. **Lost abstract bold**: a long bold label mixed with regular prose no longer bolds the whole paragraph; truly bold body text keeps its source weight, so abstract headings and prose are distinguished correctly.
+3. **Shrunk short body text**: a paragraph shrunk by a tight local text box can borrow unused source height left by a shorter translation of the next paragraph in the same column, restoring its original size.
+4. **Misaligned author blocks**: authors, affiliations, and emails on the cover page are pre-typeset as one region, keeping affiliation marks as superscripts and emails in a monospaced face instead of drifting downward line by line.
+5. **Lost partial bold in captions and wrapped headings**: bold caption titles after figure/table numbers map to the matching first sentence of the translation, and bold labels spanning wrapped lines (including line-end hyphenation) are recognized continuously without bolding the following regular prose.
+6. **Incomplete hover highlighting**: merged fragments of a source paragraph or equation keep their same-page group membership, so the reader highlights and selects the whole group on both sides instead of only the last few words or one equation line.
+7. **Multiple selection frames around one equation**: a merged equation group draws one bounding frame and tint per side, instead of several small frames or an overly dark overlapping tint.
+8. **Lost subheading italics and uniform bolding**: italic and weight follow the source font flags independently; numbering or heading structure no longer triggers uniform bolding. Chinese text gets synthesized 12° oblique faces from the embeddable font family.
+9. **Headings typeset separately from body**: when the extractor merges a heading into a body block, the layout detects the structural boundary from source line geometry and typesets both parts separately, restoring a standalone centered heading with its own size, weight, italic, and spacing.
+10. **Equation labels move with the equation**: punctuation and labels extracted into the following prose are split off and moved together with the original formula as vector content, keeping the label on the right at its original relative position.
+
+The layout cache version advances from 61 to 66: reopen a document or run "Re-typeset" to apply, with no retranslation needed; saved translations, paragraph IDs, and the source PDF are unchanged. Regression tests cover synthetic single/double-column layouts, various page widths, 0/90/180/270° rotations, and local paper samples; complex regions may still keep the original text with a stated reason.
 
 ## Quick start
 
@@ -63,14 +89,14 @@ Integrated PR #1 with fixes for figure labels, author grids, heading weight and 
 4. Afterwards, double-click `start.bat` or **`start.vbs`**. No terminal window stays open: a “页间 Parallel” tray icon appears and the workbench opens at <http://127.0.0.1:8765>.
 
 ```powershell
-git clone https://github.com/Lei-Ao/ParallelTranslation.git
+git clone https://github.com/XIA-2005/ParallelTranslation.git
 cd ParallelTranslation
 .\start.bat
 ```
 
 Double-click the tray icon to open the workbench. Its context menu offers **打开工作台**, **重新启动服务**, **启动服务 / 停止服务**, and **停止并退出**. Closing the browser does not stop the service; use **停止并退出** in the tray menu, or double-click **`stop.bat`**, to stop it completely. Server logs are written to `tmp/parallel.log`. Launching an already running instance only opens the workbench again.
 
-The tray uses a green double-page icon, with “页间 Parallel” shown on hover. If Windows places it in the hidden area, click `⌃` near the clock and drag the icon onto the taskbar to keep it visible. After updating the icon, exit the old tray controller before launching `start.vbs` again. Browser tabs use the same icon.
+The tray uses a green double-page book with a translation arrow; hovering shows “页间 Parallel”. If Windows places it in the hidden area, click `⌃` near the clock and drag the icon onto the taskbar. After updating the icon, exit the old tray controller before launching `start.vbs` again. Browser tabs use the same icon.
 
 Do not open `static/index.html` directly: PDF extraction, persistence, and API requests require the local backend. The current regression environment is Windows / Python 3.12.
 
@@ -103,7 +129,7 @@ Open **Agent 设置** (Agent settings) and select the endpoint type.
 - **Base URL**: your provider’s API URL. The app appends `/chat/completions`, unless you enter that full endpoint.
 - **API Key**: your own credential. Local endpoints that do not require authentication may leave this blank.
 - **Model**: enter the exact model ID provided by your service. No available model is assumed.
-- **Reasoning**: the default sends no additional reasoning parameters. Select an explicit setting only if your provider supports it; otherwise return to the server default. Custom endpoints control this through their request template.
+- **Reasoning level**: controls thinking mode for OpenAI-compatible endpoints. “Provider default” sends no reasoning field at all; “Off” sends `thinking: {"type": "disabled"}`; Low / Medium / High / Max send the matching `reasoning_effort`. DeepSeek enables thinking at high effort by default, so switching it off saves time and cost, while raising it slows requests and may exceed the request timeout. Custom endpoints ignore this setting and follow their request template.
 - **Test connection**: sends a real model request and may incur API charges.
 
 The current prefilled Base URL is `https://api.apigoto.com/v1`; replace it as needed. This default does not guarantee service availability or quality. Integration tests use simulated endpoints.
@@ -129,7 +155,7 @@ Only non-streaming JSON responses completed in one request are supported. SSE, p
 1. Select a target language on the home page and optionally enter terminology and translation instructions.
 2. Import a text-based PDF. The app extracts and translates its text, shows progress, and opens the reader when translation and typesetting finish.
 3. Pause when needed. Resume after failures to skip already saved translations in the current target language.
-4. Click a paragraph to locate its counterpart. Drag to select text and press Ctrl+C to copy. Double-click selects a word by default. To edit, select a translated paragraph and click “编辑译文”, enable double-click editing in the menu, or use the paragraph view.
+4. Click a paragraph to locate its counterpart; click blank space to clear the selection. Double-click translated text to edit, or select the paragraph editing view from the top-right menu.
 5. Use the menu to change language, concurrency, batch size, synchronized scrolling, or reading mode; regenerate the layout; download the PDF; or export bilingual Markdown.
 
 The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **3 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
@@ -164,7 +190,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 ## Scope and limitations
 
 - PDFs must have **1–300 pages** and be no larger than **50 MB**.
-- Translating scans and selecting text require an OCR text layer. Visual reading can use images of scanned pages.
+- Scans require OCR for translation and text selection; full-paper visual reading can inspect page images.
 - Columns, rotation, headings, author information, inline symbols, drop caps, and references use general layout rules. Complex documents can still have extraction or typesetting errors.
 - A cover title extracted as several text blocks is merged into one title group and typeset with the source title's size and weight. Author affiliation markers stay superscripted regardless of whether they follow the surname directly, a comma, a space, or a footnote symbol. Rotated covers and titles that do not start on the first page still follow the conservative per-block path.
 - A bibliography that cannot be rebuilt into complete entries (multi-page lists, unquoted book titles, non-contiguous numbering) is retained as a whole and explained in the layout report, so one entry is never mixed between languages or overwritten by an expanded translation. The heading itself is still translated. Continuation pages without recognizable numbering are treated as ordinary text.
@@ -172,8 +198,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 - A model may return one paragraph as several lines; the layout and reader merge soft line breaks inside one source paragraph (line-structured lists and notation blocks keep their breaks). The edit dialog and saved translation text are not rewritten.
 - Display equations, complex tables, vertical text, or text that cannot fit safely may retain the complete original. Tables generally retain their contents while their captions and notes are translated.
 - Text inside images is not recognized or replaced. Translation progress counts saved paragraph translations, not the proportion of PDF regions successfully replaced.
-- Figure regions are identified from visible drawings, images, and nearby captions. Independent labels with reliable line mappings and safe space checks are translated at their source centers, baselines, and sizes. Complex diagrams, ambiguous mappings, and labels whose links or superscripts cannot be rebuilt safely retain their complete source text with an explanation; captions are translated separately. Text-only diagrams without reliable graphic evidence may not be detected.
-- Both source and typeset translation pages have selectable text layers loaded on demand for visible pages. Selection uses text extractable from the actual PDF. Images, scans, and glyphs without valid character mappings cannot supply selectable text; copied text may retain PDF line breaks, and formula copying depends on the PDF encoding. Full-text search and embedded PDF annotations are not implemented in the reader.
+- The source is displayed as rendered pages with paragraph interactions. Free text selection, full-text search, and embedded PDF annotations are not implemented in the source reader.
 - Chinese typesetting first looks for locally installed Noto Serif SC or DengXian fonts, then uses a built-in fallback. Appearance may vary across systems.
 - Review generated content and retained regions, especially equations, tables, important numbers, and technical terminology.
 
@@ -182,7 +207,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
-node --test (Get-ChildItem tests/test_*.js).FullName
+node --test tests/test_translation_queue.js tests/test_layout_updates.js tests/test_open_flow.js tests/test_reader_sync.js tests/test_reader_zoom.js tests/test_continuous_scroll.js tests/test_links_ui.js
 ```
 
 Tests use temporary PDFs and simulated endpoints, without consuming real AI service credits. An optional audit of documents already translated on your machine is available:
@@ -200,12 +225,8 @@ start.bat / start.vbs   One-click Windows launch (hidden console, tray control)
 stop.bat                Stop the local server and tray
 tray.ps1                Windows tray menu (open/restart/stop/exit)
 pdf_text.py             Drop-cap recovery and complete words
-pdf_selection.py        Character geometry for selectable reader text
-pdf_structures.py       Independently anchored figure labels and author grids
 pdf_layout.py           Typesetting, obstacle handling, page caches
-pdf_figures.py          Figure regions and protection of embedded labels
 pdf_flow.py             Column reflow and equation relocation
-pdf_lists.py            List reconstruction, numbering, hanging indents
 pdf_typography.py       Font subsetting, weights, symbol fallback
 pdf_references.py       Reference reconstruction and title translation
 static/                 HTML, CSS, JavaScript without a build step
@@ -214,15 +235,6 @@ docs/                   Implementation and regression notes
 ```
 
 When reporting a problem, include your operating system, Python version, reproduction steps, and a minimal PDF sample you are allowed to share. Do not submit credentials or private documents.
-
-## Contributors
-
-Thanks to XIA-J-B (夏少) for their continued contributions. [GitHub profile](https://github.com/XIA-J-B)
-
-- Layout and typography fixes, grouped reader highlights, and regression tests. [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
-- Full-paper visual reading, contextual Q&A, colored highlights, local reading notes, and regression tests. [Contribution](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
-
-See all [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors). Issues and pull requests are welcome.
 
 ## License
 

@@ -163,7 +163,7 @@ class ReferenceTests(unittest.TestCase):
         save.assert_not_called()
         self.assertEqual(block['translation'], '旧译文')
 
-    def test_bad_batch_does_not_save_even_valid_preceding_item(self):
+    def test_bad_batch_saves_valid_title_and_leaves_invalid_one(self):
         _, document = self.normalized()
         blocks = self.entries(document)[:2]
         for block in blocks:
@@ -171,12 +171,12 @@ class ReferenceTests(unittest.TestCase):
         payload = {'blocks': [{'id': blocks[0]['id'], 'translation': '正确题名'},
                               {'id': blocks[1]['id'], 'translation': '[3] 串条'}]}
         agent = AsyncMock(return_value=json.dumps(payload))
-        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', agent):
-            with self.assertRaises(HTTPException) as error:
-                asyncio.run(service.translate_batch(document['id'], service.BatchTranslateRequest(agent=service.AgentConfig(), block_ids=[block['id'] for block in blocks])))
-        self.assertEqual(error.exception.headers['X-Translation-Fallback'], 'single')
-        save.assert_not_called()
-        self.assertEqual([block['translation'] for block in blocks], ['旧译文', '旧译文'])
+        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'doc_dir', return_value=Path('.')), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', agent):
+            result = asyncio.run(service.translate_batch(document['id'], service.BatchTranslateRequest(agent=service.AgentConfig(), block_ids=[block['id'] for block in blocks])))
+        self.assertEqual(result['missing'], [blocks[1]['id']])
+        self.assertIn('正确题名', blocks[0]['translation'])
+        self.assertEqual(blocks[1]['translation'], '旧译文')
+        save.assert_called_once()
 
     def render(self, rotation=0, overflow=False):
         pdf, document = self.normalized(rotation)

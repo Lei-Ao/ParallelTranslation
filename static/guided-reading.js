@@ -14,6 +14,16 @@ const GuidedReadingModel = {
     for(const match of (turn.answer||'').matchAll(/\[\[([^\[\]\n]+)\]\]/g))ids.push(match[1]);
     return [...new Set(ids)];
   },
+  annotationCount(data, citations = [], highlights = []) {
+    const ids = new Set();
+    for (const item of [...(citations || []), ...(highlights || [])]) {
+      if (item?.id) ids.add(item.id);
+    }
+    for (const turn of data?.messages || []) {
+      for (const citation of turn.citations || []) if (citation?.id) ids.add(citation.id);
+    }
+    return ids.size;
+  },
   routeUnits(data) {
     const units=data?.structure?.units || [];
     const pattern=data?.route==='method'?/method|approach|model|framework|方法|模型|理论/i:data?.route==='experiments'?/experiment|result|evaluation|实验|结果|评估/i:null;
@@ -101,6 +111,28 @@ if(typeof window!=='undefined') {
     if(g.note)return `<div class="guide-note-heading">${button('note-list','返回笔记列表')}<h2>${escape(g.note.title)}</h2><small>收藏于 ${escape(new Date(g.note.created).toLocaleString())}</small><div class="guide-note-actions"><a class="button secondary" href="${base()}/notes/${g.note.id}/download" download>导出 Markdown</a><button class="button secondary" data-delete-note="${g.note.id}" ${g.busy?'disabled':''}>删除笔记</button></div></div>${turnHTML(g.note.turn,g.note.sources,g.note.id)}`;
     return '<h2 class="guide-notes-title">本篇论文的笔记</h2>'+(g.notes.length?g.notes.map(n=>`<button class="guide-note-entry" data-open-note="${n.id}"><strong>${escape(n.title)}</strong><small>${escape(new Date(n.created).toLocaleString())}</small><p>${escape(n.preview)}</p></button>`).join(''):'<p class="guide-welcome">点击回答下方的“收藏为笔记”，即可在这里查看和导出。</p>');
   }
+  function annotationEntries() {
+    const highlights=globalThis.OriginalTextSelection?.highlights?.() || [];
+    const staged=g.citations || [];
+    const seen=new Set([...highlights,...staged].map(item=>item?.id).filter(Boolean));
+    const turns=[];
+    for(const turn of g.data?.messages || []) for(const citation of turn.citations || []){
+      if(citation?.id && !seen.has(citation.id)){seen.add(citation.id);turns.push(citation);}
+    }
+    return {highlights,staged,turns};
+  }
+  function annotationMeta(source,prefix) {
+    return `${prefix}${citationLabel(source)}${source?.page?` · 第 ${source.page} 页`:''}${source?.context_ambiguous?' · 定位需核对':''}`;
+  }
+  function annotationsHTML() {
+    const {highlights,staged,turns}=annotationEntries();
+    if(!highlights.length && !staged.length && !turns.length)return '<p class="guide-welcome">选中原文后使用「引用」或「高亮」，批注会汇总在这里。</p>';
+    const section=(title,body)=>body?`<section class="guide-annotations"><h2 class="guide-notes-title">${title}</h2>${body}</section>`:'';
+    const highlightHTML=highlights.map(item=>`<div class="guide-annotation"><button class="guide-annotation-main" data-annotation-highlight="${escape(item.id)}"><small>${escape(annotationMeta(item.source,'高亮 · '))}</small><p>${escape((item.text||'').slice(0,180))}</p></button><button class="guide-annotation-remove" data-remove-annotation="${escape(item.id)}" aria-label="删除高亮">×</button></div>`).join('');
+    const stagedHTML=staged.map((item,index)=>`<div class="guide-annotation"><button class="guide-annotation-main" data-preview-quote="${index}"><small>${escape(annotationMeta(item.source,'待发送 · '))}</small><p>${escape((item.text||'').slice(0,180))}</p></button><button class="guide-annotation-remove" data-remove-quote="${index}" aria-label="移除此引用">×</button></div>`).join('');
+    const turnHTMLList=turns.map(item=>`<button class="guide-annotation-main" data-citation-source="${escape(item.id)}"><small>${escape(annotationMeta(item.source,'对话 · '))}</small><p>${escape((item.text||'').slice(0,180))}</p></button>`).join('');
+    return section('高亮',highlightHTML)+section('待发送引用',stagedHTML)+section('对话引用',turnHTMLList);
+  }
   function layout() {
     const reader=$('#reader');reader.classList.add('reading-shell');reader.classList.toggle('guided-open',g.open);reader.classList.toggle('directory-open',g.directory);$('#reading-directory').classList.toggle('hidden',!g.directory);$$('[data-reader-view]').forEach(b=>b.classList.toggle('active',b.dataset.readerView===g.view));
     reader.dataset.guideView=g.view;reader.style.setProperty('--guide-width',g.width+'px');
@@ -113,7 +145,7 @@ if(typeof window!=='undefined') {
     if(open){if(!$('#reading-assistant').classList.contains('hidden'))$('#assistant-close').click();$('#reader').classList.remove('assistant-open');}
     else {g.scroll=panel.querySelector('.guide-conversation')?.scrollTop||0;saveBrowse();}
     layout();clearTimeout(g.timer);
-    if(open){render();return browseSave.then(load);}else $('#assistant-toggle').focus();
+    if(open){globalThis.OriginalTextSelection?.refresh?.();render();return browseSave.then(load);}else $('#assistant-toggle').focus();
   }
   function showSource(source) {
     if(!source || source.doc_id!==state.doc?.id)return;
@@ -151,25 +183,26 @@ if(typeof window!=='undefined') {
     const scroller=panel.querySelector('.guide-conversation'),top=scroller?.scrollTop || 0;
     const moreOpen=Boolean(panel.querySelector('.guide-more')?.open);
     const data=g.data,job=GuidedReadingModel.active(data),progress=GuidedReadingModel.progress(job),prepared=job?.progress,disabled=g.busy||Boolean(job),old=data&&!data.workflow_version,composerOld=old&&!g.citations.length;
+    const annotationTotal=GuidedReadingModel.annotationCount(data,g.citations,globalThis.OriginalTextSelection?.highlights?.()||[]);
     panel.innerHTML=`<div class="guide-resizer" role="separator" tabindex="0" aria-label="调整助手宽度" aria-orientation="vertical"></div>
       <header class="guide-header"><strong>AI 助读</strong><div><details class="guide-more" ${moreOpen?'open':''}><summary aria-label="更多助读选项">···</summary><div>
       ${button('history','历史分析')}${button('test','测试模型能力',disabled)}${button('visual','看当前页',disabled)}${button('crop','框选图表',disabled)}
       ${data?button('summary','生成阅读小结',disabled)+button('clear','清空对话',g.busy):''}
       ${old?button('archive','归档并新建会话',disabled):''}
       </div></details><button class="icon-button" data-guide-action="close" aria-label="收起助读">×</button></div></header>
-      <div class="guide-tabs" role="tablist" aria-label="助读内容"><button role="tab" aria-selected="${g.tab==='conversation'}" data-guide-action="conversation">对话</button><button role="tab" aria-selected="${g.tab==='notes'}" data-guide-action="notes">笔记${g.notes.length?` · ${g.notes.length}`:''}</button></div>
+      <div class="guide-tabs" role="tablist" aria-label="助读内容"><button role="tab" aria-selected="${g.tab==='conversation'}" data-guide-action="conversation">对话</button><button role="tab" aria-selected="${g.tab==='notes'}" data-guide-action="notes">笔记${g.notes.length?` · ${g.notes.length}`:''}</button><button role="tab" aria-selected="${g.tab==='annotations'}" data-guide-action="annotations">批注${annotationTotal?` · ${annotationTotal}`:''}</button></div>
       ${g.tab==='conversation'?`<div class="guide-modes">${button('start','文章速读',disabled||old)}${button('continue','逐节陪读',disabled||old)}</div>`:''}
       <div id="guide-notice" role="status"></div>
       <div class="guide-conversation" aria-label="助读对话">
-      ${g.tab==='notes'?notesHTML():`${old?'<p class="assistant-warning">此会话保留旧版 Skill。请在更多菜单归档并新建，使用规范阅读方式。</p>':''}
+      ${g.tab==='notes'?notesHTML():g.tab==='annotations'?annotationsHTML():`${old?'<p class="assistant-warning">此会话保留旧版 Skill。请在更多菜单归档并新建，使用规范阅读方式。</p>':''}
       ${!data?.messages.length?'<div class="guide-welcome"><p>选中原文，解释一句话，或引用多段文字一起讨论。</p><p class="assistant-meta">选择文章速读或逐节陪读，按 Skill 阅读。</p></div>':''}
       ${(data?.messages||[]).map(t=>turnHTML(t,data.sources)).join('')}`}
       </div>
-      <div class="guide-composer ${g.tab==='notes'&&!job?'hidden':''}">
+      <div class="guide-composer ${g.tab!=='conversation'&&!job?'hidden':''}">
       ${job?`<div class="guide-working" role="status"><div>${escape(job.stage||'准备中')} ${button('stop','停止')}</div>
       <progress max="100" ${progress&&(prepared?.phase==='preparing'||progress.total_chunks)?`value="${progress.percent}"`:''} aria-label="文章分析进度"></progress>
       ${prepared?.prepared_pages!==undefined?`<small>页面图已准备 ${prepared.prepared_pages}/${prepared.total_pages} 页${prepared.round?` · 补读与核查第 ${prepared.round}/${prepared.max_rounds} 轮`:''}</small>`:prepared?.round?`<small>补读与核查第 ${prepared.round}/${prepared.max_rounds} 轮</small>`:progress?.total_chunks?`<small>已分析 ${progress.completed_chunks}/${progress.total_chunks} 块</small>`:'<small>正在处理，请稍候…</small>'}</div>`:''}
-      ${g.tab==='conversation'?`<div id="guide-selection"></div><form id="guide-form"><textarea id="guide-question" rows="2" maxlength="4000" placeholder="问一个问题，或引用选中的文字…" aria-label="助读问题">${escape(g.draft)}</textarea><div class="guide-sendbar"><small>通过 Skill 回答 · ${escape(state.agent.model||'请配置模型')}</small><button class="button primary" aria-label="发送问题" ${disabled||composerOld?'disabled':''}>↑</button></div></form>`:''}</div>`;
+      ${g.tab==='conversation'?`<div class="guide-composer-box"><div id="guide-selection"></div><form id="guide-form"><textarea id="guide-question" rows="2" maxlength="4000" placeholder="问一个问题，或引用选中的文字…" aria-label="助读问题">${escape(g.draft)}</textarea><div class="guide-sendbar"><small>通过 Skill 回答 · ${escape(state.agent.model||'请配置模型')}</small><button class="button primary" aria-label="发送问题" ${disabled||composerOld?'disabled':''}>↑</button></div></form></div>`:''}</div>`;
     const last=Object.values(data?.jobs||{}).at(-1);
     if(last&&['failed','interrupted','cancelled','limited'].includes(last.status))$('#guide-notice').innerHTML=`<p class="assistant-warning">${escape(last.error||'本轮尚未完成')} ${button('retry','重试',disabled)}</p>`;
     selectionPreview();renderDirectory();
@@ -258,11 +291,13 @@ if(typeof window!=='undefined') {
       if(confirm('删除这篇本地笔记？'))mutate(()=>api(base()+'/notes/'+encodeURIComponent(deletedNote.dataset.deleteNote),{method:'DELETE'}));return;
     }
     const unit=e.target.closest('[data-unit]');if(unit){mutate(async()=>{if(!await update({unit_id:unit.dataset.unit}))return;showSource(g.data.structure.units.find(u=>u.id===unit.dataset.unit).source);});return;}
-    const remove=e.target.closest('[data-remove-quote]');if(remove){g.citations.splice(Number(remove.dataset.removeQuote),1);selectionPreview();return;}
+    const remove=e.target.closest('[data-remove-quote]');if(remove){g.citations.splice(Number(remove.dataset.removeQuote),1);g.tab==='annotations'?render():selectionPreview();return;}
     const preview=e.target.closest('[data-preview-quote]');if(preview){showSource(g.citations[Number(preview.dataset.previewQuote)].source);return;}
+    const removeAnnotation=e.target.closest('[data-remove-annotation]');if(removeAnnotation){globalThis.OriginalTextSelection?.removeHighlight?.(removeAnnotation.dataset.removeAnnotation);return;}
+    const annotation=e.target.closest('[data-annotation-highlight]');if(annotation){const item=(globalThis.OriginalTextSelection?.highlights?.()||[]).find(highlight=>highlight.id===annotation.dataset.annotationHighlight);if(item)showSource(item.source);return;}
     const quote=e.target.closest('[data-citation-source]');if(quote){showSource(currentSources()[quote.dataset.citationSource]);return;}
     const action=e.target.closest('[data-guide-action]')?.dataset.guideAction;if(!action)return;
-    if(action==='notes'||action==='conversation'||action==='note-list'){g.tab=action==='conversation'?'conversation':'notes';g.note=null;render();panel.querySelector('.guide-conversation').scrollTop=0;return;}
+    if(action==='notes'||action==='conversation'||action==='annotations'||action==='note-list'){g.tab=action==='conversation'?'conversation':action==='annotations'?'annotations':'notes';g.note=null;render();panel.querySelector('.guide-conversation').scrollTop=0;return;}
     if(action==='close'){show(false);return;}
     if(action==='history'){show(false);legacyToggle();return;}
     if(action==='unselect'){g.selection=null;clearBlockSelection();selectionPreview();return;}
@@ -308,16 +343,17 @@ if(typeof window!=='undefined') {
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&g.crop){g.crop=false;$('#reader').classList.remove('quote-cropping');drag=null;toast('已取消框选');}});
   $('#assistant-toggle').onclick=()=>show(!g.open);
   globalThis.PaperAssistant={
-    async addCitations(quotes,action){
+    async addCitations(quotes,explain){
       const epoch=g.epoch;g.tab='conversation';g.note=null;g.selection=null;clearBlockSelection();
       for(const c of quotes){if(!g.citations.some(x=>x.id===c.id))g.citations.push(c);}
       const loading=show(true);
-      if(action==='translate' || action==='explain'){await loading;if(epoch!==g.epoch)return;g.draft=action==='translate'?`请将引用的文字翻译为${state.target}。`:'请按 Skill 解释引用的文字，结合论文原文说明。';render();await submit('message');}
-      else selectionPreview();
+      if(explain){await loading;if(epoch!==g.epoch)return;g.draft='请按 Skill 解释引用的文字，结合论文原文说明。';render();await submit('message');}
+      else {selectionPreview();panel.querySelector('#guide-question')?.focus();}
     },
     documentChanged(){legacy?.documentChanged();if(g.id!==state.doc?.id){g.epoch++;g.id=state.doc?.id;clearTimeout(g.timer);Object.assign(g,{data:null,draft:'',selection:null,citations:[],outline:null,busy:false,signature:'',restored:false,scroll:0,view:'both',tab:'conversation',notes:[],note:null});}layout();loadOutline();globalThis.OriginalTextSelection?.refresh();if(g.open){render();load();}},
     selectionChanged(){legacy?.selectionChanged();g.selection=null;if(g.open)selectionPreview();}
   };
+  document.addEventListener('parallel:highlights-changed',()=>{if(g.open)render();});
   $('#settings-dialog').addEventListener('close',()=>{if(g.open)load();});
   window.addEventListener('pagehide',saveBrowse);
 }

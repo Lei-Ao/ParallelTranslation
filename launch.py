@@ -15,8 +15,7 @@ def server_ready():
         with opener.open(URL + "/api/session", timeout=1) as response:
             if response.status != 200 or b'"token"' not in response.read(4096):
                 return False
-        for asset, mime in [("style.css", "text/css"), ("translation-queue.js", "javascript"),
-                            ("app.js", "javascript"), ("reading-assistant.js", "javascript")]:
+        for asset, mime in [("style.css", "text/css"), ("translation-queue.js", "javascript"), ("app.js", "javascript")]:
             with opener.open(URL + "/static/" + asset, timeout=1) as response:
                 if response.status != 200 or mime not in response.headers.get("Content-Type", ""):
                     return False
