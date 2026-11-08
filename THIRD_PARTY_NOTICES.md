@@ -42,8 +42,23 @@ No system font files are redistributed in this repository. The app may read loca
 
 本仓库不分发系统字体。应用可能读取本机的 Noto Serif SC 或微软等线字体，对字形做子集处理并嵌入生成的 PDF。相关字体许可与嵌入权限仍然适用；PyMuPDF 内置字体资源也保留其上游条款。
 
+## Translation workflow references / 翻译工作流参考
+
+The document-quality workflow was independently implemented after studying
+[BabelDOC](https://github.com/funstory-ai/BabelDOC) (AGPL-3.0),
+[PDFMathTranslate-next](https://github.com/PDFMathTranslate/PDFMathTranslate-next) (AGPL-3.0), and
+[translation-agent](https://github.com/andrewyng/translation-agent) (MIT).
+Their runtime packages and source files are not bundled by this change. The examined local file hashes,
+adopted mechanisms, and evaluation limitations are recorded in [translation-quality.zh-CN.md](docs/translation-quality.zh-CN.md).
+
 ## Documents and services / 文档与服务
 
 Input PDFs, their content, translations, and third-party AI services are not licensed by this notice. This archive does not include personal papers, translations, credentials, or local development screenshots.
 
 输入 PDF、文档内容、译文及第三方 AI 服务不因本说明而获得授权。源码包不包含私人论文、译文、密钥或本机开发截图。
+
+## Document structure and visual API / 文档结构与视觉接口
+
+BabelDOC 0.7.1 (AGPL-3.0) informed the typed intermediate representation and formula/style placeholder design in `pdf_document.py` and `pdf_translation.py`. The final implementation uses the user's configured translation API for layout detection and visual acceptance. It does not bundle or use BabelDOC runtime packages, Rust extensions, DocLayout weights, or ONNX inference. This project remains AGPL-3.0-only. Reference file hashes and provenance are recorded in [babeldoc-reference.json](docs/babeldoc-reference.json).
+
+Playwright is used only for optional developer browser tests, not added as an application dependency.

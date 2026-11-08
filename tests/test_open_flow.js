@@ -5,7 +5,7 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const TranslationQueue=require('../static/translation-queue.js');
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
-function workspace({saved=false,empty=false}={}){
+function workspace({saved=false,empty=false,storage={}}={}){
   const elements=new Map(),requests=[],opened=[];
   function element(selector){
     if(!elements.has(selector)){
@@ -20,7 +20,7 @@ function workspace({saved=false,empty=false}={}){
   const doc={id:'demo',name:'demo.pdf',pages:[{number:1,blocks:empty?[]:[
     {id:'a',text:'A',translation:saved?'甲':'',target:'简体中文'},
     {id:'b',text:'B',translation:saved?'乙':'',target:'简体中文'}]}]};
-  const context=vm.createContext({TranslationQueue,localStorage:{getItem:()=>null},
+  const context=vm.createContext({TranslationQueue,localStorage:{getItem:key=>storage[key]??null,setItem:(key,value)=>{storage[key]=value;}},
     document:{querySelector:element,querySelectorAll:()=>[],body:element('body')},
     FormData:class{append(){}},setTimeout:()=>0,clearTimeout(){},
     request:(path,options)=>new Promise((resolve,reject)=>requests.push({path,options,resolve,reject})),
@@ -39,6 +39,24 @@ function workspace({saved=false,empty=false}={}){
 async function finishBlock(r,index,id){
   r.requests[index].resolve({id,translation:'译文',target:'简体中文'});await tick();
 }
+
+test('old saved five migrates once and later deliberate choices survive reopening',()=>{
+  const storage={'parallel-batch-size':'5'};
+  assert.equal(workspace({storage}).eval('state.batchSize'),3);
+  assert.equal(storage['parallel-batch-size'],'3');
+  assert.equal(storage['parallel-batch-settings-version'],'2');
+  storage['parallel-batch-size']='5';
+  assert.equal(workspace({storage}).eval('state.batchSize'),5);
+});
+
+test('batch defaults and migration preserve other saved choices',()=>{
+  assert.equal(workspace().eval('state.batchSize'),3);
+  for(const size of [1,3,'auto']){
+    const storage={'parallel-batch-size':JSON.stringify(size)};
+    assert.equal(workspace({storage}).eval('state.batchSize'),size);
+  }
+  assert.equal(workspace({storage:{'parallel-batch-size':'99'}}).eval('state.batchSize'),3);
+});
 
 test('direct read opens an untranslated document without a model request',async()=>{
   const r=workspace(),job=r.eval("openDocument('demo',true)");

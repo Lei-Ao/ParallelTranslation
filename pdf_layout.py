@@ -4,6 +4,8 @@ Preflight every replacement on a separate PDF before removing any source text.
 Uncertain/overflowing regions remain intact and are reported to the reader.
 """
 import hashlib
+import time
+from performance import measured, span, count
 import html
 import json
 import re
@@ -16,7 +18,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import pymupdf
-from pdf_typography import font_resources, font_signature, space_cjk_latin
+from pdf_typography import FONT_CACHE_VERSION, font_resources, font_signature, space_cjk_latin
 from pdf_flow import (visible_drawings, heading as section_heading, original_formula_units,
                       column_lanes, reflow_columns, source_flow_spacing, text_ink_bounds,
                       caption as flow_caption, lane_options)
@@ -27,12 +29,14 @@ from pdf_lists import ListLayoutError, source_list_structure, translated_list_la
 from pdf_figures import figure_regions, is_figure_caption
 from pdf_structures import anchored_lines, anchored_overlay, grid_members
 from pdf_continuation import continuation_map
+import pdf_document
+import pdf_translation
 
 ET.register_namespace("", "http://www.w3.org/2000/svg")
 ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
 
 PDF_LOCK = threading.RLock()
-ENGINE_VERSION = 76
+ENGINE_VERSION = 79
 SOURCE_SCAN_VERSION = 1
 MATH_FONT = re.compile(r"math|symbol|cmmi|cmsy|cmex|msam|msbm|stmary|rsfs", re.I)
 JUSTIFY_MAX_SLACK = 1.2
@@ -1186,11 +1190,14 @@ def _text_html(value, fallback):
                    for char in value)
 
 
-def _bold_html(value, start, end, ranges, fallback=(), italic=()):
+def _bold_html(value, start, end, ranges, fallback=(), italic=(), styles=()):
     edges = {start, end}
     for first, last in (*ranges, *italic):
         if first < end and last > start:
             edges.update((max(first, start), min(last, end)))
+    for item in styles:
+        if item["start"] < end and item["end"] > start:
+            edges.update((max(item["start"], start), min(item["end"], end)))
     edges = sorted(edges)
     pieces = []
     for first, last in zip(edges, edges[1:]):
@@ -1199,6 +1206,14 @@ def _bold_html(value, start, end, ranges, fallback=(), italic=()):
             text = '<i>' + text + '</i>'
         if any(a <= first and last <= b for a, b in ranges):
             text = '<b>' + text + '</b>'
+        exact = next((item["style"] for item in styles if item["start"] <= first and last <= item["end"]), None)
+        if exact:
+            css = (f"font-weight:{600 if exact.get('bold') else 400};"
+                   f"font-style:{'italic' if exact.get('italic') else 'normal'};"
+                   f"color:#{int(exact.get('color', 0)):06x}")
+            if exact.get("script") in {"sup", "sub"}:
+                css += f";vertical-align:{'super' if exact['script'] == 'sup' else 'sub'};font-size:75%"
+            text = f'<span style="{css}">' + text + '</span>'
         pieces.append(text)
     return "".join(pieces)
 
@@ -1240,7 +1255,7 @@ def list_marker_style(block, style, size):
                      "size": size * ratio, "weight": weight}
 
 
-def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None, links=(), paragraphs=(), italic=()):
+def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), marker_style=None, links=(), paragraphs=(), italic=(), styles=()):
     marker = lead_list_marker(value) if marker_style is not None and not paragraphs else None
     if marker is not None:
         first, last = marker.start(2), marker.end(2)
@@ -1261,7 +1276,9 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
                 shifted.append((max(0, start), end))
         contents, plain, labels, resolved = inline_math_markup(
             suffix, assets, archive, scale, shifted, fallback, links=links,
-            italic=[(max(0, a - removed), b - removed) for a, b in italic if b > removed])
+            italic=[(max(0, a - removed), b - removed) for a, b in italic if b > removed],
+            styles=[dict(item, start=max(0, item["start"] - removed), end=item["end"] - removed)
+                    for item in styles if item["end"] > removed])
         # Resolved ranges address the suffix; map them back behind the marker.
         resolved = [dict(item, start=item["start"] + removed, end=item["end"] + removed)
                     for item in resolved]
@@ -1282,6 +1299,24 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
     # can change the order of clauses, so source order must not consume a prefix
     # of a longer expression or prevent a later variable from being preserved.
     for asset in sorted(assets, key=lambda item: -len(item.get("match_normalized") or item["normalized"])):
+        if "source_range" in asset:
+            original = asset["source_translation"]
+            original_text, positions = pdf_document.compact(original)
+            current_text, current_positions = pdf_document.compact(value)
+            first, last = asset["source_range"]
+            indices = [i for i, p in enumerate(positions) if first <= p < last]
+            bounds = None
+            if indices and original_text == current_text:
+                bounds = (current_positions[indices[0]], current_positions[indices[-1]] + 1)
+            elif indices:
+                bounds = pdf_document.find_range(value, original[first:last], unique=True)
+            if bounds:
+                start = next((i for i, p in enumerate(mapping) if p >= bounds[0]), None)
+                end = next((i for i, p in enumerate(mapping) if p >= bounds[1]), len(mapping))
+                if start is not None and end > start:
+                    matches.append((start, end, asset))
+                    continue
+            raise ListLayoutError("公式在排版文本中的位置无法可靠恢复，保留完整原文")
         needle = asset.get("match_normalized") or asset["normalized"]
         index = text.find(needle)
         while index >= 0:
@@ -1333,11 +1368,11 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
         cursor = start
         for position in sorted(p for p in decorations if start <= p <= end):
             if position > cursor:
-                pieces.append(_bold_html(value, cursor, position, bold, fallback, italic))
+                pieces.append(_bold_html(value, cursor, position, bold, fallback, italic, styles))
             pieces.extend(decorations.pop(position))
             cursor = position + (1 if position in separators else 0)
         if cursor < end:
-            pieces.append(_bold_html(value, cursor, end, bold, fallback, italic))
+            pieces.append(_bold_html(value, cursor, end, bold, fallback, italic, styles))
 
     for start, end, kind, payload in events:
         if start < raw_cursor:
@@ -1353,7 +1388,7 @@ def inline_math_markup(value, assets, archive, scale=1, bold=(), fallback=(), ma
         else:
             # Goto anchors carry no href; the reader overlay navigates, and the
             # markup only marks the text so its rendered position can be found.
-            inner = _bold_html(value, start, end, bold, fallback, italic)
+            inner = _bold_html(value, start, end, bold, fallback, italic, styles)
             if payload.get("color"):
                 # Publishers style links black, blue or gray. Keep that color
                 # instead of MuPDF's default HTML link blue.
@@ -2804,11 +2839,12 @@ def fitted_overlay(overlays, page, block, rect, style, obstacles, typography=Non
                 return None
         ranges = bold_ranges(variant, bold_hints) if bold_hints else ()
         italics = bold_ranges(variant, italic_hints) if italic_hints else ()
+        exact_styles = pdf_translation.project_styles(block, variant)
         try:
             contents, validation_text, math_labels, resolved_links = inline_math_markup(
                 variant, block.get("_inline_assets", []), archive, scale=font_scale, bold=ranges,
                 fallback=typography.get("fallback_characters", ""), marker_style=marker_style,
-                links=block.get("_link_hints", []), paragraphs=paragraphs, italic=italics)
+                links=block.get("_link_hints", []), paragraphs=paragraphs, italic=italics, styles=exact_styles)
         except ListLayoutError as error:
             style["list_layout_issue"] = str(error)
             return None
@@ -3250,7 +3286,7 @@ def table_regions(page, native=None):
 
 
 def typeset(source: Path, document: dict, target: str, page_numbers=None, typography=None,
-            page_links=None, reference_fallbacks=None, continuation_hints=None):
+            page_links=None, reference_fallbacks=None, continuation_hints=None, structures=None, translation_records=None):
     """Typeset translated blocks onto the original pages.
 
     `page_links` maps each original page index to its link annotations in
@@ -3277,8 +3313,20 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             page = pdf[number]
             source_page_number = page_numbers[number] if page_numbers is not None else number
             rotation = page.rotation
-            native = [b for b in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"] if b["type"] == 0]
+            structure = (structures or {}).get(source_page_number + 1)
+            native = (copy.deepcopy(structure["native"]) if structure else
+                      [b for b in page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)["blocks"] if b["type"] == 0])
             rawdict_cache = []
+            if structure:
+                rawdict_cache.append(structure["raw"])
+                if structure.get("preserve_page"):
+                    report["preserved"] += len(saved_page["blocks"])
+                    report["issues"].extend({"page": saved_page["number"], "block_id": b["id"], "kind": "preserved",
+                                             "message": structure["issues"][0]} for b in saved_page["blocks"])
+                    continue
+                if structure["model"]["state"] != "ready":
+                    report["issues"].append({"page": saved_page["number"], "block_id": None, "kind": "analysis",
+                                             "message": structure["model"].get("reason", "版面模型未生效，使用几何规则")})
 
             def raw_native_blocks():
                 # Raw characters are only needed for links, inline math and
@@ -3314,18 +3362,23 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
             figures = figure_regions(page, native, drawings=drawings, images=page_images)
             page.set_rotation(rotation)
             figure_ids = set()
+            model_roles = {p["block_id"]: p["role"] for p in structure["paragraphs"]} if structure else {}
             for block in saved_page["blocks"]:
                 if is_figure_caption(block["text"]) or TABLE_CAPTION.match(block["text"]):
                     continue
                 box = source_rect(page, block)
-                if box.get_area() > 0 and any(
+                if model_roles.get(block["id"]) == "figure" or (box.get_area() > 0 and any(
                         region.contains((box.tl + box.br) * .5)
-                        and overlap(box, region) >= box.get_area() * .5 for region in figures):
+                        and overlap(box, region) >= box.get_area() * .5 for region in figures)):
                     figure_ids.add(block["id"])
             working = layout_blocks(page, {**saved_page, "blocks": [
                 block for block in saved_page["blocks"] if block["id"] not in figure_ids]},
                 native, target, cover_page=source_page_number == 0, graphics=graphics)
             working.extend(block for block in saved_page["blocks"] if block["id"] in figure_ids)
+            if structure:
+                originals = {b["id"]: b for b in saved_page["blocks"]}
+                paragraphs = {b["block_id"]: b for b in structure["paragraphs"]}
+                working = [pdf_translation.project_group(b, originals, paragraphs, translation_records or {}) for b in working]
             rects = {b["id"]: source_rect(page, b) for b in working}
             caption_rects = [rects[b["id"]] for b in working
                              if is_figure_caption(b["text"]) or TABLE_CAPTION.match(b["text"])]
@@ -3428,8 +3481,8 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                             report["issues"].extend({**entry, "block_id": key, "kind": kind, "message": cover_reason} for key in member_ids)
                         continue
                     block_rect = rects[block["id"]]
-                    if table_boxes and not TABLE_CAPTION.match(block["text"]) and any(
-                            overlap(block_rect, box) >= block_rect.get_area() * .5 for box in table_boxes):
+                    if not TABLE_CAPTION.match(block["text"]) and (model_roles.get(block["id"]) == "table" or any(
+                            overlap(block_rect, box) >= block_rect.get_area() * .5 for box in table_boxes)):
                         # Keep the published table intact; mixed cell translations
                         # were unreadable. Captions and notes outside the grid still
                         # translate through their own blocks.
@@ -3506,7 +3559,14 @@ def typeset(source: Path, document: dict, target: str, page_numbers=None, typogr
                                 fit_rect.y0 = max(fit_rect.y0, box.y1 + .6)
                         runs = []
                         cluster_rect = None
-                        if should_preserve_inline_symbols(block):
+                        if block.get("_ir_assets"):
+                            block = {**block, "_inline_assets": block["_ir_assets"]}
+                            for asset in block["_ir_assets"]:
+                                if asset.get("run"):
+                                    runs.append({**asset["run"], "rect": pymupdf.Rect(asset["run"]["rect"])})
+                                if asset.get("cluster_rect"):
+                                    cluster_rect = asset["cluster_rect"]
+                        elif should_preserve_inline_symbols(block):
                             runs = inline_math_runs(raw_native_blocks(), rect, combine="_members" in block)
                             assets = (inline_math_assets(page, runs, block["translation"],
                                                          **math_page_assets()) if runs else [])
@@ -3851,13 +3911,136 @@ def _write_json_atomic(path: Path, value):
     temporary.replace(path)
 
 
+def _layout_context(directory, document):
+    source = directory / "source.pdf"
+    source_stat = source.stat()
+    cache = directory / "layout"
+    cache.mkdir(exist_ok=True)
+    (cache / "pages").mkdir(exist_ok=True)
+    source_links = None
+    reference_fallbacks = None
+    scan_path = cache / "source-scan.json"
+    try:
+        cached_scan = json.loads(scan_path.read_text(encoding="utf-8"))
+        if (cached_scan.get("version") == SOURCE_SCAN_VERSION
+                and cached_scan.get("size") == source_stat.st_size
+                and cached_scan.get("mtime") == source_stat.st_mtime_ns):
+            source_links = {int(key): value for key, value in cached_scan["links"].items()}
+            reference_fallbacks = {int(key): [pymupdf.Rect(box) for box in value]
+                                   for key, value in cached_scan["fallbacks"].items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        source_links = None
+        reference_fallbacks = None
+    if source_links is None:
+        try:
+            with pymupdf.open(source) as scanned:
+                try:
+                    names = scanned.resolve_names()
+                except Exception:
+                    names = {}
+                source_links = {}
+                for index, page in enumerate(scanned):
+                    # page_link_targets derotates PyMuPDF's displayed link
+                    # rectangles itself; resetting the rotation first would
+                    # lose the transform on rotated source pages.
+                    source_links[index] = page_link_targets(page, names)
+                reference_fallbacks = reference_fallback_pages(scanned)
+            scan_temp = cache / "source-scan.tmp"
+            scan_temp.write_text(json.dumps({
+                "version": SOURCE_SCAN_VERSION, "size": source_stat.st_size,
+                "mtime": source_stat.st_mtime_ns, "links": source_links,
+                "fallbacks": {key: [list(box) for box in value]
+                              for key, value in reference_fallbacks.items()},
+            }, ensure_ascii=False), encoding="utf-8")
+            scan_temp.replace(scan_path)
+        except Exception:
+            source_links = None
+            reference_fallbacks = None
+    return {"source": source, "stat": source_stat, "font": font_signature(),
+            "links": source_links, "fallbacks": reference_fallbacks,
+            "hints": continuation_map(document)}
+
+
+def _layout_page(directory, document, target, index, context):
+    saved_page = document["pages"][index]
+    page_ids = {block["id"] for block in saved_page["blocks"]}
+    hints = {key: value for key, value in context["hints"].items() if key in page_ids}
+    signature = json.dumps({"version": ENGINE_VERSION, "font": context["font"],
+                           "source_size": context["stat"].st_size,
+                           "source_mtime": context["stat"].st_mtime_ns,
+                           "scan_version": SOURCE_SCAN_VERSION,
+                           "font_engine": FONT_CACHE_VERSION,
+                           "drop_cap_schema": document.get("drop_cap_schema"),
+                           "index": index, "target": target, "page": saved_page,
+                           "continuation": hints,
+                           "structure": context.get("structures", {}).get(saved_page["number"], {}).get("fingerprint"),
+                           "translation_structures": {key: value for key, value in context.get("translation_records", {}).items() if key in page_ids}}, ensure_ascii=False, sort_keys=True)
+    key = hashlib.sha256(signature.encode()).hexdigest()[:24]
+    cache = directory / "layout" / "pages"
+    page_pdf, page_report = cache / (key + ".pdf"), cache / (key + ".json")
+    details = _cached_page_report(page_report) if page_pdf.is_file() else None
+    count("page_cache_hits" if details is not None else "page_cache_misses")
+    if details is None:
+        page_structures = context.get("structures")
+        structure_summary = (page_structures or {}).get(saved_page["number"], {})
+        if "structure_file" in structure_summary:
+            page_structures = {saved_page["number"]: json.loads(Path(structure_summary["structure_file"]).read_text(encoding="utf-8"))}
+        page_document = {"pages": [saved_page]}
+        if "drop_cap_schema" in document:
+            page_document["drop_cap_schema"] = document["drop_cap_schema"]
+        # A page has the same glyph resources whether warmed early or built at
+        # the end. Another page's new translation cannot change this font set.
+        typography = font_resources("\n".join(b.get("translation", "")
+                                              for b in saved_page["blocks"]))
+        with span("page_typeset"):
+            page_raw, details = typeset(context["source"], page_document, target,
+                page_numbers=[index], typography=typography, page_links=context["links"],
+                reference_fallbacks=context["fallbacks"], continuation_hints=hints,
+                structures=page_structures, translation_records=context.get("translation_records"))
+        temporary = cache / (key + ".tmp")
+        temporary.write_bytes(page_raw)
+        temporary.replace(page_pdf)
+        _write_json_atomic(page_report, details)
+        _remember_page_report(page_report, details)
+    return page_pdf, details
+
+
+@measured("prewarm")
+def prewarm_layout(directory, document, target, pages):
+    requested = set(pages)
+    warmed = []
+    structures = pdf_document.ensure_pages(directory, document, requested)
+    records = pdf_translation.load_records(directory, document)
+    with PDF_LOCK:
+        context = _layout_context(directory, document)
+        context.update(structures=structures, translation_records=records)
+    for index, page in enumerate(document["pages"]):
+        if page["number"] not in requested or not page["blocks"]:
+            continue
+        if not all(b.get("translation", "").strip() and b.get("target") == target
+                   for b in page["blocks"]):
+            continue
+        # Release between pages so foreground rendering/final assembly can run.
+        with PDF_LOCK:
+            _layout_page(directory, document, target, index, context)
+        warmed.append(page["number"])
+    return {"pages": warmed}
+
+
+@measured("layout")
 def build_layout(directory: Path, document: dict, target: str):
     source = directory / "source.pdf"
+    structures = pdf_document.ensure_pages(directory, document, summary_only=True)
+    records = pdf_translation.load_records(directory, document)
     font_key = font_signature()
     source_stat = source.stat()
     signature = json.dumps({"version": ENGINE_VERSION, "font": font_key, "source_size": source_stat.st_size,
                             "source_mtime": source_stat.st_mtime_ns,
-                            "target": target, "pages": document["pages"]}, ensure_ascii=False, sort_keys=True)
+                            "scan_version": SOURCE_SCAN_VERSION, "font_engine": FONT_CACHE_VERSION,
+                            "drop_cap_schema": document.get("drop_cap_schema"),
+                            "target": target, "pages": document["pages"],
+                            "structures": {n: p["fingerprint"] for n, p in structures.items()},
+                            "translation_structures": records}, ensure_ascii=False, sort_keys=True)
     revision = hashlib.sha256(signature.encode()).hexdigest()[:24]
     cache = directory / "layout"
     with PDF_LOCK:
@@ -3865,83 +4048,27 @@ def build_layout(directory: Path, document: dict, target: str):
         pdf_path = cache / (revision + ".pdf")
         report_path = cache / (revision + ".json")
         if pdf_path.is_file() and report_path.is_file():
+            count("revision_cache_hits")
             return json.loads(report_path.read_text(encoding="utf-8"))
         page_cache = cache / "pages"
         page_cache.mkdir(exist_ok=True)
         report = {"target": target, "pages": len(document["pages"]), "replaced": 0,
                   "untranslated": 0, "preserved": 0, "scaled": 0, "issues": [], "placements": {}}
-        typography = font_resources("\n".join(b.get("translation", "") for p in document["pages"] for b in p["blocks"]))
         # One pass over the source resolves named destinations and collects every
         # page's links in unrotated coordinates; per-page typeset calls then see
         # the full document's targets even though only one page is selected.
-        source_links = None
-        reference_fallbacks = None
-        scan_path = cache / "source-scan.json"
-        try:
-            cached_scan = json.loads(scan_path.read_text(encoding="utf-8"))
-            if (cached_scan.get("version") == SOURCE_SCAN_VERSION
-                    and cached_scan.get("size") == source_stat.st_size
-                    and cached_scan.get("mtime") == source_stat.st_mtime_ns):
-                source_links = {int(key): value for key, value in cached_scan["links"].items()}
-                reference_fallbacks = {int(key): [pymupdf.Rect(box) for box in value]
-                                       for key, value in cached_scan["fallbacks"].items()}
-        except (OSError, ValueError, KeyError, TypeError):
-            source_links = None
-            reference_fallbacks = None
-        if source_links is None:
-            try:
-                with pymupdf.open(source) as scanned:
-                    try:
-                        names = scanned.resolve_names()
-                    except Exception:
-                        names = {}
-                    source_links = {}
-                    for index, page in enumerate(scanned):
-                        # page_link_targets derotates PyMuPDF's displayed link
-                        # rectangles itself; resetting the rotation first would
-                        # lose the transform on rotated source pages.
-                        source_links[index] = page_link_targets(page, names)
-                    reference_fallbacks = reference_fallback_pages(scanned)
-                scan_temp = cache / "source-scan.tmp"
-                scan_temp.write_text(json.dumps({
-                    "version": SOURCE_SCAN_VERSION, "size": source_stat.st_size,
-                    "mtime": source_stat.st_mtime_ns, "links": source_links,
-                    "fallbacks": {key: [list(box) for box in value]
-                                  for key, value in reference_fallbacks.items()},
-                }, ensure_ascii=False), encoding="utf-8")
-                scan_temp.replace(scan_path)
-            except Exception:
-                source_links = None
-                reference_fallbacks = None
-        hints = continuation_map(document)
+        context = _layout_context(directory, document)
+        context.update(structures=structures, translation_records=records)
+        report["structure"] = {"version": pdf_document.STRUCTURE_VERSION,
+                               "model_pages": sum(p["model"]["state"] == "ready" for p in structures.values()),
+                               "fallback_pages": sum(p["model"]["state"] != "ready" for p in structures.values())}
         with pymupdf.open() as combined:
             for index, saved_page in enumerate(document["pages"]):
-                page_ids = {block["id"] for block in saved_page["blocks"]}
-                page_continuations = {key: value for key, value in hints.items() if key in page_ids}
-                page_signature = json.dumps({"version": ENGINE_VERSION, "font": font_key, "source_size": source_stat.st_size,
-                                             "source_mtime": source_stat.st_mtime_ns, "index": index,
-                                             "target": target, "page": saved_page,
-                                             "continuation": page_continuations,
-                                             }, ensure_ascii=False, sort_keys=True)
-                key = hashlib.sha256(page_signature.encode()).hexdigest()[:24]
-                page_pdf = page_cache / (key + ".pdf")
-                page_report = page_cache / (key + ".json")
-                details = _cached_page_report(page_report) if page_pdf.is_file() else None
-                if details is None:
-                    page_document = {"pages": [saved_page]}
-                    if "drop_cap_schema" in document:
-                        page_document["drop_cap_schema"] = document["drop_cap_schema"]
-                    page_raw, details = typeset(source, page_document, target, page_numbers=[index],
-                                                typography=typography, page_links=source_links,
-                                                reference_fallbacks=reference_fallbacks,
-                                                continuation_hints=page_continuations)
-                    page_temp = page_cache / (key + ".tmp")
-                    page_temp.write_bytes(page_raw)
-                    page_temp.replace(page_pdf)
-                    _write_json_atomic(page_report, details)
-                    _remember_page_report(page_report, details)
+                page_pdf, details = _layout_page(directory, document, target, index, context)
+                merge_started = time.perf_counter()
                 with pymupdf.open(page_pdf) as cached:
                     combined.insert_pdf(cached, links=False, annots=True)
+                count("merge_ms", (time.perf_counter() - merge_started) * 1000)
                 for field in ("replaced", "untranslated", "preserved", "scaled"):
                     report[field] += details[field]
                 report["issues"].extend(details["issues"])
@@ -3962,6 +4089,7 @@ def build_layout(directory: Path, document: dict, target: str):
             # that the layout re-attached to translated text replace the original
             # rectangles, and links whose source text was erased are dropped
             # instead of pointing at unrelated content.
+            merge_started = time.perf_counter()
             with pymupdf.open(source) as original:
                 combined.set_metadata(original.metadata)
                 toc = original.get_toc()
@@ -4060,6 +4188,7 @@ def build_layout(directory: Path, document: dict, target: str):
                 if reader_links:
                     report["links"] = reader_links
             raw = combined.tobytes(garbage=4, deflate=True)
+            count("merge_ms", (time.perf_counter() - merge_started) * 1000)
         report["revision"] = revision
         temporary = cache / (revision + ".tmp")
         temporary.write_bytes(raw)

@@ -24,6 +24,8 @@ def sample_pdf(rotation=0):
 
 class TranslationTests(unittest.TestCase):
     def setUp(self):
+        from vision_fixture import install
+        install(self)
         self.temp = tempfile.TemporaryDirectory()
         self.data_patch = patch.object(service, "DATA", Path(self.temp.name))
         self.data_patch.start()
@@ -179,6 +181,7 @@ class TranslationTests(unittest.TestCase):
         doc = self.upload()
         active = 0
         peak = 0
+        all_started = None
 
         async def handler(request):
             nonlocal active, peak
@@ -186,11 +189,15 @@ class TranslationTests(unittest.TestCase):
             peak = max(peak, active)
             prompt = json.loads(request.content)["messages"][1]["content"]
             context = json.loads(prompt.split("以下 JSON 为待翻译内容与参考资料：\n", 1)[1])
-            await asyncio.sleep(.01)
+            if active == 3:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), timeout=2)
             active -= 1
             return httpx.Response(200, json={"choices": [{"message": {"content": "译文 " + context["block_id"]}, "finish_reason": "stop"}]})
 
         async def translate_all():
+            nonlocal all_started
+            all_started = asyncio.Event()
             request = service.TranslateRequest(agent=service.AgentConfig(**self.agent))
             return await asyncio.gather(*(service.translate(doc["id"], block["id"], request)
                                           for block in service.all_blocks(doc)))

@@ -7,6 +7,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -21,13 +22,19 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES, GZipMiddleware
-from pdf_layout import PDF_LOCK, build_layout, goto_fraction
+from pdf_layout import PDF_LOCK, build_layout, prewarm_layout, goto_fraction
+from performance import TRACE, measured, span, count, write as write_performance
 from pdf_continuation import continuation_map
 from pdf_references import normalize_document, translation_source, format_translation
 from pdf_text import DROP_CAP_SCHEMA, normalize_drop_caps
 from pdf_selection import page_selection
 from paper_analysis import install as install_analysis
 from paper_reading import install as install_reading
+from translation_quality import install as install_quality
+import pdf_document
+import pdf_model
+import pdf_translation
+import pdf_visual_check
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("TRANSLATION_DATA_DIR", ROOT / ".data"))
@@ -46,6 +53,9 @@ _SUMMARY_CACHE = {}
 _PIXMAP_CACHE = OrderedDict()
 _PIXMAP_CACHE_LOCK = threading.Lock()
 _PIXMAP_CACHE_SIZE = 48
+_LIBRARY_LOCK = threading.RLock()
+_DOCUMENT_ACTIVITY = {}
+_DOCUMENT_EXCLUSIVE = set()
 app = FastAPI(title="Parallel · PDF 对照翻译", docs_url=None, redoc_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=1024,
                    exclude_content_types=(*DEFAULT_EXCLUDED_CONTENT_TYPES, "application/pdf"))
@@ -96,7 +106,40 @@ async def local_only(request: Request, call_next):
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         if not secrets.compare_digest(request.headers.get("x-local-token", ""), TOKEN):
             return JSONResponse({"detail": "会话失效，请刷新页面"}, status_code=403)
-    response = await call_next(request)
+    match = re.fullmatch(r"/api/documents/([a-f0-9]{32})(?:/.*)?", request.url.path)
+    active_doc = match[1] if match else None
+    exclusive = bool(active_doc and request.url.path == f"/api/documents/{active_doc}"
+                     and request.method in {"PATCH", "DELETE"})
+    if active_doc:
+        with _LIBRARY_LOCK:
+            if active_doc in _DOCUMENT_EXCLUSIVE or (exclusive and _DOCUMENT_ACTIVITY.get(active_doc, 0)):
+                return JSONResponse({"detail": "该论文正在处理，请稍后再试"}, status_code=409)
+            _DOCUMENT_ACTIVITY[active_doc] = _DOCUMENT_ACTIVITY.get(active_doc, 0) + 1
+            if exclusive:
+                _DOCUMENT_EXCLUSIVE.add(active_doc)
+    trace = {"timestamp": time.time()}
+    timing_token = TRACE.set(trace)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    finally:
+        trace["request_ms"] = (time.perf_counter() - started) * 1000
+        TRACE.reset(timing_token)
+        if active_doc:
+            with _LIBRARY_LOCK:
+                _DOCUMENT_ACTIVITY[active_doc] -= 1
+                if not _DOCUMENT_ACTIVITY[active_doc]:
+                    _DOCUMENT_ACTIVITY.pop(active_doc, None)
+                if exclusive:
+                    _DOCUMENT_EXCLUSIVE.discard(active_doc)
+    if request.method == "POST" and ("/translate" in request.url.path or "/layout" in request.url.path):
+        trace["status"] = response.status_code
+        await asyncio.to_thread(write_performance, trace)
+        response.headers["Server-Timing"] = ", ".join(
+            f"{key[:-3]};dur={value:.3f}" for key, value in trace.items() if key.endswith("_ms"))
+        response.headers["X-Performance-Counts"] = json.dumps({
+            key: value for key, value in trace.items()
+            if key in {"model_requests", "page_cache_hits", "page_cache_misses", "revision_cache_hits"}})
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Frame-Options"] = "DENY"
@@ -148,11 +191,36 @@ class EditRequest(BaseModel):
 
 
 class BatchTranslateRequest(TranslateRequest):
-    block_ids: list[str] = Field(min_length=1, max_length=5)
+    block_ids: list[str] = Field(min_length=1, max_length=12)
 
 
 class LayoutRequest(BaseModel):
+    agent: AgentConfig | None = None
     target: str = Field(default="简体中文", min_length=1, max_length=100)
+
+
+class PrewarmRequest(LayoutRequest):
+    pages: list[int] = Field(min_length=1, max_length=300)
+
+
+@measured("prepare")
+def snapshot_doc(doc_id):
+    with doc_lock(doc_id):
+        return copy.deepcopy(load_doc(doc_id))
+
+
+def with_dependencies(doc):
+    hints = {key: value["continues_from"] for key, value in continuation_map(doc).items()
+             if value.get("continues_from")}
+    if hints:
+        doc = {**doc, "translation_dependencies": hints}
+    return doc
+
+
+def ensure_unchanged(current, original):
+    if any(current.get(key) != original.get(key)
+           for key in ("text", "translation", "target", "edited")):
+        raise HTTPException(409, "该段内容已更新，保留最新译文；请刷新文档后重试")
 
 
 def doc_dir(doc_id: str) -> Path:
@@ -208,6 +276,7 @@ def load_doc(doc_id: str) -> dict:
         return document
 
 
+@measured("save")
 def save_doc(path: Path, doc: dict):
     temp = path / "document.tmp"
     temp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
@@ -365,7 +434,13 @@ def endpoint(config: AgentConfig) -> str:
 def expand_template(value, variables):
     # Substitute after JSON decoding, so document quotes/newlines cannot break the body.
     if isinstance(value, str):
-        return re.sub(r"\{\{(\w+)\}\}", lambda m: variables.get(m[1], m[0]), value)
+        whole = re.fullmatch(r"\{\{(\w+)\}\}", value)
+        if whole and isinstance(variables.get(whole[1]), (list, dict)):
+            return variables[whole[1]]
+        def substitute(match):
+            item = variables.get(match[1], match[0])
+            return item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+        return re.sub(r"\{\{(\w+)\}\}", substitute, value)
     if isinstance(value, list):
         return [expand_template(item, variables) for item in value]
     if isinstance(value, dict):
@@ -477,15 +552,17 @@ def context_for(doc, index: int, request: TranslateRequest) -> dict:
             **continuation_context(doc, index, request)}
 
 
-def prompt_parts(doc, index: int, request: TranslateRequest):
+def prompt_parts(doc, index: int, request: TranslateRequest, packet=None):
     context = context_for(doc, index, request)
+    if packet is not None:
+        context["current_source"] = packet.text
     if context.get("kind") == "reference_title":
         instruction = ("仅翻译 current_source 中的这一条论文题名。"
                        "作者、期刊、会议、出版信息由程序保留，不要输出它们；不要输出文献编号或其他条目。\n")
     else:
         instruction = ""
     user = instruction + "以下 JSON 为待翻译内容与参考资料：\n" + json.dumps(context, ensure_ascii=False)
-    return system_prompt_for(request), user
+    return system_prompt_for(request) + (pdf_translation.PROTECTION_HINT if packet and packet.protected else ""), user
 
 
 def build_prompt(doc, index, request: TranslateRequest):
@@ -494,7 +571,9 @@ def build_prompt(doc, index, request: TranslateRequest):
     return system + "\n\n" + user
 
 
+@measured("model")
 async def invoke_agent(config: AgentConfig, prompt: str, text: str = "", target: str = "简体中文", system_prompt: str = SYSTEM_PROMPT):
+    count("model_requests")
     url = endpoint(config)
     headers = {"Content-Type": "application/json"}
     if config.api_key.strip():
@@ -519,7 +598,9 @@ async def invoke_agent(config: AgentConfig, prompt: str, text: str = "", target:
         if not isinstance(template, dict):
             raise HTTPException(400, "请求模板必须是 JSON 对象")
         body = expand_template(template, {"prompt": system_prompt + "\n\n" + prompt,
-                                         "text": text, "target": target, "model": config.model})
+                                         "text": text, "target": target, "model": config.model,
+                                         "images": [], "messages": [{"role": "system", "content": system_prompt},
+                                                                      {"role": "user", "content": prompt}]})
     try:
         client = agent_client()
         # A dead connection should not consume the entire read timeout; retries
@@ -570,7 +651,34 @@ async def invoke_agent(config: AgentConfig, prompt: str, text: str = "", target:
 
 @app.get("/api/session")
 def session():
-    return {"token": TOKEN, "batch_translation": True}
+    return {"token": TOKEN, "batch_translation": True, "batch_limit": 12, "prewarm_layout": True,
+            "quality_translation": False, "translation_history": True, "document_structure": True}
+
+
+@app.get("/api/layout-model")
+def layout_model_status():
+    return pdf_model.status()
+
+
+@app.get("/api/documents/{doc_id}/structure")
+def structure_status(doc_id: str):
+    return {**pdf_document.progress(doc_dir(doc_id)), "model": pdf_model.status()}
+
+
+@app.post("/api/documents/{doc_id}/structure")
+def prepare_structure(doc_id: str, request: LayoutRequest = LayoutRequest()):
+    document = snapshot_doc(doc_id)
+    with pdf_model.using(request.agent):
+        pages = pdf_document.ensure_pages(doc_dir(doc_id), document, summary_only=True)
+    return {**pdf_document.progress(doc_dir(doc_id)), "pages": len(pages)}
+
+
+async def translation_structures(doc_id, document, selected, agent=None):
+    ids = {b["id"] for b in selected}
+    numbers = [p["number"] for p in document["pages"] if any(b["id"] in ids for b in p["blocks"])]
+    with pdf_model.using(agent):
+        pages = await asyncio.to_thread(pdf_document.ensure_pages, doc_dir(doc_id), document, numbers)
+    return {b["id"]: pdf_document.paragraph_for(pages, b) for b in selected}
 
 
 @app.get("/api/documents")
@@ -606,14 +714,74 @@ async def upload(file: UploadFile = File(...)):
         raise HTTPException(400, "请选择有效的 PDF 文件")
     name = (file.filename or "未命名.pdf").replace("\\", "/").rsplit("/", 1)[-1][:200]
     _, doc = await asyncio.to_thread(extract_document, raw, name)
-    return doc
+    return with_dependencies(doc)
 
 
 @app.get("/api/documents/{doc_id}")
 def document(doc_id: str):
     # Snapshot while no translation is patching the shared cached document.
     with doc_lock(doc_id):
-        return copy.deepcopy(load_doc(doc_id))
+        return with_dependencies(copy.deepcopy(load_doc(doc_id)))
+
+
+class RenameDocumentRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+def ensure_library_idle(doc_id):
+    identity = str(doc_dir(doc_id).resolve())
+    for module in (analysis_service, reading_service):
+        if any(key[0] == identity and not task.done() for key, task in list(module['running'].items())):
+            raise HTTPException(409, "该论文的阅读助手正在处理，请等待完成后再操作")
+
+
+@app.patch('/api/documents/{doc_id}')
+def rename_document(doc_id: str, request: RenameDocumentRequest):
+    name = request.name.strip()
+    if not name or re.search(r'[\x00-\x1f\x7f/\\]', name) or name in {'.', '..'}:
+        raise HTTPException(400, '名称不能为空，也不能包含路径分隔符或控制字符')
+    with doc_lock(doc_id), WRITE_LOCK:
+        ensure_library_idle(doc_id)
+        doc = load_doc(doc_id)
+        doc['name'] = name
+        save_doc(doc_dir(doc_id), doc)
+        return {'id': doc_id, 'name': name}
+
+
+@app.delete('/api/documents/{doc_id}')
+def delete_document(doc_id: str):
+    def linked_directory(path):
+        # st_file_attributes covers Windows junctions on Python 3.10/3.11 too.
+        try:
+            return path.is_symlink() or bool(getattr(path.lstat(), 'st_file_attributes', 0) & 0x400)
+        except FileNotFoundError:
+            return False
+    with doc_lock(doc_id), WRITE_LOCK:
+        ensure_library_idle(doc_id)
+        source = doc_dir(doc_id)
+        root = DATA.resolve()
+        # Move only a verified direct child; never follow a junction outside the library.
+        if linked_directory(source) or source.resolve().parent != root:
+            raise HTTPException(409, '文档目录不是安全的本地目录，未执行删除')
+        trash = DATA / '.trash'
+        if linked_directory(trash) or trash.resolve().parent != root:
+            raise HTTPException(409, '回收目录异常，未执行删除')
+        destination = trash / f'{doc_id}-{uuid.uuid4().hex}'
+        if destination.resolve().parent != trash.resolve():
+            raise HTTPException(409, '回收路径异常，未执行删除')
+        try:
+            trash.mkdir(exist_ok=True)
+            source.rename(destination)
+        except OSError:
+            raise HTTPException(409, '文件正在被占用或目录不可写，请稍后重试')
+        with _DOC_CACHE_LOCK:
+            _DOC_CACHE.pop(doc_id, None)
+        _SUMMARY_CACHE.pop(source / 'document.json', None)
+        with _PIXMAP_CACHE_LOCK:
+            for key in list(_PIXMAP_CACHE):
+                if Path(key[0]).is_relative_to(source):
+                    _PIXMAP_CACHE.pop(key, None)
+        return {'id': doc_id, 'deleted': True}
 
 
 @app.get("/api/documents/{doc_id}/pages/{number}.png")
@@ -727,11 +895,33 @@ def layout(doc_id: str, request: LayoutRequest):
                 "preserved": 0, "scaled": 0, "issues": [], "placements": {}}
     try:
         directory = doc_dir(doc_id)
-        report = dict(build_layout(directory, document, request.target))
-        save_finished_pdf(directory, document, request.target, report)
+        with pdf_model.using(request.agent):
+            report = dict(build_layout(directory, document, request.target))
+            report = pdf_visual_check.validate(directory, document, report)
+        with doc_lock(doc_id):
+            if load_doc(doc_id)["pages"] == document["pages"]:
+                if report.get("visual_check", {}).get("status") == "passed" or request.agent is None:
+                    save_finished_pdf(directory, document, request.target, report)
+                else:
+                    report["save_error"] = "视觉验收尚未通过，候选 PDF 可预览；未覆盖之前的自动导出文件。"
+            else:
+                report["stale"] = True
         return report
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(422, "PDF 排版失败，请切换段落视图检查文档；原文与译文均已保留") from exc
+
+
+@app.post("/api/documents/{doc_id}/layout/prewarm")
+def prewarm(doc_id: str, request: PrewarmRequest):
+    document = snapshot_doc(doc_id)
+    valid = {page["number"] for page in document["pages"]}
+    if not set(request.pages) <= valid:
+        raise HTTPException(400, "预排版页码无效")
+    try:
+        with pdf_model.using(request.agent):
+            return prewarm_layout(doc_dir(doc_id), document, request.target, request.pages)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(422, "提前排版未完成，最终排版时会重试；译文已保留") from exc
 
 
 def layout_file(doc_id: str, revision: str):
@@ -771,23 +961,30 @@ async def test_agent(config: AgentConfig):
 
 @app.post("/api/documents/{doc_id}/blocks/{block_id}/translate")
 async def translate(doc_id: str, block_id: str, request: TranslateRequest):
-    with doc_lock(doc_id):
-        doc = load_doc(doc_id)
-        _, index, block = find_block(doc, block_id)
-        if len(block["text"]) > 18000:
-            raise HTTPException(400, "此文本块过长，请拆分 PDF 或手动编辑该段译文")
-        source_text = block["text"]
-        fixed = non_translatable_text(source_text)
-        if fixed:
-            result = source_text
-            system = prompt = ""
-        else:
-            system, prompt = prompt_parts(doc, index, request)
-            source = translation_source(block)
+    doc = await asyncio.to_thread(snapshot_doc, doc_id)
+    _, index, block = find_block(doc, block_id)
+    if len(block["text"]) > 18000:
+        raise HTTPException(400, "此文本块过长，请拆分 PDF 或手动编辑该段译文")
+    source_text = block["text"]
+    structures = await translation_structures(doc_id, doc, [block], request.agent)
+    paragraph = structures[block_id]
+    if paragraph and paragraph.get("issues"):
+        raise HTTPException(422, paragraph["issues"][0] + "；已有译文未修改")
+    packet = pdf_translation.build_input(block, paragraph, translation_source(block))
+    record = None
+    fixed = non_translatable_text(source_text) or bool(paragraph and paragraph["pure_formula"])
+    if fixed:
+        result = source_text
+        system = prompt = ""
+    else:
+        system, prompt = prompt_parts(doc, index, request, packet)
+        source = translation_source(block)
+        system += quality_service["manual_prompt"](doc_id, request.target, source)
     warning = ""
     if not fixed:
-        result = await invoke_agent(request.agent, prompt, source, request.target, system_prompt=system)
+        result = await invoke_agent(request.agent, prompt, packet.text, request.target, system_prompt=system)
         try:
+            result, record = pdf_translation.restore_output(packet, result, request.target)
             result = format_translation(block, result)
         except ValueError as error:
             raise HTTPException(502, str(error))
@@ -797,12 +994,14 @@ async def translate(doc_id: str, block_id: str, request: TranslateRequest):
             # wording and report it instead of silently rewriting saved text.
             try:
                 retry = await invoke_agent(request.agent, prompt + "\n" + ELLIPSIS_HINT,
-                                           source, request.target, system_prompt=system)
+                                           packet.text, request.target, system_prompt=system)
+                retry, retry_record = pdf_translation.restore_output(packet, retry, request.target)
                 retry = format_translation(block, retry)
             except (HTTPException, ValueError):
                 retry = ""
             if retry and not introduces_ellipsis(source_text, retry):
                 result = retry
+                record = retry_record
             else:
                 warning = "原文没有省略号，译文自行添加了省略号；该片段可能是被版面切断的半句，请核对。"
 
@@ -810,8 +1009,10 @@ async def translate(doc_id: str, block_id: str, request: TranslateRequest):
         with doc_lock(doc_id), WRITE_LOCK:
             latest = load_doc(doc_id)
             _, _, current = find_block(latest, block_id)
+            ensure_unchanged(current, block)
             current.update(translation=result, target=request.target, edited=False)
             current.pop("drop_cap_review", None)
+            pdf_translation.save_records(doc_dir(doc_id), {block_id: record})
             save_doc(doc_dir(doc_id), latest)
             saved = copy.deepcopy(current)
             if warning:
@@ -827,46 +1028,64 @@ async def translate_batch(doc_id: str, request: BatchTranslateRequest):
         raise HTTPException(400, "合并翻译仅支持 OpenAI 兼容接口")
     if len(set(request.block_ids)) != len(request.block_ids):
         raise HTTPException(400, "段落 ID 不能重复")
-    with doc_lock(doc_id):
-        doc = load_doc(doc_id)
-        entries = sorted((find_block(doc, block_id)[1:] for block_id in request.block_ids), key=lambda item: item[0])
-        indexes = [item[0] for item in entries]
-        selected = [item[1] for item in entries]
-        if any(len(b["text"]) > 18000 for b in selected) or sum(len(b["text"]) for b in selected) > 24000:
-            raise HTTPException(400, "合并文本过长，请降低每次请求段数")
-        fixed = {b["id"]: b["text"] for b in selected if non_translatable_text(b["text"])}
-        translatable = [b for b in selected if b["id"] not in fixed]
-        fixed_only = not translatable
-        if fixed_only:
-            def save_fixed():
-                with doc_lock(doc_id), WRITE_LOCK:
-                    latest = load_doc(doc_id)
-                    saved = []
-                    for block in selected:
-                        _, _, current = find_block(latest, block["id"])
-                        current.update(translation=fixed[block["id"]], target=request.target, edited=False)
-                        current.pop("drop_cap_review", None)
-                        saved.append(copy.deepcopy(current))
-                    save_doc(doc_dir(doc_id), latest)
-                    return {"blocks": saved, "missing": []}
-        else:
-            context = context_for(doc, indexes[0], request)
-            for key in ("block_id", "current_source", "kind", "read_only_citation",
-                        "continuation", "previous_source_tail", "previous_translation_tail"):
-                context.pop(key, None)
-            hints = continuation_map(doc)
-            current_blocks = []
-            for index, block in entries:
-                if block["id"] in fixed:
-                    continue
-                item = {"id": block["id"], "source": translation_source(block),
-                        "kind": "reference_title" if block.get("reference") else "paragraph"}
-                item.update(continuation_context(doc, index, request, hints))
-                current_blocks.append(item)
-            context["current_blocks"] = current_blocks
-            context["next"] = [b["text"][:3000] for b in all_blocks(doc)[indexes[-1] + 1:indexes[-1] + 3]]
-            prompt = "参考资料与本次待翻译段落：\n" + json.dumps(context, ensure_ascii=False)
-            system = system_prompt_for(request, BATCH_SYSTEM_PROMPT)
+    doc = await asyncio.to_thread(snapshot_doc, doc_id)
+    entries = sorted((find_block(doc, block_id)[1:] for block_id in request.block_ids), key=lambda item: item[0])
+    indexes = [item[0] for item in entries]
+    selected = [item[1] for item in entries]
+    if any(len(b["text"]) > 18000 for b in selected) or sum(len(b["text"]) for b in selected) > 24000:
+        raise HTTPException(400, "合并文本过长，请降低每次请求段数")
+    structures = await translation_structures(doc_id, doc, selected, request.agent)
+    packets = {b["id"]: pdf_translation.build_input(b, structures[b["id"]], translation_source(b)) for b in selected}
+    records = {}
+    fixed = {b["id"]: b["text"] for b in selected if non_translatable_text(b["text"])
+             or bool(structures[b["id"]] and structures[b["id"]]["pure_formula"])}
+    translatable = [b for b in selected if b["id"] not in fixed]
+    unsafe = {b["id"] for b in translatable if structures[b["id"]] and structures[b["id"]].get("issues")}
+    if unsafe:
+        # The normal batch fallback isolates invalid blocks while keeping good
+        # results. Never expose an unprotected damaged formula to the model.
+        translatable = [b for b in translatable if b["id"] not in unsafe]
+        if not translatable and not fixed:
+            raise HTTPException(422, "所选段落含无法可靠保护的公式，保留原文和已有译文", headers={"X-Translation-Fallback": "single"})
+    fixed_only = not translatable
+    if fixed_only:
+        def save_fixed():
+            with doc_lock(doc_id), WRITE_LOCK:
+                latest = load_doc(doc_id)
+                saved = []
+                for block in selected:
+                    if block["id"] not in fixed:
+                        continue
+                    ensure_unchanged(find_block(latest, block["id"])[2], block)
+                for block in selected:
+                    if block["id"] not in fixed:
+                        continue
+                    _, _, current = find_block(latest, block["id"])
+                    current.update(translation=fixed[block["id"]], target=request.target, edited=False)
+                    current.pop("drop_cap_review", None)
+                    saved.append(copy.deepcopy(current))
+                save_doc(doc_dir(doc_id), latest)
+                return {"blocks": saved, "missing": [b["id"] for b in selected if b["id"] not in fixed]}
+    else:
+        context = context_for(doc, indexes[0], request)
+        for key in ("block_id", "current_source", "kind", "read_only_citation",
+                    "continuation", "previous_source_tail", "previous_translation_tail"):
+            context.pop(key, None)
+        hints = continuation_map(doc)
+        current_blocks = []
+        for index, block in entries:
+            if block["id"] in fixed or block["id"] in unsafe:
+                continue
+            item = {"id": block["id"], "source": packets[block["id"]].text,
+                    "kind": "reference_title" if block.get("reference") else "paragraph"}
+            item.update(continuation_context(doc, index, request, hints))
+            current_blocks.append(item)
+        context["current_blocks"] = current_blocks
+        context["next"] = [b["text"][:3000] for b in all_blocks(doc)[indexes[-1] + 1:indexes[-1] + 3]]
+        prompt = "参考资料与本次待翻译段落：\n" + json.dumps(context, ensure_ascii=False)
+        system = system_prompt_for(request, BATCH_SYSTEM_PROMPT) + quality_service["manual_prompt"](doc_id, request.target, "\n".join(b["text"] for b in selected))
+        if any(packets[b["id"]].protected for b in translatable):
+            system += pdf_translation.PROTECTION_HINT
     if fixed_only:
         return await asyncio.to_thread(save_fixed)
     try:
@@ -901,10 +1120,11 @@ async def translate_batch(doc_id: str, request: BatchTranslateRequest):
             continue
         source_block = next(block for block in translatable if block["id"] == block_id)
         try:
+            text, records[block_id] = pdf_translation.restore_output(packets[block_id], text, request.target)
             translations[block_id] = format_translation(source_block, text)
         except ValueError:
             continue
-    missing = [b["id"] for b in translatable if b["id"] not in translations]
+    missing = [b["id"] for b in selected if b["id"] not in translations]
     if not translations:
         raise HTTPException(502, "合并译文格式不完整，已有译文未修改", headers={"X-Translation-Fallback": "single"})
     warnings = {}
@@ -916,15 +1136,18 @@ async def translate_batch(doc_id: str, request: BatchTranslateRequest):
         # Correct only the affected fragment once; a batch retry would return
         # every paragraph again and cost much more than the single retry.
         try:
-            system_one, prompt_one = prompt_parts(doc, index_by_id[block["id"]], request)
+            system_one, prompt_one = prompt_parts(doc, index_by_id[block["id"]], request, packets[block["id"]])
+            system_one += quality_service["manual_prompt"](doc_id, request.target, translation_source(block))
             retry = await invoke_agent(request.agent, prompt_one + "\n" + ELLIPSIS_HINT,
-                                       translation_source(block), request.target,
+                                       packets[block["id"]].text, request.target,
                                        system_prompt=system_one)
+            retry, retry_record = pdf_translation.restore_output(packets[block["id"]], retry, request.target)
             retry = format_translation(block, retry)
         except (HTTPException, ValueError):
             retry = ""
         if retry and not introduces_ellipsis(block["text"], retry):
             translations[block["id"]] = retry
+            records[block["id"]] = retry_record
         else:
             warnings[block["id"]] = "原文没有省略号，译文自行添加了省略号；该片段可能是被版面切断的半句，请核对。"
 
@@ -933,12 +1156,16 @@ async def translate_batch(doc_id: str, request: BatchTranslateRequest):
             latest = load_doc(doc_id)
             saved = []
             for block in selected:
+                if block["id"] in translations:
+                    ensure_unchanged(find_block(latest, block["id"])[2], block)
+            for block in selected:
                 if block["id"] not in translations:
                     continue
                 _, _, current = find_block(latest, block["id"])
                 current.update(translation=translations[block["id"]], target=request.target, edited=False)
                 current.pop("drop_cap_review", None)
                 saved.append(copy.deepcopy(current))
+            pdf_translation.save_records(doc_dir(doc_id), {b["id"]: records.get(b["id"]) for b in saved})
             save_doc(doc_dir(doc_id), latest)
             result = {"blocks": saved, "missing": missing}
             if warnings:
@@ -956,6 +1183,7 @@ def edit(doc_id: str, block_id: str, request: EditRequest):
         block.update(translation=request.translation.strip(), target=request.target, edited=True)
         block.pop("drop_cap_review", None)
         block.pop("drop_cap_preserve", None)
+        pdf_translation.save_records(doc_dir(doc_id), {block_id: None})
         if doc.get("drop_cap_review_pending"):
             # Re-check the conflict once after the user resolves a translation,
             # not on every future document load.
@@ -980,6 +1208,7 @@ def export(doc_id: str):
 
 analysis_service = install_analysis(sys.modules[__name__])
 reading_service = install_reading(sys.modules[__name__])
+quality_service = install_quality(sys.modules[__name__])
 
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 

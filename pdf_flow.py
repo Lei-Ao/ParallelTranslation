@@ -204,6 +204,15 @@ def source_flow_spacing(style, result, prior_style, prior_result, source_gap):
         ink_gap = style["ink_bounds"][1] - prior_style["ink_bounds"][3]
         padding = prior_result["ink_insets"][1] + result["ink_insets"][0]
         gap = max(1.5, size * .2, ink_gap - padding)
+    if prior_result.get("original") and prior_style.get("spans"):
+        # A tightly cropped formula still owns its original font frame. Moving
+        # following prose into that frame changes formula-region pixels even
+        # when the formula's visible ink itself stays in place.
+        clip = pymupdf.Rect(prior_result["clip"])
+        destination = pymupdf.Rect(prior_result["rect"])
+        scale = destination.height / clip.height if clip.height else 1
+        frame_bottom = max(span["bbox"][3] for span in prior_style["spans"])
+        gap = max(gap, (frame_bottom - clip.y1) * scale + .8)
     return gap, ink_gap, padding
 
 
