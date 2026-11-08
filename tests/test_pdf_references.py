@@ -135,7 +135,7 @@ class ReferenceTests(unittest.TestCase):
         _, document = self.normalized()
         block = self.entries(document)[0]
         agent = AsyncMock(return_value='反向课程生成')
-        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'doc_dir', return_value=Path('.')), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', agent):
+        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'doc_dir', return_value=Path('.')), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', agent), patch.object(service, 'translation_structures', AsyncMock(return_value={b['id']: None for p in document['pages'] for b in p['blocks']})), patch.object(service.pdf_translation, 'save_records'):
             result = asyncio.run(service.translate(document['id'], block['id'], service.TranslateRequest(agent=service.AgentConfig())))
         self.assertEqual(agent.await_args.args[2], block['reference']['title'])
         self.assertIn('A. Example. 反向课程生成。Example Journal, 2020.', result['translation'])
@@ -145,7 +145,7 @@ class ReferenceTests(unittest.TestCase):
         _, document = self.normalized()
         blocks = self.entries(document)[:2]
         agent = AsyncMock(return_value=json.dumps({'blocks': [{'id': block['id'], 'translation': '校订题名'} for block in blocks]}))
-        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'doc_dir', return_value=Path('.')), patch.object(service, 'save_doc'), patch.object(service, 'invoke_agent', agent):
+        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'doc_dir', return_value=Path('.')), patch.object(service, 'save_doc'), patch.object(service, 'invoke_agent', agent), patch.object(service, 'translation_structures', AsyncMock(return_value={b['id']: None for p in document['pages'] for b in p['blocks']})), patch.object(service.pdf_translation, 'save_records'):
             result = asyncio.run(service.translate_batch(document['id'], service.BatchTranslateRequest(agent=service.AgentConfig(), block_ids=[block['id'] for block in blocks])))
         context = json.loads(agent.await_args.args[1].split('参考资料与本次待翻译段落：\n')[1])
         self.assertEqual([item['source'] for item in context['current_blocks']], [block['reference']['title'] for block in blocks])
@@ -157,7 +157,7 @@ class ReferenceTests(unittest.TestCase):
         _, document = self.normalized()
         block = self.entries(document)[0]
         block['translation'] = '旧译文'
-        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', AsyncMock(return_value='[2] 串条')):
+        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', AsyncMock(return_value='[2] 串条')), patch.object(service, 'translation_structures', AsyncMock(return_value={block['id']: None})):
             with self.assertRaises(HTTPException):
                 asyncio.run(service.translate(document['id'], block['id'], service.TranslateRequest(agent=service.AgentConfig())))
         save.assert_not_called()
@@ -171,7 +171,7 @@ class ReferenceTests(unittest.TestCase):
         payload = {'blocks': [{'id': blocks[0]['id'], 'translation': '正确题名'},
                               {'id': blocks[1]['id'], 'translation': '[3] 串条'}]}
         agent = AsyncMock(return_value=json.dumps(payload))
-        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'doc_dir', return_value=Path('.')), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', agent):
+        with patch.object(service, 'load_doc', return_value=document), patch.object(service, 'doc_dir', return_value=Path('.')), patch.object(service, 'save_doc') as save, patch.object(service, 'invoke_agent', agent), patch.object(service, 'translation_structures', AsyncMock(return_value={b['id']: None for p in document['pages'] for b in p['blocks']})), patch.object(service.pdf_translation, 'save_records'):
             result = asyncio.run(service.translate_batch(document['id'], service.BatchTranslateRequest(agent=service.AgentConfig(), block_ids=[block['id'] for block in blocks])))
         self.assertEqual(result['missing'], [blocks[1]['id']])
         self.assertIn('正确题名', blocks[0]['translation'])

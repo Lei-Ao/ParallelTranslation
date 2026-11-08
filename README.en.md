@@ -37,6 +37,55 @@ A local-first PDF translation workspace with side-by-side reading, layout-aware 
 
 ## Changelog
 
+### 2026-11-08 Shared vision API, document structure, direct translation, and library management
+
+This release keeps direct translation and uses the same configured API for page-layout detection and post-layout visual acceptance. **Restart the local service and refresh the page after updating.**
+
+**Translation and manual terminology**
+
+- Direct translation retains context, saved translations, manual terminology, instructions, format checks, and bounded retries. Automatic terminology preparation and the draft → model review → revision → verification chain have been removed. Existing translations are not automatically rewritten.
+- Defaults are **up to 3 paragraphs per batch and 3 concurrent requests**. Choose 1 / 3 / 5 paragraphs or automatic batching, independently of concurrency. A legacy saved value of 5 migrates once to 3; explicitly choosing 5 afterwards remains persistent. Custom HTTP endpoints still translate one paragraph per request.
+- Document-specific manual glossaries support adding, editing, disabling, and CSV import/export. They take precedence over the general glossary; historical automatically extracted terms are excluded from new requests.
+- Historical drafts, suggestions, and job records remain readable. Retired execution endpoints return HTTP 410. Manually accepting a saved candidate checks for intervening edits and does not restart model review.
+
+**Library and saved reading data**
+
+- Rename papers without changing source content, translations, paragraph IDs, note citations, or reading locations.
+- Confirmed deletion moves application-managed document data into `.data/.trash`; original imported files and existing `output/pdf` exports remain. Active translation, layout, or paper-assistant work blocks rename/delete. Deleting the open paper clears the corresponding reader state and library cache.
+
+**Translation and layout performance**
+
+- Reuse HTTP connections, keep valid partial batch results, and retry only missing/invalid paragraphs. Recognized continuations wait for the preceding translation; late responses cannot overwrite manual edits.
+- Optional automatic batching uses an approximately 1,200-character soft budget with up to 12 short blocks on the same page. Blocks of 1,000 characters or more run separately; body text and references are grouped separately. Automatic concurrency starts at 3, increases after 12 clean requests up to 6, and backs off on rate limits or repeated timeouts while respecting `Retry-After`. Fixed concurrency still supports up to 12.
+- Pre-typeset completed pages by default, validate caches against the latest snapshot, then assemble pages and restore links. Page-level font/layout caches reduce repeated work. Body flow respects the full source equation font box, avoiding collisions after formulas.
+- Export a timing report from the reader menu. Numeric diagnostics exclude keys, prompts, and translation text. The earlier 23-block speed experiment predates visual API processing and is not a benchmark for the current full pipeline or all papers.
+
+**Document structure, formulas, and styles**
+
+- Inspired by BabelDOC's intermediate representation and protection mechanisms, extraction, translation, and typesetting share page, character, paragraph, local-style, formula-glyph, and graphic-obstacle data. Existing paragraph IDs are retained; source and translation structures are stored separately.
+- Collision-free formula placeholders are validated by identity/count; style markers must pair correctly. Saved translations, editors, and Markdown expose restored plain text. Manual edits invalidate stale fragment mappings.
+- Preserve paragraph font/size, local bold/italic/color/superscript styling, and per-symbol font fallback. A bold variable or leading label must not make the whole body paragraph bold.
+- Reconstruct formulas in historical translations only when correspondence is reliable, including equivalent subscripts/dotted derivatives and count-matched repetitions. Uncertain regions retain complete originals with reasons; no automatic retranslation.
+- Preserve image-based pages with hidden OCR text layers to avoid printing translations over the scanned text. This fallback does not provide OCR or scanned-page reconstruction.
+
+**Shared API for layout detection and visual acceptance**
+
+- Assume the translation model supports images. Layout detection, text translation, and visual acceptance share its endpoint, model, key, and reasoning settings. No local recognition model or new runtime dependency is required; PDF parsing, rendering, geometry checks, and generation remain local.
+- Send source-page images for region detection and cross-check the results against native text, fonts, drawings, and images. A model box alone cannot authorize content removal.
+- Compare source/translated page images for missing or clipped text, overlaps, formula changes, obscured figures, unintended whitespace, and style changes. This checks presentation and completeness, not translation wording. Images and relevant text are sent to the configured service and can add API cost and latency.
+- The current UI distinguishes passed / issues / unavailable. Only a pass updates the automatic PDF export; otherwise keep a candidate preview and explicitly labeled candidate download, preserving the previous export. API failure is never recorded as a pass.
+- Cache detection and acceptance by page, invalidating affected entries when source data, API settings, prompt protocol, translation, or rendered output changes. Custom HTTP vision templates must provide structured `{{messages}}` or `{{images}}` variables.
+
+**Compatibility and validation**
+
+- Layout cache **79**, source structure **5**, translation structure and visual acceptance **1**. Keep old caches without reusing incompatible entries. Build structures on demand for existing documents; merely opening a paper does not reanalyze the full document. Legacy clients without `agent` retain geometry-only layout but report visual acceptance as unavailable.
+- **380 Python cases, 95 JavaScript cases, and three isolated browser workflows passed** on Windows / Python 3.12. Multimodal payloads, authentication, response validation, caching, and failure protection use HTTP mocks. **The user's real translation API and its visual judgment have not been evaluated.**
+- Deduplicated checks cover **13 inputs / 20 pages**: one eight-page paper with saved translations, four one-page reference PDFs, and eight synthetic single-/double-column pages across four rotations. Reference PDFs use identity translations and synthetic pages use deterministic translations; these are not real-model translation-quality tests across multiple papers.
+- The complete paper's placed-Chinese-character, collision, spacing, font-change, accidental-bold, symbol, and link audits found no new report items. Five historical blocks additionally retain source content because their formulas cannot be matched reliably. Retaining originals is a fallback, not successful adaptation; neither universal coverage nor faster first-time processing is claimed.
+
+See the [document structure and visual acceptance notes](docs/document-structure.zh-CN.md), [direct translation/history notes](docs/translation-quality.zh-CN.md), [performance validation](docs/performance.zh-CN.md), and [third-party notices](THIRD_PARTY_NOTICES.md) for implementation and evidence.
+
+
 ### 2026-11-07 Paragraph continuations, inline formulas and annotations
 
 Xia Shao contributed support for paragraphs split across columns or adjacent pages and for inline fractions. An English continuation can use the preceding fragment as translation context. A blank or image-only page breaks the association. When a formula cannot be reconstructed reliably, the layout report explains why the original paragraph was retained. [PR #2](https://github.com/Lei-Ao/ParallelTranslation/pull/2)
@@ -126,11 +175,13 @@ Configure a full POST URL, a JSON request template, and a response field path. F
 }
 ```
 
-Available variables: `{{prompt}}`, `{{text}}`, `{{target}}`, and `{{model}}`. Response paths can be `data.text` or `choices.0.message.content`. Credentials are sent as `Authorization: Bearer ...`.
+Available variables: `{{prompt}}`, `{{text}}`, `{{target}}`, and `{{model}}`. Visual layout/acceptance requests also require structured `{{messages}}` or `{{images}}` in custom templates; text-only translation supplies a messages array and an empty images array. Response paths can be `data.text` or `choices.0.message.content`. Credentials are sent as `Authorization: Bearer ...`.
 
 Only non-streaming JSON responses completed in one request are supported. SSE, polling, and special authentication require additional adapters.
 
 ## Workflow
+
+The library now supports rename and confirmed deletion into `.data/.trash`. Existing source files and exported PDFs remain. Active processing blocks rename/delete. Translation uses the direct workflow and manual glossaries; retired review jobs remain readable but cannot execute again.
 
 1. Select a target language on the home page and optionally enter terminology and translation instructions.
 2. Import a text-based PDF. The app extracts and translates its text, shows progress, and opens the reader when translation and typesetting finish.
@@ -138,7 +189,11 @@ Only non-streaming JSON responses completed in one request are supported. SSE, p
 4. Click a paragraph to locate its counterpart. Drag to select text and press Ctrl+C to copy. Double-click selects a word by default. To edit a translation, enable translation editing in the menu and double-click the translated paragraph.
 5. Use the menu to change language, concurrency, batch size, synchronized scrolling, or reading mode; regenerate the layout; download the PDF; or export bilingual Markdown.
 
-The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **5 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
+The default is **3 concurrent requests**, configurable up to **12**. OpenAI-compatible endpoints combine up to **3 same-page paragraphs** per request by default, with 1 / 3 / 5 paragraph options. Custom endpoints use individual paragraph requests. Temporary failures receive at most two automatic retries; retries may incur additional charges.
+
+Optional automatic batching combines up to 12 short blocks, targets about 1,200 source characters per request, and sends blocks of 1,000 characters or more separately. Automatic concurrency starts at 3, increases after 12 clean requests up to 6, and backs off on rate limits or repeated timeouts. Existing fixed settings are retained. Recognized continuations wait for the preceding translation.
+
+Completed pages are typeset during translation by default; disable this in the reader menu to defer layout until the end. The menu can export a numeric timing report. Local backend diagnostics are stored in `tmp/performance.jsonl` without credentials, prompts or translation text. See the [performance validation notes (Chinese)](docs/performance.zh-CN.md) for measured scope, cold-font overhead and limitations.
 
 Pausing stops new requests while letting in-flight requests finish and save their results. Keep the page open during translation. After a refresh, reopen a document from the library to resume saved progress.
 
@@ -156,9 +211,9 @@ Opening the panel or browsing the outline is local. Starting an AI task uses you
 | Completed standalone translated PDFs | `output/pdf/` under the project root |
 | Agent configuration, API key, language, and terminology settings | The current browser’s localStorage |
 | Reading sessions and notes | `reading.json` and `reading-notes.json` in the document directory. Highlights are stored in the current browser. |
-| Content sent to the AI service | Translation uses paragraphs, bounded context, terminology, and instructions. Reading can also send source text, page or region images, questions, and relevant conversation history. |
+| Content sent to the AI service | Translation uses paragraphs, bounded context, terminology, and instructions. Layout detection and acceptance send page images. Reading can also send source text, page or region images, questions, and relevant conversation history. |
 
-- PDF binaries are not sent to the configured translation endpoint, but relevant text is sent to that service.
+- PDF binaries are not sent to the configured translation endpoint. Relevant text and source/translated page images for layout detection and visual acceptance are sent to that service.
 - Credentials in browser storage are **not encrypted**. A masked input only hides their display. Use the saved-key removal control to remove a credential.
 - Do not put credentials in URLs, request templates, source files, or commits.
 - Once all paragraphs are translated and typesetting succeeds, the finished PDF is automatically saved to `output/pdf/` under the project root. The folder is created on the first save, and PDFs can be opened independently. Successful saves and reopening documents do not display a save-path notification; save failures still display an error. Some regions may retain their original content; review the layout messages.
@@ -170,7 +225,7 @@ This is a single-user local application. It listens on `127.0.0.1` by default an
 ## Scope and limitations
 
 - PDFs must have **1–300 pages** and be no larger than **50 MB**.
-- Translating scans and selecting text require an OCR text layer. Visual reading can use images of scanned pages.
+- Text selection requires extractable text or an OCR layer. Image-based pages with hidden OCR text are retained intact in this release; scanned-page reconstruction is not implemented. Visual reading can still use scanned-page images.
 - Columns, rotation, headings, author information, inline symbols, drop caps, and references use general layout rules. Complex documents can still have extraction or typesetting errors.
 - A cover title extracted as several text blocks is merged into one title group and typeset with the source title's size and weight. Author affiliation markers stay superscripted regardless of whether they follow the surname directly, a comma, a space, or a footnote symbol. Rotated covers and titles that do not start on the first page still follow the conservative per-block path.
 - A bibliography that cannot be rebuilt into complete entries (multi-page lists, unquoted book titles, non-contiguous numbering) is retained as a whole and explained in the layout report, so one entry is never mixed between languages or overwritten by an expanded translation. The heading itself is still translated. Continuation pages without recognizable numbering are treated as ordinary text.
@@ -228,6 +283,7 @@ Thanks to XIA-J-B (夏少) for their continued contributions. [GitHub profile](h
 - Layout and typography fixes, grouped reader highlights, and regression tests. [PR #1](https://github.com/Lei-Ao/ParallelTranslation/pull/1)
 - Full-paper visual reading, contextual Q&A, colored highlights, local reading notes, and regression tests. [Contribution](https://github.com/XIA-J-B/ParallelTranslation/commit/06fee037477753498d8e6a4dd5387f6c277da1f0)
 - Detection of paragraphs continuing across pages or columns, fixes for incomplete inline fractions, faster typesetting, and an annotations view in the reader. [PR #2](https://github.com/Lei-Ao/ParallelTranslation/pull/2)
+- A shared API for layout detection, translation, and visual checks of typeset pages, per-document glossaries for direct translation, improved preservation of formulas and inline styles, and support for renaming papers and moving them to the trash. [PR #3](https://github.com/Lei-Ao/ParallelTranslation/pull/3)
 
 See all [**Contributors**](https://github.com/Lei-Ao/ParallelTranslation/graphs/contributors). Issues and pull requests are welcome.
 

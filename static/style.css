@@ -107,5 +107,25 @@ body.reading .translation-pane.pdf-mode{padding:16px 18px 44px;background:#e9ede
 .pdf-page .link-overlay,.pdf-page .link-group{z-index:3}
 .pdf-page .link-overlay.text-link-hover,.pdf-page .link-group.text-link-hover .link-overlay{background:#21796524;box-shadow:inset 0 0 0 1px #21796559}
 body.reading-focus .reader-viewbar{display:none}
+.library-entry{margin-bottom:12px;min-width:0}
+.library-actions{display:flex;align-items:center;gap:4px;padding:0 4px;flex-wrap:wrap}
+.library-actions .library-read,.library-manage{margin:0;padding:5px 6px;font-size:11px;color:#61765b;border-radius:4px}
+.library-manage:hover{background:#e3eadf}
+.library-delete{color:#95594d}
+.library-action-name{overflow-wrap:anywhere;color:#53694f}
+.button.primary.danger{background:#a34f40}
+@media(max-width:760px){.library-actions{padding:0;gap:2px;justify-content:center}.library-actions .library-read,.library-manage{font-size:10px;padding:4px 1px}}
+#quality-dialog{width:min(1100px,94vw);max-height:88vh;overflow:auto}
+.quality-table-wrap{overflow:auto;max-height:36vh;margin:12px 0}
+.quality-table{border-collapse:collapse;width:100%;font-size:13px}
+.quality-table th,.quality-table td{padding:8px;border-bottom:1px solid #dde6d8;text-align:left;vertical-align:top}
+.quality-table input:not([type=checkbox]){min-width:120px;width:100%;box-sizing:border-box}
+.quality-table input[type=checkbox]{width:auto}
+.quality-table td:last-child{min-width:160px;overflow-wrap:anywhere}
+.quality-actions,.quality-job{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.quality-record{border-top:1px solid #dde6d8;padding:12px 0}
+.quality-record pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;background:#f4f7f1;padding:12px;border-radius:6px}
+.quality-record summary{cursor:pointer}
+.quality-warning,#quality-message{color:#765017;overflow-wrap:anywhere}
 @media(max-width:1100px){.zoom-hint{display:none}}
 @media(max-width:760px){.reader-viewbar{display:flex;justify-content:flex-end}.viewbar-source{display:none}.viewbar-translation{border:0;width:100%;padding:5px 10px}.viewbar-translation>span::before{content:"原文 / "}}

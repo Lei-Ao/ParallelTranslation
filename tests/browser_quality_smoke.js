@@ -1,0 +1,83 @@
+// Run with NODE_PATH pointing at a Playwright installation. Uses installed Edge.
+'use strict';
+const {chromium}=require('playwright');
+const {spawn}=require('node:child_process');
+const path=require('node:path');
+const fs=require('node:fs');
+const assert=require('node:assert/strict');
+
+(async()=>{
+  const root=path.resolve(__dirname,'..');
+  const server=spawn(path.join(root,'.venv','Scripts','python.exe'),['-u',path.join(__dirname,'quality_browser_server.py')],{cwd:root,windowsHide:true});
+  let browser;
+  try{
+    const fixture=await new Promise((resolve,reject)=>{
+      let buffer='';const timer=setTimeout(()=>reject(new Error('fixture startup timed out')),20000);
+      server.stdout.on('data',chunk=>{buffer+=chunk;const line=buffer.split('\n').find(x=>x.startsWith('FIXTURE '));if(line){clearTimeout(timer);resolve(JSON.parse(line.slice(8)));}});
+      server.on('exit',code=>{clearTimeout(timer);reject(new Error('fixture exited '+code));});
+      server.stderr.on('data',chunk=>process.stderr.write(chunk));
+    });
+    browser=await chromium.launch({channel:'msedge',headless:true});
+    const page=await browser.newPage({viewport:{width:1440,height:1000}});
+    const errors=[],modelRoutes=[],batchSizes=[];page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(r.method()==='POST')modelRoutes.push(r.url());if(r.url().endsWith('/translate-batch'))batchSizes.push(r.postDataJSON().block_ids.length);});
+    await page.addInitScript(()=>{if(location.protocol==='http:'){localStorage.setItem('parallel-quality-mode',JSON.stringify('quality'));localStorage.setItem('parallel-agent',JSON.stringify({mode:'openai',base_url:'https://example.com/v1',model:'fixture',api_key:''}));}});
+    await page.addInitScript(()=>{if(location.protocol==='http:'&&!localStorage.getItem('legacy-fixture-seeded')){localStorage.setItem('parallel-batch-size','5');localStorage.setItem('legacy-fixture-seeded','true');}});
+    for(let n=0;n<40;n++){try{await page.goto(fixture.url);break;}catch(e){if(n===39)throw e;await new Promise(r=>setTimeout(r,200));}}
+    await page.locator('[data-read-doc]').first().click();
+    await page.locator('#reader-menu > summary').click();
+    assert.equal(await page.locator('#translation-batch-size').inputValue(),'3');
+    await page.locator('#translation-batch-size').selectOption('5');
+    await page.reload();
+    await page.locator('[data-read-doc]').first().click();
+    await page.locator('#reader-menu > summary').click();
+    assert.equal(await page.locator('#translation-batch-size').inputValue(),'5');
+    await page.locator('#translation-batch-size').selectOption('3');
+    await page.locator('#quality-open').click();
+    await page.locator('#quality-add').click();
+    await page.locator('[data-field=source]').last().fill('attention');
+    await page.locator('[data-field=target]').last().fill('注意力');
+    await page.locator('#quality-save').click();
+    await page.locator('#quality-message').filter({hasText:'已保存'}).waitFor();
+    await page.locator('#quality-dialog .close-dialog').click();
+    await page.locator('#reader-menu > summary').click();
+    await page.locator('#translate-all').click();
+    await page.waitForFunction(()=>!document.body.classList.contains('translating'),{},{timeout:60000});
+    await page.locator('#reader-menu > summary').click();
+    await page.locator('#quality-open').click();
+    assert.equal(await page.locator('#quality-mode').count(),0);
+    assert.equal(await page.locator('#quality-review').count(),0);
+    assert.equal(await page.locator('[data-field=source]').count(),1);
+    assert.equal(await page.locator('[data-job]').count(),0);
+    assert.ok(modelRoutes.some(url=>url.endsWith('/translate-batch')));
+    assert.ok(batchSizes.length>0 && batchSizes.every(size=>size<=3));
+    assert.ok(!modelRoutes.some(url=>url.includes('/quality/jobs')));
+    const doc=await page.evaluate(async id=>(await fetch('/api/documents/'+id)).json(),fixture.doc_id);
+    assert.ok(doc.pages.flatMap(p=>p.blocks).every(b=>b.translation));
+    fs.mkdirSync(path.join(root,'tmp','quality-validation'),{recursive:true});
+    await page.screenshot({path:path.join(root,'tmp','quality-validation','direct-translation.png'),fullPage:true});
+    await page.locator('#quality-dialog .close-dialog').click();
+    await page.locator('#back-library').click();
+    await page.locator('[data-rename-doc]').first().click();
+    await page.locator('#library-name-input').fill('我的论文 <安全显示>.pdf');
+    await page.locator('#library-action-submit').click();
+    await page.locator('#library-action-dialog').waitFor({state:'hidden'});
+    await page.locator('.library-item strong').filter({hasText:'我的论文 <安全显示>.pdf'}).waitFor();
+    assert.equal(await page.locator('#document-name').innerText(),'我的论文 <安全显示>.pdf');
+    assert.equal(await page.locator('.library-item strong *').count(),0);
+    const renamed=await page.evaluate(async id=>(await fetch('/api/documents/'+id)).json(),fixture.doc_id);
+    assert.deepEqual(renamed.pages,doc.pages);
+    await page.locator('[data-delete-doc]').first().click();
+    assert.match(await page.locator('#library-delete-description').innerText(),/回收目录/);
+    await page.locator('#library-action-dialog .dialog-footer .close-dialog').click();
+    assert.equal(await page.locator('[data-doc]').count(),1);
+    await page.screenshot({path:path.join(root,'tmp','quality-validation','library-management.png'),fullPage:true});
+    await page.locator('[data-delete-doc]').first().click();
+    await page.locator('#library-action-submit').click();
+    await page.locator('.library-empty').waitFor();
+    assert.equal(await page.locator('#library-count').innerText(),'0');
+    assert.equal(await page.locator('#reader').isVisible(),false);
+    assert.equal(await page.locator('#pdf-page').innerHTML(),'');
+    assert.deepEqual(errors,[]);
+    console.log(JSON.stringify({passed:true,checks:['manual glossary','old saved mode ignored','direct batch translation','no review requests','rename with translations preserved','cancel deletion','delete active document','no page errors'],screenshot:'tmp/quality-validation/library-management.png'}));
+  }finally{if(browser)await browser.close();server.kill();}
+})().catch(error=>{console.error(error);process.exitCode=1;});

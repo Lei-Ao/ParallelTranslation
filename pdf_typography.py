@@ -1,5 +1,6 @@
 """Local, embedded book typography; subset before instancing variable fonts."""
 import hashlib
+from performance import measured
 import io
 import json
 import math
@@ -165,6 +166,7 @@ def _write_font_cache(key, regular, semibold, italic, semibold_italic, fallback)
         pass
 
 
+@measured("font_prepare")
 def font_resources(text):
     source = font_source()
     if source is None:

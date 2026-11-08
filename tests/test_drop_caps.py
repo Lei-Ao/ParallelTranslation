@@ -67,6 +67,10 @@ def fixture(*, grouping="heading", rotation=0, width=600, height=750, scale=1,
 
 
 class DropCapTests(unittest.TestCase):
+    def setUp(self):
+        from vision_fixture import install
+        install(self)
+
     def document(self, **options):
         pdf, document = fixture(**options)
         self.addCleanup(pdf.close)

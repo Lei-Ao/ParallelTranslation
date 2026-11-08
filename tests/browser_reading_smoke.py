@@ -14,6 +14,9 @@ import httpx
 import uvicorn
 from playwright.sync_api import sync_playwright
 import app as service
+import pdf_model
+from vision_fixture import client as vision_client
+pdf_model._CLIENT = vision_client()
 import paper_reading as reading
 import re
 from test_paper_analysis import sample

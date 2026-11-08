@@ -1,0 +1,16 @@
+{
+  "reference": "BabelDOC 0.7.1 local source snapshot",
+  "upstream": "https://github.com/funstory-ai/BabelDOC",
+  "license": "AGPL-3.0",
+  "date": "2026-11-08",
+  "git_commit": null,
+  "note": "No Git metadata in supplied source. Source IL and formula/style protection architecture studied. Final layout detection and visual acceptance use the configured translation API; no BabelDOC runtime, local neural model, or Rust extension is bundled or used.",
+  "files": {
+    "pyproject.toml": "83ef921d4bfc3a03b64715ede8b963338246fae7c7808b4b6fe42a50adc8a6b3",
+    "babeldoc/docvision/doclayout.py": "5c30cae68a89f9d960f280520ef81524b1e53c5610f340afbde0d0285aa1940a",
+    "babeldoc/format/pdf/document_il/il_version_1.py": "80fb4c7f8ea1a4dd3399a0918547eab3697d9541e41df377d71e117815e086ff",
+    "babeldoc/assets/embedding_assets_metadata.py": "d7aca596e4b73bf0631836a8877a7522e9944cf21fa5f4b582979d7b97b5d316",
+    "rust/p2_stages/src/translation/ordinary_translation.rs": "f83433831e1acdb97c383ce5d8369082a1493765c7a8bd0188b7ab7dbcdec94f",
+    "rust/p2_stages/src/stages/styles_and_formulas.rs": "11ff57c672a741176c4d643146cbf00782060aeeef91dbb2bd6719ae7014096b"
+  }
+}

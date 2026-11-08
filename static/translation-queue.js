@@ -3,13 +3,14 @@
 (function(root){
   async function run({items, concurrency=3, shouldStop=()=>false, translate,
     onStart=()=>{}, onSuccess=()=>{}, onError=()=>{}, onSettled=()=>{},
-    maxConsecutiveFailures=3}){
-    let next=0, completed=0, failed=0, consecutive=0, halted=false;
-    const limit=Math.min(items.length,Math.max(1,Math.min(12,Math.floor(Number(concurrency)) || 3)));
+    maxConsecutiveFailures=3, ready=()=>true}){
+    let completed=0, failed=0, consecutive=0, halted=false, active=0;
+    const pending=items.slice();
+    const limit=()=>Math.max(1,Math.min(12,Math.floor(Number(typeof concurrency==='function'?concurrency():concurrency)) || 3));
     const fatal=error=>Boolean(error && (error.fatal || error.status===401 || error.status===403));
-    async function worker(){
-      while(next<items.length && !halted && !shouldStop()){
-        const item=items[next++];
+    return new Promise(resolve=>{
+      async function execute(item){
+        active++;
         onStart(item);
         try{
           const result=await translate(item);
@@ -21,11 +22,23 @@
           // new groups while already-started requests are still drained.
           if(fatal(error) || consecutive>=maxConsecutiveFailures)halted=true;
           onError(item,error);
-        }finally{onSettled(item);}
+        }finally{onSettled(item);active--;pump();}
       }
-    }
-    await Promise.all(Array.from({length:limit},worker));
-    return {completed,failed,paused:shouldStop()};
+      function pump(){
+        while(pending.length && active<limit() && !halted && !shouldStop()){
+          const index=pending.findIndex(ready);
+          if(index<0)break;
+          execute(pending.splice(index,1)[0]);
+        }
+        if(!active){
+          if(!halted && !shouldStop())for(const item of pending.splice(0)){
+            failed++;onError(item,Object.assign(new Error('前一续写片段尚未完成，当前段落等待其重试成功'),{dependency:true}));onSettled(item);
+          }
+          resolve({completed,failed,paused:shouldStop()});
+        }
+      }
+      pump();
+    });
   }
   function createPageTracker(pages,items,onComplete){
     const selected=new Set(items.map(item=>item.id)),owners=new Map(),pending=new Map();
@@ -41,7 +54,12 @@
       if(!ids.size){pending.delete(number);onComplete(number);}
     }};
   }
-  function groupByPage(pages,items,size=5,maxCharacters=12000,longBlockCharacters=4000){
+  function groupByPage(pages,items,size=3,maxCharacters=12000,longBlockCharacters=4000,dependencies={}){
+    const automatic=size==='auto';
+    // Keep the hard transport limits, but avoid output-heavy groups: in live
+    // reasoning-model tests a 7-block prose batch took longer than two smaller
+    // requests. Short labels still benefit from the full twelve-block budget.
+    if(automatic){size=12;maxCharacters=1200;longBlockCharacters=1000;}
     const selected=new Set(items.map(item=>item.id)),groups=[];
     for(const page of pages){
       let group=[],characters=0;
@@ -52,7 +70,8 @@
         // A very long paragraph can dominate a merged response; let it run on
         // its own worker instead of delaying several short paragraphs.
         if(length>=longBlockCharacters){flush();groups.push({id:block.id,blocks:[block]});continue;}
-        if(group.length && (group.length>=size || characters+length>maxCharacters))flush();
+        if(group.length && (group.length>=size || characters+length>maxCharacters || dependencies[block.id]
+          || (automatic && Boolean(group[0].reference)!==Boolean(block.reference))))flush();
         group.push(block);characters+=length;
       }
       flush();
@@ -69,20 +88,59 @@
       return active;
     }};
   }
+  function createPagePrewarmer(task,onError=()=>{}){
+    const pending=new Set();let active=null;
+    const start=()=>{
+      if(!active)active=Promise.resolve().then(async()=>{
+        while(pending.size){const pages=[...pending].slice(0,2);for(const page of pages)pending.delete(page);try{await task(pages);}catch(error){onError(error);}}
+      }).finally(()=>{active=null;if(pending.size)return start();});
+      return active;
+    };
+    return {add(page){pending.add(page);return start();},cancelPending(){pending.clear();},drain:()=>active || Promise.resolve()};
+  }
   function paused(){return Object.assign(new Error('翻译已暂停'),{cancelled:true});}
-  async function withRetry(task,{shouldStop=()=>false,onRetry=()=>{},wait=ms=>new Promise(resolve=>setTimeout(resolve,ms)),delays=[1000,2500]}={}){
+  function retryDelay(value,now=Date.now()){
+    if(value===null || value===undefined || value==='')return 0;
+    const seconds=Number(value);
+    return Number.isFinite(seconds)?Math.max(0,seconds*1000):Math.max(0,(Date.parse(value)||0)-now);
+  }
+  async function pauseableWait(ms,shouldStop){
+    const until=Date.now()+ms;
+    while(Date.now()<until){if(shouldStop())throw paused();await new Promise(resolve=>setTimeout(resolve,Math.min(250,until-Date.now())));}
+    if(shouldStop())throw paused();
+  }
+  function createAdaptiveConcurrency({initial=3,maximum=6,now=Date.now}={}){
+    let limit=initial,successes=0,timeouts=0,cooldown=0;
+    return {limit:()=>limit,
+      success(clean=true){timeouts=0;if(!clean){successes=0;return;}if(++successes>=12){limit=Math.min(maximum,limit+1);successes=0;}},
+      failure(error){
+        successes=0;
+        const limited=(error.agentStatus || error.status)===429;
+        timeouts=(error.status===504 || error.agentStatus===408)?timeouts+1:0;
+        if(limited || timeouts>=2){limit=Math.max(1,Math.floor(limit/2));timeouts=0;}
+        if(limited)cooldown=Math.max(cooldown,now()+(retryDelay(error.retryAfter,now())||2500));
+      },
+      enter(shouldStop=()=>false){
+        if(shouldStop())throw paused();
+        if(cooldown<=now())return;
+        return (async()=>{while(cooldown>now())await pauseableWait(Math.min(250,cooldown-now()),shouldStop);})();
+      }
+    };
+  }
+  async function withRetry(task,{shouldStop=()=>false,onRetry=()=>{},beforeAttempt=()=>{},onAttemptError=()=>{},onWait=()=>{},wait=null,delays=[1000,2500]}={}){
     for(let attempt=0;;attempt++){
       if(shouldStop())throw paused();
-      try{return await task();}
+      try{const waiting=beforeAttempt();if(waiting)await waiting;if(shouldStop())throw paused();return await task();}
       catch(error){
+        if(!error.cancelled)onAttemptError(error);
         if(!error.retryable || attempt>=delays.length)throw error;
         if(shouldStop())throw paused();
         onRetry(error,attempt+1,delays.length);
         // A provider rate limit states how long to wait; ignore that hint and
         // retrying after one second only burns the remaining attempts.
-        const retryAfter=Number(error.retryAfter);
-        const delay=Number.isFinite(retryAfter) && retryAfter>0 ? Math.min(60000,retryAfter*1000) : delays[attempt];
-        await wait(delay);
+        const delay=retryDelay(error.retryAfter) || delays[attempt];
+        const started=Date.now();
+        try{await (wait?wait(delay):pauseableWait(delay,shouldStop));}finally{onWait(Date.now()-started);}
       }
     }
   }
@@ -108,7 +166,6 @@
     if(shouldStop())throw paused();
     let remaining=blocks;
     if(blocks.length>1 && canBatch()){
-      let fellBack=false;
       try{
         const result=await translateBatch(blocks);
         const parsed=acceptedBatch(result,blocks);
@@ -118,17 +175,18 @@
         onBatchAccepted();
       }catch(error){
         if(error.fallback!=='single')throw error;
-        onFallback();fellBack=true;remaining=blocks;
+        onFallback();remaining=blocks;
       }
-      if(!fellBack && remaining.length>1 && canBatch()){
+      if(remaining.length>1 && canBatch()){
         // The model often omits exactly one paragraph from an otherwise valid
         // JSON object. Ask once for only the missing ones before paying for
         // individual requests.
         try{
-          const retry=acceptedBatch(await translateBatch(remaining),remaining);
-          if(retry){
-            for(const block of remaining){const item=retry.accepted.get(block.id);if(item)onBlock(item);}
-            remaining=remaining.filter(block=>!retry.accepted.has(block.id));
+          const size=Math.max(1,Math.floor(blocks.length/2));
+          if(size>1){
+            for(let index=0;index<remaining.length;index+=size)await translateGroup({
+              blocks:remaining.slice(index,index+size),canBatch,translateBatch,translateOne,onBlock,onFallback,onBatchAccepted,shouldStop});
+            return;
           }
         }catch(error){
           if(error.fallback!=='single')throw error;
@@ -144,7 +202,7 @@
       onBlock(result);
     }
   }
-  const api={run,createPageTracker,createCoalescedTask,groupByPage,withRetry,translateGroup};
+  const api={run,createPageTracker,createCoalescedTask,createPagePrewarmer,groupByPage,withRetry,translateGroup,createAdaptiveConcurrency,retryDelay};
   if(typeof module==='object' && module.exports)module.exports=api;
   else root.TranslationQueue=api;
 })(typeof window==='object'?window:globalThis);

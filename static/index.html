@@ -27,7 +27,7 @@
       const assistantStyle=document.createElement('link');assistantStyle.rel='stylesheet';assistantStyle.href='/static/reading-assistant.css';document.head.append(assistantStyle);
       for(const href of ['/static/guided-reading.css','/static/vendor/katex/katex.min.css']){const link=document.createElement('link');link.rel='stylesheet';link.href=href;document.head.append(link);}
       document.addEventListener('DOMContentLoaded', () => {
-        for (const asset of ['translation-queue.js', 'app.js', 'reading-assistant.js', 'vendor/marked.js', 'vendor/purify.js', 'vendor/katex/katex.min.js', 'vendor/katex/contrib/auto-render.min.js', 'guided-reading.js', 'reading-selection.js']) {
+        for (const asset of ['translation-queue.js', 'translation-quality.js', 'app.js', 'reading-assistant.js', 'vendor/marked.js', 'vendor/purify.js', 'vendor/katex/katex.min.js', 'vendor/katex/contrib/auto-render.min.js', 'guided-reading.js', 'reading-selection.js']) {
           const script = document.createElement('script');
           script.async = false;
           script.src = '/static/' + asset;
@@ -83,12 +83,15 @@
           <summary aria-label="阅读与翻译选项" title="阅读与翻译选项">•••</summary>
           <div class="reader-menu-panel">
             <p id="document-meta"></p>
+            <button id="quality-open" class="button subtle">文档术语与历史记录</button>
             <label>译为 <select id="target-language"><option>简体中文</option><option>繁體中文</option><option>English</option><option>日本語</option><option>한국어</option><option>Français</option><option>Deutsch</option></select></label>
             <label class="sync-control"><input id="sync-scroll" type="checkbox" checked> 同步滚动</label>
-            <label>并发请求 <select id="translation-concurrency"><option value="1">1 个</option><option value="2">2 个</option><option value="3" selected>3 个（推荐）</option><option value="4">4 个</option><option value="6">6 个</option><option value="8">8 个</option><option value="12">12 个</option></select></label>
+            <label>并发请求 <select id="translation-concurrency"><option value="auto">自动（3–6 个，限流时降低）</option><option value="1">1 个</option><option value="2">2 个</option><option value="3" selected>3 个（推荐）</option><option value="4">4 个</option><option value="6">6 个</option><option value="8">8 个</option><option value="12">12 个</option></select></label>
             <small class="field-help">适当提高并发可减少等待；8/12 需要服务商允许，遇到限流请调低。顺序模式可参考完整的前文译文。</small>
-            <label>每次请求 <select id="translation-batch-size"><option value="1">1 段（兼容）</option><option value="3">3 段（快速）</option><option value="5" selected>5 段</option></select></label>
+            <label>每次请求 <select id="translation-batch-size"><option value="auto">自动（按文本量，最多 12 段）</option><option value="1">1 段（兼容）</option><option value="3" selected>3 段（默认）</option><option value="5">5 段</option></select></label>
             <small id="batch-help" class="field-help">合并同页段落，减少请求和重复上下文。</small>
+            <label class="sync-control"><input id="prewarm-layout" type="checkbox"> 翻译时提前排版已完成页面</label>
+            <button id="performance-report" class="button subtle">导出最近一次耗时报告</button>
             <label>译文视图 <select id="translation-view"><option value="pdf">原版式 PDF</option><option value="paragraph">段落</option></select></label>
             <label class="sync-control"><input id="translation-edit" type="checkbox"> 开启译文编辑</label>
             <small class="field-help">默认关闭，可选中文字进行解释、引用和高亮。开启后可双击译文段落编辑。</small>
@@ -131,11 +134,29 @@
     <small id="reasoning-help" class="field-help">仅 OpenAI 兼容接口生效。默认不发送思考参数；各服务商支持范围不同，不支持时请改回服务端默认。</small>
     <div id="custom-fields" class="hidden"><label>请求 JSON 模板<textarea name="template" rows="4" spellcheck="false"></textarea></label><small class="field-help">可用变量：{{prompt}}（含翻译要求和上下文）、{{text}}、{{target}}、{{model}}。认证使用 Bearer Token。</small><label>译文响应字段路径<input name="response_path" placeholder="output 或 data.text 或 choices.0.message.content"></label></div>
     <label>请求超时（秒）<input name="timeout" type="number" min="10" max="600" value="120"></label>
+    <p id="layout-model-status" class="field-help" role="status">版面识别、翻译与视觉验收统一使用此 API，默认模型支持图片输入。原文页和译文页图片会发送至该接口。</p>
     <p id="connection-status" class="connection-status" role="status"></p>
     <div class="dialog-footer"><button id="test-connection" type="button" class="button secondary">测试连接</button><button id="reset-agent" type="button" class="button subtle">恢复默认</button><button type="submit" class="button primary">保存配置</button></div>
   </form></dialog>
   <dialog id="context-dialog"><form id="context-form"><div class="dialog-heading"><div><div class="eyebrow">A LITTLE CONTEXT GOES A LONG WAY</div><h2>让译文更懂你的领域</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div><label>术语表<textarea id="glossary" rows="6" placeholder="每行一条，例如：&#10;attention = 注意力&#10;embedding = 嵌入&#10;agent = 智能体"></textarea></label><label>翻译要求<textarea id="instructions" rows="4" placeholder="例如：这是机器学习论文，使用学术表达；保留缩写与公式，术语首次出现时附英文。"></textarea></label><p class="field-help">应用于之后的翻译请求；已有译文不会自动改写。设置仅保存在本机浏览器。</p><div class="dialog-footer"><button class="button primary" type="submit">保存要求</button></div></form></dialog>
   <dialog id="edit-dialog"><form id="edit-form"><div class="dialog-heading"><h2>编辑译文</h2><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><p id="edit-source" class="edit-source"></p><label>译文<textarea id="edit-text" rows="10" maxlength="60000"></textarea></label><div class="dialog-footer"><button type="submit" class="button primary">保存译文</button></div></form></dialog>
   <div id="toast" class="toast hidden" role="status"></div>
+  <dialog id="library-action-dialog" aria-labelledby="library-action-title"><form id="library-action-form">
+    <div class="dialog-heading"><h2 id="library-action-title">管理论文</h2><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div>
+    <p id="library-action-name" class="library-action-name"></p>
+    <label id="library-rename-field">论文名称<input id="library-name-input" maxlength="200" autocomplete="off"></label>
+    <p id="library-delete-description" class="field-help">将从左侧文档库删除这篇论文。导入的原文、译文、笔记和缓存会移入本机 .data/.trash 回收目录。你原来选择的 PDF 文件和已导出的 PDF 不会删除。</p>
+    <p id="library-action-error" class="connection-status error" role="alert"></p>
+    <div class="dialog-footer"><button type="button" class="button secondary close-dialog">取消</button><button id="library-action-submit" type="submit" class="button primary">确认</button></div>
+  </form></dialog>
+  <dialog id="quality-dialog" aria-labelledby="quality-title">
+    <div class="dialog-heading"><h2 id="quality-title">文档术语与历史记录</h2><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div>
+    <p class="field-help">仅使用手动词条，文档词条优先于通用术语。禁用可排除词条。修改对之后发出的翻译请求生效，已有译文不自动改写。</p>
+    <div id="quality-message" role="status"></div>
+    <div class="quality-actions"><button id="quality-reload" class="button subtle">刷新记录</button></div>
+    <details open><summary>本篇术语表</summary><div class="quality-table-wrap"><table class="quality-table"><thead><tr><th>启用</th><th>原词</th><th>译法</th><th>语言</th><th>来源与歧义</th></tr></thead><tbody id="quality-terms"></tbody></table></div>
+    <div class="quality-actions"><button id="quality-add" class="button subtle">添加词条</button><button id="quality-save" class="button primary">保存修改</button><label class="button subtle">导入 CSV<input id="quality-import" type="file" accept=".csv" hidden></label><a id="quality-export" class="button subtle">导出 CSV</a></div></details>
+    <h3>历史翻译与审校记录</h3><p class="field-help">自动审校已移除。以下为旧任务留下的记录，不会继续调用模型；接受已有建议时会检查编辑冲突。</p><div id="quality-jobs"></div><div id="quality-records"></div>
+  </dialog>
 </body>
 </html>

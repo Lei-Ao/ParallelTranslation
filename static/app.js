@@ -3,11 +3,37 @@ const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const DEFAULT_AGENT = {mode:'openai', base_url:'https://api.apigoto.com/v1', api_key:'', model:'', reasoning:'', template:'{\n  "input": "{{prompt}}"\n}', response_path:'output', timeout:120};
 function stored(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
+function initialBatchSize(){
+  let size=stored('parallel-batch-size',3);
+  if(!['auto',1,3,5].includes(size))size=3;
+  // Older versions persisted five without recording whether it was a default or a choice.
+  // Migrate it once; subsequent explicit choices (including five) remain authoritative.
+  if(stored('parallel-batch-settings-version',0)<2){
+    if(size===5)size=3;
+    try{
+      localStorage.setItem('parallel-batch-size',JSON.stringify(size));
+      localStorage.setItem('parallel-batch-settings-version','2');
+    }catch{} // Storage may be disabled; the current session still uses the migrated value.
+  }
+  return size;
+}
 function persist(key, data) { try { localStorage.setItem(key, JSON.stringify(data)); return true; } catch { toast('浏览器存储不可用，设置仅在当前页面有效'); return false; } }
-const state = {token:'', doc:null, library:[], page:0, selected:null, running:false, stop:false, uploading:false, loading:false, activeBlocks:new Set(), concurrency:[1,2,3,4,6,8,12].includes(stored('parallel-concurrency',3))?stored('parallel-concurrency',3):3, errors:{}, view:'pdf', layout:null, layoutKey:null, layoutBusy:false, layoutError:'', docRevision:0,
+const state = {token:'', doc:null, library:[], page:0, selected:null, running:false, stop:false, uploading:false, loading:false, activeBlocks:new Set(), concurrency:["auto",1,2,3,4,6,8,12].includes(stored('parallel-concurrency',3))?stored('parallel-concurrency',3):3, errors:{}, view:'pdf', layout:null, layoutKey:null, layoutBusy:false, layoutError:'', docRevision:0,
   agent:{...DEFAULT_AGENT,...stored('parallel-agent',{})}, context:stored('parallel-context',{glossary:'',instructions:''}), target:stored('parallel-target','简体中文')};
-state.batchSize=[1,3,5].includes(stored('parallel-batch-size',5))?stored('parallel-batch-size',5):5;
+state.batchSize=initialBatchSize();
 state.batchSupported=false;
+state.prewarmSupported=false;
+state.prewarmEnabled=stored('parallel-prewarm',true)===true;
+state.batchLimit=5;
+state.performance=null;
+state.performanceDocId=null;
+function savePerformance(){
+  if(!state.performance)return;
+  state.performance.total_ms=Date.now()-state.performance.started;
+  state.performance.characters_per_second=state.performance.characters/Math.max(.001,state.performance.translation_ms/1000);
+  persist('parallel-performance',state.performance);
+}
+
 state.pendingOpen=false;
 state.preparing=false;
 state.openMessage='';
@@ -47,8 +73,8 @@ function updateLayoutControls(){
   $('#download-pdf').classList.toggle('hidden',!valid);
   if(valid)$('#download-pdf').href=`/api/documents/${state.doc.id}/layout/${state.layout.revision}/download`;
   else $('#download-pdf').removeAttribute('href');
-  $('#download-pdf').textContent=fresh?'下载译文 PDF':'下载已排版 PDF';
-  $('#layout-status').textContent=state.layoutBusy?'正在生成译文 PDF…':state.layoutError || (valid?`已排版 ${state.layout.replaced} 段 · ${state.layout.preserved} 段保留原文 · ${state.layout.untranslated} 段未译${fresh?'':' · 新译文将在本页完成后更新'}`:'每页译完后自动排版');
+  $('#download-pdf').textContent=valid&&state.layout.visual_check&&state.layout.visual_check.status!=='passed'?'下载候选 PDF（未通过验收）':fresh?'下载译文 PDF':'下载已排版 PDF';
+  $('#layout-status').textContent=state.layoutBusy?'正在生成译文 PDF…':state.layoutError || (valid?`已排版 ${state.layout.replaced} 段 · ${state.layout.preserved} 段保留原文 · ${state.layout.untranslated} 段未译${state.layout.visual_check?' · '+({passed:'视觉验收通过',issues:'视觉验收发现问题',unavailable:'视觉验收未完成'}[state.layout.visual_check.status]||'视觉验收未完成'):''}${fresh?'':' · 新译文将在本页完成后更新'}`:'每页译完后自动排版');
   $('#layout-issues').innerHTML=valid?state.layout.issues.map(issue=>`<li>第 ${issue.page} 页${issue.block_id?` · ${escapeHtml(issue.block_id)}`:''}：${escapeHtml(issue.message)}</li>`).join(''):'';
   if(valid && state.layout.saved_pdf)$('#layout-issues').innerHTML+=`<li>已自动保存：${escapeHtml(state.layout.saved_pdf)}。可在本地直接打开；部分区域可能保留原文，请查看排版提示。</li>`;
   if(valid && state.layout.save_error)$('#layout-issues').innerHTML+=`<li>${escapeHtml(state.layout.save_error)}</li>`;
@@ -60,16 +86,21 @@ async function generateLayout(){
   const request=layoutRequest, key=layoutKey(), id=state.doc.id, target=state.target;
   state.layoutBusy=true;state.layoutError='';updateLayoutControls();
   try{
-    const report=await api(`/api/documents/${id}/layout`,{method:'POST',body:JSON.stringify({target})});
+    const report=await api(`/api/documents/${id}/layout`,{method:'POST',body:JSON.stringify({target,agent:{...state.agent}})});
     if(request!==layoutRequest)return;
     if(!report || report.empty || !report.revision){
       state.layout=null;state.layoutKey=null;
     }else{
-      state.layout=report;state.layoutKey=key;
+      state.layout=report;state.layoutKey=report.stale?null:key;
+      if(report.stale)state.layoutError='排版期间文档已更新，请重新打开文档后排版；最新译文已保留';
       if(report.save_error)toast(report.save_error);
     }
   }catch(error){if(request!==layoutRequest)return;state.layoutError=error.message;}
   finally{
+    if(state.performance && state.performanceDocId===id && !state.running && request===layoutRequest){
+      if(state.performance.translation_finished)state.performance.layout_tail_ms=Date.now()-state.performance.translation_finished;
+      savePerformance();
+    }
     if(request===layoutRequest){state.layoutBusy=false;updateLayoutControls();if(state.view==='pdf' && state.doc?.id===id && !state.pendingOpen)renderTranslations();}
   }
 }
@@ -117,11 +148,38 @@ function linkOverlays(links){
 }
 function toast(message) { $('#toast').textContent=message; $('#toast').classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('#toast').classList.add('hidden'),5500); }
 async function api(path, options={}) {
+  const diagnostics=state.performanceDocId && path.startsWith(`/api/documents/${state.performanceDocId}/`)?state.performance:null;
   const headers = {'X-Local-Token':state.token,...options.headers};
   if(options.body && !(options.body instanceof FormData)) headers['Content-Type']='application/json';
-  const response = await fetch(path,{...options,headers});
-  if(!response.ok) { let message; try { const data=await response.json(); message=typeof data.detail==='string'?data.detail:'请求参数无效，请检查设置'; } catch { message=`请求失败（HTTP ${response.status}）`; } const retryAfter=Number(response.headers.get('X-Translation-Retry-After')); throw Object.assign(new Error(message),{status:response.status,retryable:response.headers.get('X-Translation-Retryable')==='true',fallback:response.headers.get('X-Translation-Fallback'),retryAfter:Number.isFinite(retryAfter)?retryAfter:0,fatal:response.status===401||response.status===403}); }
+  const watching=state.structureSupported && options.method==='POST' && /^\/api\/documents\/[^/]+\/(?:structure|layout)$/.test(path);
+  const stopWatching=watching?watchStructure(path.split('/')[3]):()=>{};
+  let response;
+  try{response=await fetch(path,{...options,headers});}finally{stopWatching();}
+  if(diagnostics && /\/(translate|translate-batch|layout|prewarm)$/.test(path)){
+    try{for(const [key,value] of Object.entries(JSON.parse(response.headers.get('X-Performance-Counts')||'{}'))){
+      if(['model_requests','page_cache_hits','page_cache_misses','revision_cache_hits'].includes(key)&&Number.isFinite(value))diagnostics[key]=(diagnostics[key]||0)+value;
+    }}catch{}
+    for(const entry of (response.headers.get('Server-Timing')||'').split(',')){
+      const match=entry.trim().match(/^([a-z_]+);dur=([\d.]+)$/);
+      if(match){const key=match[1]+'_ms';diagnostics[key]=(diagnostics[key]||0)+Number(match[2]);}
+    }
+  }
+  if(!response.ok) { let message; try { const data=await response.json(); message=typeof data.detail==='string'?data.detail:'请求参数无效，请检查设置'; } catch { message=`请求失败（HTTP ${response.status}）`; } const retryAfter=response.headers.get('X-Translation-Retry-After');const agentStatus=Number(response.headers.get('X-Agent-Status')); throw Object.assign(new Error(message),{status:response.status,retryable:response.headers.get('X-Translation-Retryable')==='true',fallback:response.headers.get('X-Translation-Fallback'),retryAfter,agentStatus,fatal:[401,403].includes(response.status)||[401,403].includes(agentStatus)}); }
   return response.json();
+}
+function watchStructure(docId){
+  let stopped=false,timer=null;
+  const poll=async()=>{
+    try{
+      const data=await api(`/api/documents/${docId}/structure`);
+      if(stopped || state.doc?.id!==docId)return;
+      const model=data.model||{};
+      const message=data.message;
+      if(message){state.openMessage=message;status(message);if($('#layout-model-status'))$('#layout-model-status').textContent=message;updateProgressControls();}
+    }catch{}finally{if(!stopped)timer=setTimeout(poll,800);}
+  };
+  timer=setTimeout(poll,200);
+  return ()=>{stopped=true;clearTimeout(timer);};
 }
 function currentPage(){return state.doc?.pages[state.page];}
 function blocks(){return state.doc?.pages.flatMap(page=>page.blocks) ?? [];}
@@ -143,14 +201,14 @@ function updateControls(){
   $('#target-language').disabled=state.running;
   $('#translation-concurrency').disabled=state.running;
   $('#translation-batch-size').disabled=state.running || !state.batchSupported || state.agent.mode!=='openai';
-  $('#batch-help').textContent=!state.batchSupported?'重启本机服务后可启用合并翻译。':state.agent.mode!=='openai'?'自定义接口保持单段请求。':'合并同页段落，减少请求和重复上下文；格式不兼容时可改回 1 段。';
+  $('#batch-help').textContent=!state.batchSupported?'重启本机服务后可启用合并翻译。':state.agent.mode!=='openai'?'自定义接口保持单段请求。':'每批最多按所选段数翻译；长段、跨页与续句可能拆小批次。';
   $('#settings-button').disabled=state.running || state.preparing;
   $('#reader-settings').disabled=state.running;
   $('#back-library').disabled=state.running;
   document.body.classList.toggle('translating',state.running);
   $('#context-button').disabled=state.running;
   $('#upload-side').disabled=state.running || state.uploading || state.loading || state.preparing;
-  $$('.library-item,.library-read').forEach(button=>button.disabled=state.running || state.uploading || state.loading || state.preparing);
+  $$('.library-item,.library-read,.library-manage').forEach(button=>button.disabled=state.running || state.uploading || state.loading || state.preparing);
   $('#previous-page').disabled=state.page<=0;
   $('#next-page').disabled=!state.doc || state.page>=state.doc.pages.length-1;
   $$('.card-actions button').forEach(button=>button.disabled=state.running);
@@ -158,7 +216,7 @@ function updateControls(){
 }
 function renderLibrary(){
   $('#library-count').textContent=state.library.length;
-  $('#library').innerHTML=state.library.length?state.library.map(doc=>`<button class="library-item ${state.doc?.id===doc.id?'active':''}" data-doc="${doc.id}" title="${escapeHtml(doc.name)}" aria-label="打开 ${escapeHtml(doc.name)}"><span class="doc-symbol">▤</span><div><strong>${escapeHtml(doc.name)}</strong><small>${doc.pages} 页 · ${doc.translated} 段已有译文</small></div></button><button class="library-read" data-read-doc="${doc.id}" aria-label="直接阅读 ${escapeHtml(doc.name)}">直接阅读</button>`).join(''):'<p class="library-empty">导入第一份文档，<br>开始跨越语言的阅读。</p>';
+  $('#library').innerHTML=state.library.length?state.library.map(doc=>`<div class="library-entry"><button class="library-item ${state.doc?.id===doc.id?'active':''}" data-doc="${doc.id}" title="${escapeHtml(doc.name)}" aria-label="打开 ${escapeHtml(doc.name)}"><span class="doc-symbol">▤</span><div><strong>${escapeHtml(doc.name)}</strong><small>${doc.pages} 页 · ${doc.translated} 段已有译文</small></div></button><div class="library-actions"><button class="library-read" data-read-doc="${doc.id}" aria-label="直接阅读 ${escapeHtml(doc.name)}">直接阅读</button><button class="library-manage" data-rename-doc="${doc.id}" aria-label="重命名 ${escapeHtml(doc.name)}">重命名</button><button class="library-manage library-delete" data-delete-doc="${doc.id}" aria-label="删除 ${escapeHtml(doc.name)}">删除</button></div></div>`).join(''):'<p class="library-empty">导入第一份文档，<br>开始跨越语言的阅读。</p>';
   updateControls();
 }
 async function refreshLibrary(){state.library=await api('/api/documents');renderLibrary();}
@@ -766,13 +824,37 @@ async function runTranslation(selectedBlocks,retryPass=false){
   const request={agent:{...state.agent},target:state.target,...state.context};
   const docId=state.doc.id;
   const canBatch=state.batchSupported && state.agent.mode==='openai' && !retryPass;
-  const groups=TranslationQueue.groupByPage(state.doc.pages,selectedBlocks,canBatch?state.batchSize:1,12000,4000);
-  const pageTracker=TranslationQueue.createPageTracker(state.doc.pages,selectedBlocks,()=>{if(!state.pendingOpen)scheduleLayout();});
-  let allowBatch=canBatch,fallbackStreak=0;
-  const send=(path,body)=>TranslationQueue.withRetry(()=>api(path,{method:'POST',body:JSON.stringify(body)}),{
-    shouldStop:()=>state.stop,
-    onRetry:(error,attempt,total)=>{state.openMessage=`${error.message} · 正在重试（${attempt}/${total}）…`;status(state.openMessage);updateProgressControls();}
+  const dependencies=state.doc.translation_dependencies || {};
+  const requestedIds=new Set(selectedBlocks.map(block=>block.id));
+  const completedIds=new Set(blocks().filter(block=>isTranslated(block)&&!requestedIds.has(block.id)).map(block=>block.id));
+  const size=state.batchSize==='auto'&&state.batchLimit<12?3:state.batchSize;
+  const groups=TranslationQueue.groupByPage(state.doc.pages,selectedBlocks,canBatch?size:1,12000,4000,dependencies);
+  const adaptive=TranslationQueue.createAdaptiveConcurrency();
+  const translationStarted=Date.now();
+  if(!retryPass)state.performance={started:translationStarted,total_ms:0,translation_ms:0,requests:0,retries:0,queue_ms:0,characters:0,prewarm_failures:0};
+  state.performanceDocId=docId;
+  const diagnostics=state.performance;
+  const warm=TranslationQueue.createPagePrewarmer(async pages=>{
+    await api(`/api/documents/${docId}/layout/prewarm`,{method:'POST',body:JSON.stringify({target:request.target,pages,agent:request.agent})});
+  },()=>{diagnostics.prewarm_failures++;});
+  const pageTracker=TranslationQueue.createPageTracker(state.doc.pages,selectedBlocks,number=>{
+    const page=state.doc.pages.find(page=>page.number===number);
+    if(state.prewarmEnabled && state.prewarmSupported && page?.blocks.every(isTranslated))warm.add(number);
+    if(!state.pendingOpen)scheduleLayout();
   });
+  let allowBatch=canBatch,fallbackStreak=0;
+  const send=async(path,body)=>{
+    let retried=false;
+    const result=await TranslationQueue.withRetry(()=>{diagnostics.requests++;return api(path,{method:'POST',body:JSON.stringify(body)});},{
+      shouldStop:()=>state.stop,
+      beforeAttempt:()=>{const start=Date.now(),waiting=adaptive.enter(()=>state.stop);return waiting?.finally(()=>{diagnostics.rate_limit_wait_ms=(diagnostics.rate_limit_wait_ms||0)+Date.now()-start;});},
+      onAttemptError:error=>adaptive.failure(error),
+      onWait:ms=>{diagnostics.retry_wait_ms=(diagnostics.retry_wait_ms||0)+ms;},
+      onRetry:(error,attempt,total)=>{retried=true;diagnostics.retries++;state.openMessage=`${error.message} · 正在重试（${attempt}/${total}）…`;status(state.openMessage);updateProgressControls();}
+    });
+    adaptive.success(!retried && !result.missing?.length);
+    return result;
+  };
   function progress(blockId){
     if(failure)status(`${failure}${state.activeBlocks.size?` · 等待 ${state.activeBlocks.size} 段返回`:''}`,true);
     else status(`${state.stop?'正在暂停':'正在翻译'} · 已完成 ${done} / ${selectedBlocks.length} 段 · ${state.activeBlocks.size} 段处理中`);
@@ -781,23 +863,35 @@ async function runTranslation(selectedBlocks,retryPass=false){
     }else updateProgressControls();
   }
   try{
-    await TranslationQueue.run({items:groups,concurrency:state.concurrency,shouldStop:()=>state.stop,
+    if(state.structureSupported && !retryPass){
+      state.openMessage='正在分析页面结构…';updateProgressControls();
+      const analysis=await api(`/api/documents/${docId}/structure`,{method:'POST',body:JSON.stringify({agent:request.agent,target:request.target})});
+      if(analysis.state==='degraded')toast(analysis.message);
+    }
+    await TranslationQueue.run({items:groups,concurrency:state.concurrency==='auto'?adaptive.limit:state.concurrency,shouldStop:()=>state.stop,
+      ready:group=>group.blocks.every(block=>!dependencies[block.id] || completedIds.has(dependencies[block.id])),
       translate:group=>TranslationQueue.translateGroup({blocks:group.blocks,canBatch:()=>allowBatch,shouldStop:()=>state.stop,
         translateBatch:items=>send(`/api/documents/${docId}/blocks/translate-batch`,{...request,block_ids:items.map(b=>b.id)}),
         translateOne:block=>send(`/api/documents/${docId}/blocks/${block.id}/translate`,request),
-        onFallback:()=>{fallbackStreak++;if(fallbackStreak>=3)allowBatch=false;state.openMessage='合并翻译未返回完整格式，当前组改单段翻译…';},
+        onFallback:()=>{fallbackStreak++;if(fallbackStreak>=3)allowBatch=false;state.openMessage='合并翻译格式不完整，正在缩小批次重试…';},
         onBatchAccepted:()=>{fallbackStreak=0;allowBatch=canBatch;},
-        onBlock:result=>{const block=group.blocks.find(b=>b.id===result.id);Object.assign(block,result);done++;failed.delete(block.id);state.openMessage='';state.activeBlocks.delete(block.id);delete state.errors[block.id];invalidateLayout(true);pageTracker.mark(block.id);progress(result.id);}
+        onBlock:result=>{const block=group.blocks.find(b=>b.id===result.id);Object.assign(block,result);completedIds.add(block.id);diagnostics.characters+=(block.text||'').length;done++;failed.delete(block.id);state.openMessage='';state.activeBlocks.delete(block.id);delete state.errors[block.id];invalidateLayout(true);pageTracker.mark(block.id);progress(result.id);}
       }),
-      onStart:group=>{for(const block of group.blocks){state.activeBlocks.add(block.id);delete state.errors[block.id];}if(state.view==='paragraph'&&!state.pendingOpen)for(const block of group.blocks)updateCard(block.id);progress();},
-      onError:(group,error)=>{if(error.cancelled)return;for(const block of group.blocks)if(state.activeBlocks.has(block.id)){state.errors[block.id]=error.message;failed.add(block.id);}if(!failure){failure=error.message;toast(error.message);}if(error.fatal)fatal=true;},
+      onStart:group=>{diagnostics.queue_ms+=Date.now()-translationStarted;for(const block of group.blocks){state.activeBlocks.add(block.id);delete state.errors[block.id];}if(state.view==='paragraph'&&!state.pendingOpen)for(const block of group.blocks)updateCard(block.id);progress();},
+      onError:(group,error)=>{if(error.cancelled)return;for(const block of group.blocks)if(state.activeBlocks.has(block.id)||error.dependency){state.errors[block.id]=error.message;failed.add(block.id);}if(!failure){failure=error.message;toast(error.message);}if(error.fatal)fatal=true;},
       onSettled:group=>{for(const block of group.blocks)state.activeBlocks.delete(block.id);if(state.view==='paragraph'&&!state.pendingOpen)for(const block of group.blocks)updateCard(block.id);progress();}
     });
     if(!failure)status(state.stop?`已暂停 · 本次完成 ${done} 段，可继续翻译`:`翻译完成 · 本次完成 ${done} 段`);
     paused=state.stop;
   }finally{
     paused=paused||state.stop;
+    diagnostics.translation_ms+=Date.now()-translationStarted;
+    diagnostics.translation_finished=Date.now();
+    if(paused)warm.cancelPending();
+    if(!paused && !failure){state.openMessage='翻译完成 · 正在完成页面排版…';updateProgressControls();}
+    await warm.drain();
     state.running=false;state.stop=false;state.activeBlocks.clear();updateControls();
+    savePerformance();
     if(!state.pendingOpen){if(done)refreshLayout();else renderTranslations();}
     try{await refreshLibrary();}catch(error){toast(error.message);}
   }
@@ -811,7 +905,57 @@ async function runTranslation(selectedBlocks,retryPass=false){
     }
   }
 }
+let libraryAction=null;
+function openLibraryAction(id,action){
+  if(state.running||state.preparing||state.loading||state.uploading)return;
+  const doc=state.library.find(item=>item.id===id);if(!doc)return;
+  libraryAction={id,action};
+  $('#library-action-title').textContent=action==='rename'?'重命名论文':'删除论文';
+  $('#library-action-name').textContent=doc.name;
+  $('#library-rename-field').classList.toggle('hidden',action!=='rename');
+  $('#library-name-input').required=action==='rename';
+  $('#library-name-input').value=doc.name;
+  $('#library-delete-description').classList.toggle('hidden',action!=='delete');
+  $('#library-action-error').textContent='';
+  $('#library-action-submit').textContent=action==='rename'?'保存名称':'确认删除';
+  $('#library-action-submit').classList.toggle('danger',action==='delete');
+  $('#library-action-dialog').showModal();
+  if(action==='rename'){$('#library-name-input').focus();$('#library-name-input').select();}
+}
+async function submitLibraryAction(event){
+  event.preventDefault();if(!libraryAction)return;
+  const {id,action}=libraryAction,button=$('#library-action-submit');
+  if(button.disabled)return;
+  const name=$('#library-name-input').value.trim();
+  if(action==='rename'&&!name){$('#library-action-error').textContent='请输入论文名称。';return;}
+  button.disabled=true;
+  try{
+    const result=await api(`/api/documents/${id}`,{method:action==='rename'?'PATCH':'DELETE',
+      ...(action==='rename'?{body:JSON.stringify({name})}:{})});
+    if(state.doc?.id===id){
+      if(action==='rename'){
+        state.doc.name=result.name;
+        $('#document-name').textContent=result.name;$('#breadcrumb-title').textContent=result.name;
+      }else{
+        cancelScheduledLayout();layoutRequest++;state.doc=null;state.selected=null;state.page=0;
+        state.pendingOpen=false;state.openMessage='';state.errors={};state.layout=null;state.layoutError='';
+        state.layoutKey=null;state.layoutBusy=false;state.editTranslation=false;readingInteraction.anchor=null;
+        readingInteraction.selection=new Set();
+        $('#pdf-page').innerHTML='';$('#translation-pane').innerHTML='';$('#document-name').textContent='';
+        $('#export').removeAttribute('href');$('#download-pdf').removeAttribute('href');
+        $('#breadcrumb-title').textContent='对照翻译';showLibrary();
+        globalThis.PaperAssistant?.documentChanged();
+      }
+    }
+    $('#library-action-dialog').close();libraryAction=null;
+    await refreshLibrary();
+    toast(action==='rename'?'论文名称已更新':'论文已从文档库删除，文件保存在本机回收目录');
+  }catch(error){$('#library-action-error').textContent=error.message;}
+  finally{button.disabled=false;}
+}
 function formAgent(){const data=Object.fromEntries(new FormData($('#settings-form')));data.timeout=Number(data.timeout);return data;}
+function qualityEnvironment(){return {state,api,blocks,validAgent,updateControls,status,toast,persist,
+  invalidateLayout,renderTranslations,refreshLayout,refreshLibrary,renderDocument};}
 function modeVisibility(){const custom=$('#agent-mode').value==='custom';$('#custom-fields').classList.toggle('hidden',!custom);$('#url-help').textContent=custom?'填写完整 POST 接口地址；目前支持非流式 JSON 响应。':'自动追加 /chat/completions，也可填写完整端点。';$('#settings-form [name=model]').required=!custom;const reasoning=$('#agent-reasoning');reasoning.disabled=custom;reasoning.title=custom?'自定义接口由请求模板控制':'';$('#reasoning-help').textContent=custom?'自定义接口模式下由请求模板决定是否思考，此处设置不生效。':'仅 OpenAI 兼容接口生效。默认不发送思考参数；各服务商支持范围不同，不支持时请改回服务端默认。';}
 function showSettings(){
   for(const [key,value]of Object.entries(state.agent)){const input=$(`#settings-form [name="${key}"]`);if(input)input.value=value;}
@@ -842,7 +986,7 @@ $('#agent-mode').onchange=modeVisibility;
 $('#settings-form').onsubmit=event=>{
   event.preventDefault();const config=formAgent();
   if(config.mode==='custom'){try{const value=JSON.parse(config.template);if(!value || Array.isArray(value)||typeof value!=='object')throw new Error();}catch{toast('请求模板必须是有效 JSON 对象');return;}}
-  state.agent=config;const saved=persist('parallel-agent',config);updateAgentDot();$('#settings-dialog').close();if(saved)toast('Agent 配置和密钥已保存，下次自动读取');
+  state.agent=config;state.layoutKey=null;const saved=persist('parallel-agent',config);updateAgentDot();$('#settings-dialog').close();if(saved)toast('Agent 配置和密钥已保存，下次自动读取');
 };
 $('#test-connection').onclick=async()=>{
   if(!$('#settings-form').reportValidity())return;
@@ -866,7 +1010,13 @@ $('#drop-zone').onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event
 $('#file-input').onchange=()=>uploadFile($('#file-input').files[0]);
 for(const eventName of ['dragenter','dragover'])$('#drop-zone').addEventListener(eventName,event=>{event.preventDefault();$('#drop-zone').classList.add('dragging');});
 for(const eventName of ['dragleave','drop'])$('#drop-zone').addEventListener(eventName,event=>{event.preventDefault();$('#drop-zone').classList.remove('dragging');if(eventName==='drop')uploadFile(event.dataTransfer.files[0]);});
-$('#library').onclick=event=>{const direct=event.target.closest('[data-read-doc]');if(direct){openDocument(direct.dataset.readDoc,true);return;}const button=event.target.closest('[data-doc]');if(button)openDocument(button.dataset.doc);};
+$('#library-action-form').onsubmit=submitLibraryAction;
+$('#library').onclick=event=>{
+  const rename=event.target.closest('[data-rename-doc]'),remove=event.target.closest('[data-delete-doc]');
+  if(rename||remove){openLibraryAction(rename?.dataset.renameDoc||remove.dataset.deleteDoc,rename?'rename':'delete');return;}
+  const direct=event.target.closest('[data-read-doc]');if(direct){openDocument(direct.dataset.readDoc,true);return;}
+  const button=event.target.closest('[data-doc]');if(button)openDocument(button.dataset.doc);
+};
 $('#previous-page').onclick=()=>choosePage(state.page-1);$('#next-page').onclick=()=>choosePage(state.page+1);
 $('#page-select').onchange=event=>choosePage(event.target.value);
 $('#target-language').value=state.target;
@@ -879,10 +1029,17 @@ $('#translation-view').onchange=event=>{state.view=event.target.value;renderTran
 $('#translation-edit').checked=false;
 $('#translation-edit').onchange=event=>{state.editTranslation=event.target.checked;getSelection()?.removeAllRanges();renderTranslations();};
 $('#translation-concurrency').value=state.concurrency;
-$('#translation-concurrency').onchange=event=>{state.concurrency=Number(event.target.value);persist('parallel-concurrency',state.concurrency);};
+$('#translation-concurrency').onchange=event=>{state.concurrency=event.target.value==='auto'?'auto':Number(event.target.value);persist('parallel-concurrency',state.concurrency);};
 $('#translation-batch-size').value=state.batchSize;
-$('#translation-batch-size').onchange=event=>{state.batchSize=Number(event.target.value);persist('parallel-batch-size',state.batchSize);};
-$('#refresh-layout').onclick=()=>refreshLayout();
+$('#translation-batch-size').onchange=event=>{state.batchSize=event.target.value==='auto'?'auto':Number(event.target.value);persist('parallel-batch-size',state.batchSize);};
+$('#prewarm-layout').checked=state.prewarmEnabled;
+$('#prewarm-layout').onchange=event=>{state.prewarmEnabled=event.target.checked;persist('parallel-prewarm',state.prewarmEnabled);};
+$('#performance-report').onclick=()=>{
+  const report=stored('parallel-performance',null);if(!report){toast('完成一次翻译后可导出耗时报告');return;}
+  const url=URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}));
+  const link=document.createElement('a');link.href=url;link.download='parallel-performance.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+$('#refresh-layout').onclick=()=>{state.layoutKey=null;refreshLayout();};
 $('#translate-all').onclick=()=>{if(state.running){state.stop=true;updateControls();status(`将在已发送的 ${state.activeBlocks.size} 段完成后暂停…`);return;}const pending=blocks().filter(block=>!isTranslated(block));if(!pending.length){toast('全文已翻译完成。如需调整，可对单段重新翻译。');return;}runTranslation(pending);};
 $('#translate-page').onclick=()=>{const pending=currentPage().blocks.filter(block=>!isTranslated(block));if(!pending.length){toast('本页已翻译完成');return;}runTranslation(pending);};
 $('#source-pane').onclick=event=>readerClick(event,'source');
@@ -935,5 +1092,5 @@ window.addEventListener('resize',()=>{cancelAnimationFrame(resizeFrame);resizeFr
   refreshReaderViewport();
 });});
 window.addEventListener('beforeunload',event=>{if(state.running){event.preventDefault();event.returnValue='';}});
-async function init(){try{const session=await api('/api/session');state.token=session.token;state.batchSupported=session.batch_translation===true;await refreshLibrary();updateAgentDot();}catch(error){toast(`初始化失败：${error.message}`);}}
+async function init(){try{const session=await api('/api/session');state.token=session.token;state.batchSupported=session.batch_translation===true;state.batchLimit=session.batch_limit||5;state.prewarmSupported=session.prewarm_layout===true;state.structureSupported=session.document_structure===true;if(typeof QualityTranslation!=='undefined')QualityTranslation.bind(qualityEnvironment());await refreshLibrary();updateAgentDot();}catch(error){toast(`初始化失败：${error.message}`);}}
 init();
